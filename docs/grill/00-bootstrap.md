@@ -1,0 +1,9 @@
+Use grill-with-docs for the Need Radar project in /home/ubuntu/projects/need-radar. You are interviewing ChatGPT, the owner's decision proxy, not the owner directly. Read AGENTS.md and docs/owner-brief.md first; apply your normal skill to discover missing material decisions.
+
+This is design/documents-only work. No implementation, installation, paid requests, account/credential changes, deployment, schedules, Discord messages, or changes outside this project. No broad external research. Treat tentative dependency claims as unverified; record narrow preflight tests instead of guessing.
+
+The proxy may inspect evidence and answer all routine, low-risk, reversible questions; do not insist on owner confirmation for those. Product-intent changes, meaningful ongoing spend, security boundaries, and hard-to-reverse choices require the owner. Allow pending owner decisions and continue independent parts. Unset credentials/budget/channel/time can remain fail-closed activation gates and do not automatically block completing a design review.
+
+Keep this frontier-discovery turn READ-ONLY. Do not rewrite docs yet and do not call interactive clarification tools. Ask the ENTIRE current material decision frontier in one response, grouping related questions and giving a recommended conservative answer for each. Focus on experimentally comparable extraction-only v0/serve and v1/shadow, one fixed judge, evidence/size/grounding, deterministic observability, failure isolation, least necessary data/state, and dependency validation. Do not resurrect personalization, milestones, or multiple changing experiment dimensions.
+
+Begin with HERMES_SESSION_ID: <your current session ID if available>. Print numbered frontier questions with short recommendations and what genuinely needs owner intent, if anything. If already complete print FRONTIER_EMPTY. Stop after this response and wait for the proxy. Do not implement and do not start a long documentation-finalization turn.

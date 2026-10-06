@@ -1,0 +1,57 @@
+# Need Radar
+
+独立项目：持续发现 AI 开发/学习中具体、有价值、可解决、有合理规模切入口的 friction。
+
+**当前状态：设计讨论已完成，尚未实现或启用系统。当前没有需要用户补答的设计问题。**
+
+项目路径：`/home/ubuntu/projects/need-radar`
+
+## 整体架构图
+
+![Need Radar 整体架构](docs/diagrams/system-overview.svg)
+
+[浏览器查看架构图](docs/architecture.html) · [中文说明与 Mermaid 源码](docs/architecture.md)
+
+模型已选 **DeepSeek V4.1 Flash**，Discord 频道已指定为 **`1557157266824634469`**。这里只更新设计记录，没有改全局 Hermes 配置、启用任务或发送消息。凭证和实际接入见 [runtime selections](docs/runtime-selections.md)。
+
+## 从这里读
+
+| 文档 | 用途 |
+|---|---|
+| [整体架构图](docs/architecture.md) | 已排版 SVG、浏览器版、可编辑 Mermaid 和模块边界 |
+| [Runtime selections](docs/runtime-selections.md) | 已确认模型/频道、Treg 凭证何时需要、尚未启用的配置 |
+| [具体问题与实际回答全文](docs/grill/qa-transcript.md) | Q1–Q30 原始提问、Hermes 建议、对应的代理回答及实际结束消息，已核对原会话 |
+| [ChatGPT × Hermes 讨论摘要](docs/grill/discussion.md) | 中文结论、原始记录导航和后续实验例子；不是问答全文 |
+| [Design](docs/design.md) | 系统边界、extraction-only 实验、固定 judge、报告和完整 observability |
+| [Decisions](docs/decisions.md) | 区分用户已定要求、可逆代理默认值与未来启用审批 |
+| [Activation checklist](docs/activation-checklist.md) | 真实接入前的预算、数据处理、频道配置和技术核查；目前全部未启用 |
+| [Owner brief](docs/owner-brief.md) | 本次对话中已经确认的意图和约束 |
+| [Evidence notes](docs/evidence-notes.md) | 已核实的文档/CLI 信息及尚未实测的依赖假设 |
+
+## 已定的第一轮实验
+
+```text
+同一份 source/retrieval -> 冻结输入
+                           |
+              +------------+------------+
+              |                         |
+       v0: explicit pain        v1: workaround/latent friction
+            SERVE                       SHADOW
+              |                         |
+              +------ 同一固定 judge ----+
+              |       非阻塞比较
+              |
+       正式 report.md -> HTML / PDF / Discord
+
+Shadow 仅归档实验产物，不发布。
+```
+
+Judge 对两版使用相同目标：是否发现了真实、有价值、sizeable、可解决且切口合理的 friction。评测链路比较两版，但不阻塞正常的正式报告。
+
+仅改变 extraction；source/retrieval 的不同策略保留为后续单变量实验。没有个人喜好或个性化反馈模块。
+
+## 接续约束
+
+Hermes session：`20261006_114451_8a8410`，全程保留，详见 [session record](docs/grill/session.md)。
+
+后续 agent 先读 [AGENTS.md](AGENTS.md)。本次只完成设计/讨论文档：没有应用代码、Git 初始化、依赖安装、付费数据接入、cron 或 Discord 发布。实施与上线需要另外授权。

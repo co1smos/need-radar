@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Need Radar · 整体架构</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f4f7fb;color:#172338;font:16px/1.7 system-ui,-apple-system,"Segoe UI",sans-serif}main{max-width:1680px;margin:0 auto;padding:20px}.diagram{overflow-x:auto;background:#f4f7fb}.diagram img{display:block;width:100%;min-width:1000px;height:auto}.notes{background:#fff;border:1px solid #dbe3ed;border-radius:14px;padding:20px 26px;margin-top:18px}h1{font-size:24px;margin:0 0 8px}h2{font-size:18px;margin:16px 0 6px}p{margin:7px 0;color:#526176}a{color:#2563eb}code{background:#edf2f8;padding:2px 5px;border-radius:4px}strong{color:#172338}@media print{main{padding:0}.diagram img{min-width:0}.notes{break-inside:avoid}}
+</style>
+</head>
+<body><main>
+<div class="diagram"><img src="diagrams/system-overview.svg" alt="Need Radar 整体架构：共同采集与冻结快照，v0/v1 仅改变 extraction；独立固定 judge；正式 Markdown 输出；全链路可观测性"></div>
+<section class="notes">
+<h1>读图要点</h1>
+<p><strong>一套采集，两种提取角度，一个固定评测标准。</strong> 上半部共用 source、retrieval 和冻结输入；下半部只有 extraction 指令不同。</p>
+<p><strong>正式发布与实验隔离。</strong> v0 生成唯一内容源 <code>report.md</code>；HTML、可选 PDF、Discord 从同一内容产生。Shadow 与 judge 不阻塞正式报告，也不自动成为 serve。</p>
+<p><strong>Observability 覆盖 deterministic 程序。</strong> 保留 query/provider、配置、输入内容、context/truncation 决策、最终 prompt、模型响应及报告/投递关联。虚线为部分控制/诊断关联，不是业务前置依赖。</p>
+<h2>已指定、尚未启用</h2>
+<p>模型：<strong>DeepSeek V4.1 Flash</strong>。Discord 频道：<code>1557157266824634469</code>。Treg live access、模型账号、预算、bot 权限、调度与外部 telemetry 尚未激活。本图是设计文档，不表示实际运行成功。</p>
+<p><a href="architecture.md">可编辑 Mermaid 源码与中文说明</a> · <a href="runtime-selections.md">模型、频道与凭证时机</a> · <a href="design.md">完整设计</a> · <a href="grill/qa-transcript.md">原始具体问答</a></p>
+</section>
+</main></body></html>
