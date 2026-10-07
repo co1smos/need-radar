@@ -378,6 +378,39 @@ if os.environ.get("NEED_RADAR_OFFLINE_TESTS") == "1":
         ):
             self.assertNotIn(secret, persisted)
 
+    def test_sensitive_assignment_context_survives_embedded_url_splitting(self):
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        encoded_cookie = quote(quote("fixture-cookie-after-url", safe=""), safe="")
+        encoded_password = quote(quote("fixture-password-after-url", safe=""), safe="")
+        encoded_cookie_key = quote("Cookie: redirect=", safe="")
+        post["text"] = (
+            "Cookie: redirect=https://ordinary.example/path; "
+            f"session={encoded_cookie}; refresh=fixture-refresh-after-url\n"
+            f'password="quoted https://ordinary.example/path {encoded_password}"\n'
+            f"{encoded_cookie_key}https://ordinary.example/path; "
+            "session=fixture-encoded-cookie-after-url"
+        )
+        transport = FixtureTransport([response(200, page)])
+
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        persisted = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        for _ in range(collect_reddit.MAX_URL_DECODE_ROUNDS + 2):
+            persisted = unquote(persisted)
+        for secret in (
+            "fixture-cookie-after-url",
+            "fixture-refresh-after-url",
+            "fixture-password-after-url",
+            "fixture-encoded-cookie-after-url",
+        ):
+            self.assertNotIn(secret, persisted)
+
     def test_redacts_quoted_cookie_and_encoded_secrets_from_persisted_text(self):
         page = fixture_body("feed-page-1.json")
         post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
@@ -1331,6 +1364,40 @@ if os.environ.get("NEED_RADAR_OFFLINE_TESTS") == "1":
         record = json.loads(next(self.recordings_dir.glob("record-*.json")).read_text())
         self.assertIn("feed_response_schema_invalid", record["validation_errors"])
 
+    def test_deeply_nested_feed_data_string_fails_with_replay_lineage(self):
+        nested_data = "[" * 1100 + "0" + "]" * 1100
+        transport = FixtureTransport([response(200, {"code": 200, "data": nested_data})])
+
+        code, stdout, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 2, stderr)
+        report = json.loads(stdout)
+        self.assertIn("feed_response_schema_invalid", report["errors"])
+        record_path = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(record_path.read_text())
+        self.assertIn("feed_response_schema_invalid", record["validation_errors"])
+        record.pop("validation_errors")
+        for malformed_data in (
+            nested_data,
+            '{"oversized":' + "9" * 5000 + "}",
+        ):
+            with self.subTest(data_length=len(malformed_data)):
+                record["response"]["body"] = {"code": 200, "data": malformed_data}
+                record_path.write_text(json.dumps(record))
+                replay_code, replay_stdout, replay_stderr = self.run_cli([
+                    "replay", "--recordings-dir", str(self.recordings_dir),
+                    "--state-dir", str(self.state_dir),
+                ])
+                self.assertEqual(replay_code, 2, replay_stderr)
+                replay = json.loads(replay_stdout)
+                self.assertIn("feed_response_schema_invalid", replay["errors"])
+                self.assertIn(record["record_id"], replay["record_ids"])
+                self.assertGreater(replay["counts"]["validation_failures"], 0)
+
     def test_surrogate_response_is_sanitized_before_persistence(self):
         page = fixture_body("feed-page-1.json")
         page["data"]["subredditV3"]["elements"]["edges"][0]["node"]["text"] = "\ud800"
@@ -1421,6 +1488,47 @@ if os.environ.get("NEED_RADAR_OFFLINE_TESTS") == "1":
         self.assertEqual(state["reserved_micro_usd"], 0)
         self.assertEqual(len(transport.requests), 1)
 
+    def test_known_charge_without_call_id_releases_reservation_and_reconciles_once(self):
+        self.state_dir.mkdir(mode=0o700)
+        state = collect_reddit.default_state()
+        state["spent_micro_usd"] = 249000
+        state_path = self.state_dir / "state.json"
+        state_path.write_text(json.dumps(state))
+        state_path.chmod(0o600)
+        missing_call_id = collect_reddit.HTTPResponse(
+            200,
+            {"X-Treg-Cost-Micro": "1000"},
+            json.dumps(fixture_body("feed-page-2.json")).encode(),
+        )
+        transport = FixtureTransport([missing_call_id])
+
+        code, stdout, _ = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("billing_call_id_missing_reconciliation_required", stdout)
+        state = json.loads(state_path.read_text())
+        self.assertEqual(state["spent_micro_usd"], 250000)
+        self.assertEqual(state["reserved_micro_usd"], 0)
+        self.assertEqual(state["successful_requests"], 1)
+        self.assertTrue(state["pending"]["charge_known"])
+
+        reconcile = [
+            "reconcile", "--state-dir", str(self.state_dir),
+            "--call-id", "reconciled-call", "--charge-micro", "1000",
+            "--request-outcome", "success", "--evidence", "synthetic ledger reference",
+        ]
+        reconcile_code, _, stderr = self.run_cli(reconcile)
+        self.assertEqual(reconcile_code, 0, stderr)
+        state = json.loads(state_path.read_text())
+        self.assertEqual(state["spent_micro_usd"], 250000)
+        self.assertEqual(state["reserved_micro_usd"], 0)
+        self.assertEqual(state["successful_requests"], 1)
+        self.assertIsNone(state["pending"])
+
     def test_unknown_outcome_pauses_until_local_reconciliation(self):
         transport = FixtureTransport([TimeoutError("synthetic timeout")])
         code, _, _ = self.run_cli(self.args("--max-feed-pages", "1", "--max-posts", "0"), transport, FakeCredentials())
@@ -1464,6 +1572,7 @@ if os.environ.get("NEED_RADAR_OFFLINE_TESTS") == "1":
         self.assertEqual(state["reserved_micro_usd"], 1000)
         self.assertEqual(state["reserved_success_slots"], 0)
         self.assertTrue(state["pending"]["http_success"])
+
         saved = json.loads(next(self.recordings_dir.glob("record-*.json")).read_text())
         self.assertIsNone(saved["billing"]["charged_micro_usd"])
 
@@ -1744,6 +1853,83 @@ if os.environ.get("NEED_RADAR_OFFLINE_TESTS") == "1":
         report = json.loads(stdout)
         self.assertEqual(len(transport.requests), 3)
         self.assertIn("comment cursor repeated", report["capabilities"]["source_coverage"]["evidence"])
+
+    def test_opaque_feed_and_comment_cursors_are_dispatched_without_decoding(self):
+        first_feed = fixture_body("feed-page-1.json")
+        first_feed["data"]["subredditV3"]["elements"]["pageInfo"]["endCursor"] = "opaque%2Ffeed"
+        first_feed["data"] = json.dumps(first_feed["data"])
+        first_comments = {
+            "success": True,
+            "comments": [],
+            "more": {"has_more": True, "cursor": "opaque%2Fcomment"},
+        }
+        final_comments = {
+            "success": True,
+            "comments": [],
+            "more": {"has_more": False, "cursor": None},
+        }
+        transport = FixtureTransport([
+            response(200, first_feed),
+            response(200, fixture_body("feed-page-2.json")),
+            response(200, first_comments),
+            response(200, final_comments),
+        ])
+
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "2", "--max-comment-pages", "2", "--max-posts", "1"),
+            transport,
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        feed_params = parse_qs(urlsplit(transport.requests[1][0]).query)
+        comment_params = parse_qs(urlsplit(transport.requests[3][0]).query)
+        self.assertEqual(feed_params["after"], ["opaque%2Ffeed"])
+        self.assertEqual(comment_params["cursor"], ["opaque%2Fcomment"])
+        records = [json.loads(path.read_text()) for path in self.recordings_dir.glob("record-*.json")]
+        feed_record = next(
+            record
+            for record in records
+            if record["endpoint"] == collect_reddit.FEED_ID
+            and collect_reddit.feed_data(record["response"]["body"])[1] is True
+        )
+        feed_request_record = next(
+            record
+            for record in records
+            if record["endpoint"] == collect_reddit.FEED_ID
+            and record["request"]["parameters"].get("after") is not None
+        )
+        comment_record = next(
+            record
+            for record in records
+            if record["endpoint"] == collect_reddit.COMMENTS_ID
+            and record["request"]["parameters"].get("cursor") is not None
+        )
+        self.assertEqual(collect_reddit.feed_data(feed_record["response"]["body"])[2], "opaque/feed")
+        self.assertNotIn("opaque%2Ffeed", feed_record["response"]["body"]["data"])
+        self.assertEqual(feed_request_record["request"]["parameters"]["after"], "opaque/feed")
+        self.assertEqual(comment_record["request"]["parameters"]["cursor"], "opaque/comment")
+
+    def test_pending_opaque_cursors_are_sanitized_in_reports(self):
+        first_feed = fixture_body("feed-page-1.json")
+        first_feed["data"]["subredditV3"]["elements"]["pageInfo"]["endCursor"] = "opaque%2Ffeed"
+        first_comments = {
+            "success": True,
+            "comments": [],
+            "more": {"has_more": True, "cursor": "opaque%2Fcomment"},
+        }
+        transport = FixtureTransport([response(200, first_feed), response(200, first_comments)])
+
+        code, stdout, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-comment-pages", "1", "--max-posts", "1"),
+            transport,
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        for artifact in (stdout, *(path.read_text() for path in self.recordings_dir.glob("*.json"))):
+            self.assertNotIn("opaque%2Ffeed", artifact)
+            self.assertNotIn("opaque%2Fcomment", artifact)
 
     def test_post_limit_reports_uncommented_in_window_posts(self):
         transport = FixtureTransport([

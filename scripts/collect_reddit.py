@@ -36,6 +36,7 @@ MAX_RETRY_DELAY_SECONDS = 8
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 REQUEST_TIMEOUT_SECONDS = 30
 RETENTION_DAYS = 7
+MAX_JSON_DEPTH = 64
 MAX_URL_DECODE_ROUNDS = 16
 MAX_NESTED_URLS = 8
 MAX_SANITIZE_DEPTH = 32
@@ -297,6 +298,23 @@ def safe_string(value, secrets=(), _depth=0):
     for secret in secrets:
         if secret:
             text = text.replace(secret, "[REDACTED]")
+    decoded_parts = []
+    offset = 0
+    for match in EMBEDDED_URL.finditer(text):
+        decoded = decode_url_component(text[offset:match.start()])
+        if decoded is None:
+            return "[REDACTED]"
+        decoded_parts.extend((decoded, match.group(0)))
+        offset = match.end()
+    decoded = decode_url_component(text[offset:])
+    if decoded is None:
+        return "[REDACTED]"
+    decoded_parts.append(decoded)
+    text = "".join(decoded_parts)
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    text = redact_assignments(text)
     parts = []
     offset = 0
     for match in EMBEDDED_URL.finditer(text):
@@ -428,7 +446,7 @@ def sanitize(value, secrets=(), key="", _depth=0):
         return [sanitize(item, secrets, _depth=_depth + 1) for item in value]
     if isinstance(value, str):
         try:
-            nested = json.loads(value)
+            nested = parse_json(value)
         except json.JSONDecodeError:
             nested = None
         except ValueError:
@@ -449,14 +467,14 @@ def sanitize(value, secrets=(), key="", _depth=0):
 def sanitize_body(body, secrets=()):
     text = body.decode("utf-8", errors="replace")
     try:
-        value = json.loads(text)
+        value = parse_json(text)
     except json.JSONDecodeError:
         return safe_string(text, secrets)
     except RecursionError:
         return "[REDACTED_INVALID_JSON]"
     except ValueError:
         try:
-            value = json.loads(text, parse_int=str)
+            value = parse_json(text, parse_int=str)
         except (json.JSONDecodeError, ValueError, RecursionError):
             return "[REDACTED_INVALID_JSON]"
         try:
@@ -791,9 +809,33 @@ def call_url(route_id, params):
     return "https://treg.to/call/" + route_id + ("?" + query if query else "")
 
 
-def parse_json(body):
-    value = json.loads(body.decode("utf-8"))
-    return value
+def parse_json(body, *, parse_int=int):
+    text = body.decode("utf-8") if isinstance(body, bytes) else body
+    if not isinstance(text, str):
+        raise TypeError("json_text_required")
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+        elif character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise ValueError("json_nesting_limit_exceeded")
+        elif character in "]}":
+            depth = max(0, depth - 1)
+    try:
+        return json.loads(text, parse_int=parse_int)
+    except RecursionError:
+        raise ValueError("json_nesting_limit_exceeded") from None
 
 
 def feed_data(payload):
@@ -804,7 +846,7 @@ def feed_data(payload):
     data = payload.get("data")
     for _ in range(2):
         if isinstance(data, str):
-            data = json.loads(data)
+            data = parse_json(data)
     if not isinstance(data, dict):
         raise ValueError("feed_data_schema_unknown")
     elements = data.get("subredditV3", {}).get("elements") if isinstance(data.get("subredditV3"), dict) else None
@@ -917,6 +959,17 @@ def cursors_in_comments(value):
         for item in value:
             result.extend(cursors_in_comments(item))
     return result
+
+
+def original_cursors(route_name, body):
+    try:
+        payload = parse_json(body)
+        if route_name == "feed":
+            return feed_data(payload)[2]
+        validate_comment_body(payload)
+        return cursors_in_comments(payload)
+    except (UnicodeError, TypeError, ValueError, RecursionError):
+        return None
 
 
 def comment_pagination_incomplete(value):
@@ -1205,6 +1258,7 @@ class Collector:
                 "successful_limit": MAX_SUCCESSFUL_REQUESTS,
                 "spend_limit_micro_usd": MAX_SPEND_MICRO_USD,
             }
+        report = sanitize(report, [self.credentials.token])
         artifact_name = "run-" + self.run_id + ".json"
         report["artifact"] = artifact_name
         now = self.clock()
@@ -1409,6 +1463,7 @@ class Collector:
             atomic_json(state_path, state)
             raise CollectorError("provider_cost_ceiling_breach", "failed")
         if not call_id:
+            state["reserved_micro_usd"] -= reservation
             pending.update({
                 "charge_known": True,
                 "known_charge_micro_usd": cost,
@@ -1455,6 +1510,7 @@ class Collector:
                     state["pending"]["request_error"] = type(error).__name__
                     atomic_json(state_path, state)
                 raise CollectorError("request_outcome_unknown_reconciliation_required", "blocked") from None
+            cursors = original_cursors(route_name, result.body)
             body = sanitize_body(result.body, [self.credentials.token])
             successful_response = acquisition_succeeded(route_name, result.status, body)
             self.save_record(
@@ -1501,7 +1557,7 @@ class Collector:
                 if 200 <= result.status < 300:
                     self.fail_record("provider_api_request_failed")
                 self.fail_record("provider_http_request_failed")
-            return body
+            return body, cursors
 
     def feed(self, state_path, state):
         start = parse_datetime(self.args.window_start)
@@ -1513,7 +1569,7 @@ class Collector:
                 params = {"subreddit_name": subreddit, "sort": "NEW", "need_format": "false"}
                 if cursor:
                     params["after"] = cursor
-                body = self.dispatch(state_path, state, "feed", params)
+                body, original_cursor = self.dispatch(state_path, state, "feed", params)
                 self.counts["feed_requests"] += 1
                 try:
                     posts, has_next, next_cursor = feed_data(body)
@@ -1522,6 +1578,8 @@ class Collector:
                     self.coverage_reasons.append("feed response schema validation failed")
                     self.annotate_record_validation("feed_response_schema_invalid")
                     raise CollectorError("feed_response_schema_invalid", "failed") from None
+                if isinstance(original_cursor, str):
+                    next_cursor = original_cursor
                 try:
                     post_times = feed_post_times(posts)
                 except ValueError:
@@ -1595,7 +1653,7 @@ class Collector:
                 params = {"url": post["url"], "trim": "false"}
                 if cursor:
                     params["cursor"] = cursor
-                body = self.dispatch(state_path, state, "comments", params)
+                body, original_comment_cursors = self.dispatch(state_path, state, "comments", params)
                 self.counts["comment_requests"] += 1
                 page_count += 1
                 try:
@@ -1607,7 +1665,12 @@ class Collector:
                     raise CollectorError("comment_response_schema_invalid", "failed") from None
                 self.counts["comment_pages"] += 1
                 self.counts["comments_seen"] += len(comments)
-                for next_cursor in cursors_in_comments(body):
+                comment_cursors = (
+                    original_comment_cursors
+                    if isinstance(original_comment_cursors, list)
+                    else cursors_in_comments(body)
+                )
+                for next_cursor in comment_cursors:
                     if next_cursor not in seen_cursors and next_cursor not in cursors:
                         cursors.append(next_cursor)
                     elif next_cursor in seen_cursors:
