@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from urllib.parse import unquote
 from unittest import mock
 
 
@@ -118,7 +119,7 @@ def cli_environment():
         "PATH": os.environ.get("PATH", ""),
         "PYTHONPATH": str(ROOT / "tests"),
         "PYTHONDONTWRITEBYTECODE": "1",
-        "TMPDIR": os.environ.get("TMPDIR", ""),
+        "TMPDIR": "/home/ubuntu/.hermes/cache/scratch",
     }
 
 
@@ -160,11 +161,55 @@ class LiveGateTests(unittest.TestCase):
                         collect_x.collect(
                             approved_inputs(),
                             state_dir=state_dir,
+                            recording_dir=Path(temporary) / "recordings",
                             offline_transport=offline_transport,
                             token=token,
                         )
                 loader.assert_not_called()
                 self.assertFalse(state_dir.exists())
+
+    def test_offline_collection_rejects_canonical_aliases_and_containing_paths_before_side_effects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            live_dir = root / "canonical" / "ticket-9"
+            live_recordings = live_dir / "recordings"
+            live_recordings.mkdir(parents=True)
+            sentinel = live_recordings / "sentinel.json"
+            sentinel.write_text("preserve")
+            alias = root / "canonical-alias"
+            alias.symlink_to(live_dir, target_is_directory=True)
+            cases = (
+                (live_dir, root / "isolated-recordings"),
+                (alias, alias / "recordings"),
+                (root / "isolated-state", alias / "recordings"),
+                (root / "isolated-state", live_dir / "recordings"),
+                (live_dir.parent, root / "isolated-recordings"),
+                (root / "isolated-state", live_dir.parent),
+                (root / "same-path", root / "same-path"),
+                (root / "recording-parent" / "state", root / "recording-parent"),
+                (root / "isolated-state", None),
+                (None, root / "isolated-recordings"),
+            )
+            with mock.patch.object(collect_x, "DEFAULT_STATE_DIR", live_dir):
+                for state_dir, recording_dir in cases:
+                    with self.subTest(state_dir=state_dir, recording_dir=recording_dir):
+                        transport = collect_x.OfflineTransport(lambda *_args: self.fail("must not dispatch"))
+                        with mock.patch.object(collect_x, "_ticket_lock", side_effect=AssertionError("lock touched")) as lock:
+                            with mock.patch.object(collect_x, "_clean_expired", side_effect=AssertionError("cleanup touched")) as cleanup:
+                                with mock.patch.object(collect_x, "_load_credentials", side_effect=AssertionError("credentials loaded")) as loader:
+                                    with self.assertRaisesRegex(collect_x.CollectorError, "offline.*(isolated|explicit)"):
+                                        collect_x.collect(
+                                            approved_inputs(),
+                                            state_dir=state_dir,
+                                            recording_dir=recording_dir,
+                                            token="synthetic-secret",
+                                            offline_transport=transport,
+                                        )
+                        lock.assert_not_called()
+                        cleanup.assert_not_called()
+                        loader.assert_not_called()
+            self.assertEqual(sentinel.read_text(), "preserve")
+            self.assertFalse((root / "isolated-state").exists())
 
     def test_cli_maps_failed_collector_summary_to_nonzero(self):
         inputs = approved_inputs()
@@ -599,26 +644,44 @@ class CollectionTests(unittest.TestCase):
         body["output"]["data"]["items"][0]["text"] = (
             'Synthetic text synthetic-secret Bearer abc123 api_key=leakme "token": "quoted-leak" '
             'https://url-user-secret:url-pass-secret@example.test/data?X-Amz-Signature=aws-leak&ok=signed-other-leak#fragment-secret '
+            'https://example.test/?q=synthetic%2Dsecret '
+            'https://example.test/synthetic%2Dsecret?synthetic%2Dsecret=value '
+            'https://synthetic%2Dsecret.example/path '
+            'https://example.test/a%2Fb?x=public '
             'Cookie: sessionid=cookie-leak Authorization: Basic basic-leak '
             'Authorization=Basic basic-assignment-secret\nCookie=sessionid=cookie-one; other=cookie-two'
         )
+        body["output"]["data"]["items"][0]["url"] = "https://example.test/?q=synthetic%2Dsecret"
         provider = LocalProvider([{"body": body, "headers": {
             "X-Treg-Cost-Micro": "750",
-            "X-Treg-Call-Id": "https://example.test/call?X-Amz-Signature=header-signature&x=header-query-secret",
+            "X-Treg-Call-Id": "https://example.test/call?q=synthetic%2Dsecret",
         }}])
         try:
             with tempfile.TemporaryDirectory() as temporary:
-                _, _, recording_dir = self.collect(provider, temporary)
+                _, state_dir, recording_dir = self.collect(provider, temporary)
                 recording_path = next(recording_dir.glob("*.json"))
                 persisted = recording_path.read_text()
+                persisted_state = (state_dir / "state.json").read_text()
                 self.assertNotIn("synthetic-secret", persisted)
+                self.assertNotIn("synthetic-secret", unquote(persisted))
+                self.assertNotIn("synthetic-secret", unquote(persisted_state))
+                self.assertIn("https://example.test/a%2Fb?x=public", persisted)
+                recording = json.loads(persisted)
+                state = json.loads(persisted_state)
+                self.assertIn("[REDACTED]", unquote(recording["response"]["body"]["items"][0]["url"]))
+                self.assertIn(
+                    "[REDACTED]",
+                    unquote(recording["response"]["evidence_body"]["output"]["data"]["items"][0]["url"]),
+                )
+                self.assertNotIn("synthetic-secret", unquote(recording["billing"]["call_id"]))
+                self.assertNotIn("synthetic-secret", unquote(state["attempts"][0]["call_id"]))
                 self.assertNotIn("abc123", persisted)
                 self.assertNotIn("leakme", persisted)
                 self.assertNotIn("quoted-leak", persisted)
                 for secret in (
                     "url-user-secret", "url-pass-secret", "aws-leak", "signed-other-leak", "fragment-secret",
                     "cookie-leak", "basic-leak", "field-token-secret", "authorization-field-secret",
-                    "cookie-field-secret", "header-signature", "header-query-secret",
+                    "cookie-field-secret",
                     "basic-assignment-secret", "cookie-one", "cookie-two",
                 ):
                     self.assertNotIn(secret, persisted)
@@ -824,6 +887,34 @@ class CollectionTests(unittest.TestCase):
                 self.assertNotIn("cursor-secret", recording_path.read_text())
                 replay = collect_x.replay_recording(recording_path)
                 self.assertEqual(replay["replay_validation"], recording["validation"])
+        finally:
+            provider.close()
+
+    def test_replay_rejects_normalized_output_inconsistent_with_retained_evidence(self):
+        body = response_body("page-1.json")
+        body["output"]["data"]["items"][1]["createdUtc"] = 1790857000
+        provider = LocalProvider([{"body": body, "headers": {"X-Treg-Cost-Micro": "750"}}])
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                self.collect(provider, temporary)
+                original = json.loads(next((Path(temporary) / "recordings").glob("*.json")).read_text())
+                mutations = (
+                    ("text", lambda output: output["items"][0].__setitem__("text", "tampered text")),
+                    ("id", lambda output: output["items"][0].__setitem__("id", "tampered-id")),
+                    ("timestamp", lambda output: output["items"][0].__setitem__("createdUtc", 1)),
+                    ("cursor", lambda output: output.__setitem__("next_cursor", "tampered-cursor")),
+                    ("ordering", lambda output: output["items"].reverse()),
+                    ("count", lambda output: output["items"].pop()),
+                )
+                for name, mutate in mutations:
+                    with self.subTest(field=name):
+                        altered = json.loads(json.dumps(original))
+                        mutate(altered["response"]["body"])
+                        path = Path(temporary) / f"tampered-{name}.json"
+                        path.write_text(json.dumps(altered))
+                        os.chmod(path, 0o600)
+                        with self.assertRaisesRegex(collect_x.CollectorError, "does not match retained response evidence"):
+                            collect_x.replay_recording(path)
         finally:
             provider.close()
 

@@ -16,7 +16,7 @@ import tempfile
 import threading
 import time
 import urllib.error
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 import urllib.request
 import uuid
 
@@ -162,6 +162,29 @@ def _has_symlink_component(path):
         except FileNotFoundError:
             return False
     return False
+
+
+def _paths_overlap(first, second):
+    return first == second or first in second.parents or second in first.parents
+
+
+def _validate_offline_paths(state_dir, recording_dir):
+    if state_dir is None or recording_dir is None:
+        raise CollectorError("offline collection requires explicit isolated state and recording paths")
+    try:
+        paths = (Path(state_dir), Path(recording_dir))
+        if any(_has_symlink_component(path) for path in paths):
+            raise CollectorError("offline collection requires explicitly isolated non-symlink paths")
+        resolved_paths = tuple(path.resolve(strict=False) for path in paths)
+        live_dir = Path(DEFAULT_STATE_DIR).resolve(strict=False)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        raise CollectorError("offline collection paths could not be safely resolved") from None
+    if resolved_paths[0] == resolved_paths[1]:
+        raise CollectorError("offline collection requires separate isolated state and recording paths")
+    if resolved_paths[1] in resolved_paths[0].parents:
+        raise CollectorError("offline collection requires an isolated recording path outside the state directory")
+    if any(_paths_overlap(path, live_dir) for path in resolved_paths):
+        raise CollectorError("offline collection requires explicitly isolated paths outside canonical live storage")
 
 
 def _private_json(path, value):
@@ -396,12 +419,28 @@ def _load_credentials():
 def _redact(value, secrets=()):
     if not isinstance(value, str):
         return value
-    for secret in secrets:
-        if secret:
-            value = value.replace(secret, "[REDACTED]")
-    value = TOKEN_PATTERN.sub("Bearer [REDACTED]", value)
-    value = AUTH_COOKIE_PAYLOAD_PATTERN.sub(r"\1\2[REDACTED]", value)
-    value = KEY_VALUE_SECRET_PATTERN.sub(r"\1\2[REDACTED]", value)
+
+    def contains_secret(text):
+        decoded = unquote(text)
+        return any(secret and (secret in text or secret in decoded) for secret in secrets)
+
+    def redact_plain(text):
+        for secret in secrets:
+            if secret:
+                text = text.replace(secret, "[REDACTED]")
+        text = TOKEN_PATTERN.sub("Bearer [REDACTED]", text)
+        text = AUTH_COOKIE_PAYLOAD_PATTERN.sub(r"\1\2[REDACTED]", text)
+        return KEY_VALUE_SECRET_PATTERN.sub(r"\1\2[REDACTED]", text)
+
+    def sanitize_component(component):
+        if re.search(r"%[0-9a-f]{2}", component, re.IGNORECASE):
+            return "[REDACTED]"
+        sanitized = redact_plain(component)
+        if contains_secret(sanitized):
+            return "[REDACTED]"
+        return sanitized
+
+    value = redact_plain(value)
 
     def redact_url(match):
         candidate = match.group(0)
@@ -412,21 +451,44 @@ def _redact(value, secrets=()):
             hostname = parsed.hostname
             if hostname is None:
                 return "[REDACTED_URL]" + trailing
+            hostname = unquote(hostname)
+            safe_hostname = sanitize_component(hostname)
+            if safe_hostname != hostname:
+                return "[REDACTED_URL]" + trailing
             host = f"[{hostname}]" if ":" in hostname else hostname
             if parsed.port is not None:
                 host += ":" + str(parsed.port)
+            path = []
+            for segment in parsed.path.split("/"):
+                decoded_segment = unquote(segment)
+                safe_segment = sanitize_component(decoded_segment)
+                path.append(
+                    segment if safe_segment == decoded_segment
+                    else quote(safe_segment, safe=":@!$&'()*+,;=-._~")
+                )
+            safe_path = "/".join(path)
             query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
             signed = any(SIGNED_URL_KEY_PATTERN.search(key) for key, _value in query_pairs)
-            query = [
-                (key, "[REDACTED]" if signed or SECRET_QUERY_KEY_PATTERN.fullmatch(key) else item)
-                for key, item in query_pairs
-            ]
-            safe_url = urlunsplit((parsed.scheme, host, parsed.path, urlencode(query), ""))
+            query = []
+            for key, item in query_pairs:
+                safe_key = sanitize_component(key)
+                sensitive_key = (
+                    bool(SECRET_QUERY_KEY_PATTERN.fullmatch(key))
+                    or "[REDACTED]" in safe_key
+                )
+                safe_item = "[REDACTED]" if signed or sensitive_key else sanitize_component(item)
+                query.append((safe_key, safe_item))
+            safe_url = urlunsplit((parsed.scheme, host, safe_path, urlencode(query), ""))
+            if contains_secret(safe_url):
+                return "[REDACTED_URL]" + trailing
             return safe_url + trailing
         except ValueError:
             return "[REDACTED_URL]" + trailing
 
-    return URL_PATTERN.sub(redact_url, value)
+    value = URL_PATTERN.sub(redact_url, value)
+    if contains_secret(value):
+        return "[REDACTED]"
+    return value
 
 
 def _safe_value(value, secrets=()):
@@ -713,7 +775,16 @@ def _replay_validation(record):
         )
         transformations = context.get("sanitized_transformations", []) if isinstance(context, dict) else []
         if isinstance(transformations, list) and "next_cursor_redacted" in transformations:
+            if response.get("body") is not None:
+                raise CollectorError("recorded validation does not match retained response evidence")
             return {"errors": ["next_cursor_redacted"]}
+        try:
+            reconstructed = json.dumps(_replayed, sort_keys=True, allow_nan=False)
+            retained = json.dumps(response.get("body"), sort_keys=True, allow_nan=False)
+        except (TypeError, ValueError):
+            raise CollectorError("recorded validation does not match retained response evidence") from None
+        if reconstructed != retained:
+            raise CollectorError("recorded validation does not match retained response evidence")
         return validation
     if isinstance(status, int):
         return {"errors": ["http_error"], "evidence_completeness": "not_validated"}
@@ -857,10 +928,12 @@ def _summary(state, stop_reason, run_id, pages, item_count, pagination, acquisit
     return summary
 
 
-def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None, org=None, offline_transport=None, review=None):
+def collect(inputs, state_dir=None, recording_dir=None, token=None, org=None, offline_transport=None, review=None):
     inputs = validate_approval(inputs)
     live = offline_transport is None
     if live:
+        if state_dir is None:
+            state_dir = DEFAULT_STATE_DIR
         validate_review(review)
         if not hasattr(signal, "setitimer") or threading.current_thread() is not threading.main_thread() or any(signal.getitimer(signal.ITIMER_REAL)):
             raise CollectorError("live request deadline cannot be enforced in this execution context")
@@ -879,6 +952,8 @@ def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None,
         raise CollectorError("test transports must be explicitly marked offline")
     elif not isinstance(token, str) or not token.startswith(OFFLINE_TOKEN_PREFIX):
         raise CollectorError("offline collection requires an explicit synthetic token")
+    else:
+        _validate_offline_paths(state_dir, recording_dir)
     state_dir = Path(state_dir)
     recording_dir = Path(recording_dir) if recording_dir else state_dir / "recordings"
     request_transport = offline_transport if offline_transport is not None else _http_request
