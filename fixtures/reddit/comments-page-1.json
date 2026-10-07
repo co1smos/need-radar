@@ -1,0 +1,13 @@
+{
+  "success": true,
+  "credits_charged": 1,
+  "post": {"id": "demo1", "title": "Synthetic post one"},
+  "comments": [
+    {
+      "id": "synthetic-comment-1",
+      "body": "Clearly synthetic comment text.",
+      "replies": {"items": [], "more": {"has_more": false, "cursor": null}}
+    }
+  ],
+  "more": {"has_more": true, "cursor": "comment-cursor-2"}
+}
