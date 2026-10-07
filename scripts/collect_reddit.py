@@ -204,19 +204,39 @@ def repository_path(path):
     root = pathlib.Path(__file__).resolve().parents[1]
     resolved = pathlib.Path(path).resolve()
     roots = {root}
-    if root.parent.name == "worktrees" and root.parent.parent.name == ".sandcastle":
-        primary = root.parent.parent.parent.resolve()
-        roots.add(primary)
-        git_dir = primary / ".git"
-        if git_dir.is_dir():
-            worktrees = git_dir / "worktrees"
-            if worktrees.is_dir():
-                for entry in worktrees.iterdir():
-                    try:
-                        gitfile = pathlib.Path((entry / "gitdir").read_text(encoding="utf-8").strip()).resolve()
-                    except OSError:
-                        continue
-                    roots.add(gitfile.parent)
+    git_path = root / ".git"
+    if git_path.is_dir():
+        git_dir = git_path
+    else:
+        try:
+            git_pointer = git_path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            git_pointer = ""
+        if git_pointer.startswith("gitdir:"):
+            git_dir = pathlib.Path(git_pointer.partition(":")[2].strip())
+            if not git_dir.is_absolute():
+                git_dir = root / git_dir
+            git_dir = git_dir.resolve()
+        else:
+            git_dir = None
+    if git_dir is not None:
+        common_dir_file = git_dir / "commondir"
+        try:
+            common_dir = (git_dir / common_dir_file.read_text(encoding="utf-8").strip()).resolve()
+        except (OSError, UnicodeError):
+            common_dir = git_dir
+        roots.add(common_dir.parent)
+        worktrees = common_dir / "worktrees"
+        if worktrees.is_dir():
+            for entry in worktrees.iterdir():
+                try:
+                    gitfile = pathlib.Path((entry / "gitdir").read_text(encoding="utf-8").strip())
+                    if not gitfile.is_absolute():
+                        gitfile = entry / gitfile
+                    gitfile = gitfile.resolve()
+                except (OSError, UnicodeError):
+                    continue
+                roots.add(gitfile.parent)
     return any(resolved == candidate or candidate in resolved.parents for candidate in roots)
 
 
@@ -270,12 +290,16 @@ def safe_text(value, secrets=()):
 def safe_url(value, secrets=()):
     if not isinstance(value, str):
         return value
+    if any(ord(character) <= 0x20 or ord(character) == 0x7f for character in value):
+        return "[REDACTED_URL]"
+    if re.search(r"%(?![0-9a-f]{2})", value, re.IGNORECASE):
+        return "[REDACTED_URL]"
     try:
         parsed = urllib.parse.urlsplit(value)
     except ValueError:
-        return safe_text(value, secrets)
-    if not parsed.scheme or not parsed.netloc:
-        return safe_text(value, secrets)
+        return "[REDACTED_URL]"
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
+        return "[REDACTED_URL]"
     try:
         host = urllib.parse.quote(safe_text(urllib.parse.unquote(parsed.hostname or ""), secrets), safe=".-:")
         if ":" in host and not host.startswith("["):
@@ -285,10 +309,10 @@ def safe_url(value, secrets=()):
         if parsed.username is not None or parsed.password is not None:
             host = "[REDACTED]@" + host
     except ValueError:
-        return safe_text(value, secrets)
+        return "[REDACTED_URL]"
     query = []
     for key, item in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
-        if key.lower() in SENSITIVE_QUERY_KEYS:
+        if key.lower() in SENSITIVE_QUERY_KEYS or SENSITIVE_KEYS.search(key):
             item = "[REDACTED]"
         query.append((safe_text(key, secrets), safe_text(item, secrets)))
     return urllib.parse.urlunsplit((
@@ -671,6 +695,13 @@ def feed_data(payload):
     return posts, page.get("hasNextPage"), page.get("endCursor")
 
 
+def feed_post_times(posts):
+    try:
+        return [post_time(post) for post in posts]
+    except ValueError:
+        raise ValueError("feed_response_payload_invalid") from None
+
+
 def acquisition_succeeded(route_name, status, payload):
     if not 200 <= status < 300:
         return False
@@ -689,9 +720,15 @@ def post_url(post, secrets, subreddit):
             try:
                 parsed = urllib.parse.urlsplit(value)
                 port = parsed.port
+                decoded_path = urllib.parse.unquote(parsed.path, errors="strict")
             except ValueError:
                 continue
+            except UnicodeDecodeError:
+                continue
             permalink = re.fullmatch(r"/r/([^/]+)/comments/([^/]+)(?:/[^/]*)?/?", parsed.path, re.IGNORECASE)
+            decoded_permalink = re.fullmatch(
+                r"/r/([^/]+)/comments/([^/]+)(?:/[^/]*)?/?", decoded_path, re.IGNORECASE
+            )
             if (
                 parsed.scheme.lower() == "https"
                 and parsed.hostname in {"reddit.com", "www.reddit.com", "old.reddit.com"}
@@ -699,6 +736,12 @@ def post_url(post, secrets, subreddit):
                 and parsed.password is None
                 and port in (None, 443)
                 and permalink
+                and re.fullmatch(r"[0-9a-z]+", permalink.group(2), re.ASCII | re.IGNORECASE)
+                and decoded_permalink
+                and decoded_permalink.group(2) == permalink.group(2)
+                and not re.search(r"%[0-9a-f]{2}", decoded_path, re.IGNORECASE)
+                and "\\" not in decoded_path
+                and not any(segment in {".", ".."} for segment in decoded_path.split("/"))
                 and permalink.group(1).casefold() == subreddit.casefold()
             ):
                 sanitized = urllib.parse.urlsplit(safe_url(value, secrets))
@@ -771,6 +814,47 @@ def validate_comment_body(payload):
     if not isinstance(payload.get("comments"), list):
         raise ValueError("comments_schema_unknown")
     return payload["comments"]
+
+
+def valid_recording_envelope(record, filename):
+    if not isinstance(record, dict):
+        return False
+    if any(
+        not isinstance(record.get(field), str)
+        for field in ("record_id", "evidence_kind", "run_id", "trace_id", "span_id", "approval_sha256")
+    ):
+        return False
+    route = next((route for route in ROUTES.values() if route["id"] == record.get("endpoint")), None)
+    validation_errors = record.get("validation_errors", [])
+    return bool(
+        re.fullmatch(r"[0-9a-f]{32}", str(record.get("record_id", "")))
+        and filename == "record-" + record["record_id"] + ".json"
+        and record.get("ticket") == TICKET
+        and record.get("evidence_kind") in {"synthetic_offline", "live_provider_response"}
+        and re.fullmatch(r"[0-9a-f]{32}", str(record.get("run_id", "")))
+        and re.fullmatch(r"[0-9a-f]{32}", str(record.get("trace_id", "")))
+        and re.fullmatch(r"[0-9a-f]{16}", str(record.get("span_id", "")))
+        and record.get("stage") == "reddit_acquisition"
+        and route is not None
+        and record.get("provider") == route["provider"]
+        and re.fullmatch(r"[0-9a-f]{64}", str(record.get("approval_sha256", "")))
+        and isinstance(record.get("configuration"), dict)
+        and isinstance(record.get("request"), dict)
+        and record["request"].get("method") == "GET"
+        and evidence_present(record["request"].get("url"))
+        and isinstance(record["request"].get("parameters"), dict)
+        and isinstance(record.get("response"), dict)
+        and type(record["response"].get("truncated")) is bool
+        and isinstance(record["response"].get("headers"), dict)
+        and isinstance(record.get("billing"), dict)
+        and isinstance(record.get("counts"), dict)
+        and isinstance(validation_errors, list)
+        and all(isinstance(error, str) and re.fullmatch(r"[a-z0-9_]+", error) for error in validation_errors)
+        and (
+            record.get("parent_record_id") is None
+            or re.fullmatch(r"record-[0-9a-f]{32}\.json", str(record.get("parent_record_id", "")))
+        )
+    )
 
 
 def recording_file(recordings_dir, record):
@@ -1061,6 +1145,25 @@ class Collector:
         self.previous_record = record_id
         return record_id, body, headers
 
+    def annotate_record_validation(self, code):
+        if not self.counts["record_ids"]:
+            return
+        path = self.recordings_dir / self.counts["record_ids"][-1]
+        try:
+            with path.open(encoding="utf-8") as source:
+                record = json.load(source)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            raise CollectorError("record_validation_persistence_failed", "blocked") from None
+        errors = record.setdefault("validation_errors", [])
+        if not isinstance(errors, list):
+            raise CollectorError("record_validation_persistence_failed", "blocked")
+        if code not in errors:
+            errors.append(code)
+        try:
+            atomic_json(path, record)
+        except (OSError, CollectorError):
+            raise CollectorError("record_validation_persistence_failed", "blocked") from None
+
     def reserve(self, state_path, state, route_name, params):
         if state.get("limit_breach"):
             raise CollectorError("persistent_budget_limit_breach", "blocked")
@@ -1235,19 +1338,21 @@ class Collector:
                 except (TypeError, ValueError, json.JSONDecodeError):
                     self.counts["errors"].append("feed_response_schema_invalid")
                     self.coverage_reasons.append("feed response schema validation failed")
+                    self.annotate_record_validation("feed_response_schema_invalid")
                     raise CollectorError("feed_response_schema_invalid", "failed") from None
+                try:
+                    post_times = feed_post_times(posts)
+                except ValueError:
+                    self.counts["errors"].append("feed_response_payload_invalid")
+                    self.coverage_reasons.append("feed post contains an invalid numeric timestamp")
+                    self.annotate_record_validation("feed_response_payload_invalid")
+                    raise CollectorError("feed_response_payload_invalid", "failed") from None
                 self.feed_ok = True
                 self.counts["feed_pages"] += 1
                 self.counts["posts_seen"] += len(posts)
                 if not posts:
                     self.coverage_reasons.append("empty feed page does not establish source completeness")
-                for post in posts:
-                    try:
-                        observed = post_time(post)
-                    except ValueError:
-                        self.counts["errors"].append("feed_response_payload_invalid")
-                        self.coverage_reasons.append("feed post contains an invalid numeric timestamp")
-                        raise CollectorError("feed_response_payload_invalid", "failed") from None
+                for post, observed in zip(posts, post_times):
                     if observed is None:
                         self.counts["posts_missing_timestamp"] += 1
                         self.coverage_reasons.append("some feed posts have no verified timestamp field")
@@ -1316,6 +1421,7 @@ class Collector:
                 except (TypeError, ValueError):
                     self.comments_ok = False
                     self.counts["errors"].append("comment_response_schema_invalid")
+                    self.annotate_record_validation("comment_response_schema_invalid")
                     raise CollectorError("comment_response_schema_invalid", "failed") from None
                 self.counts["comment_pages"] += 1
                 self.counts["comments_seen"] += len(comments)
@@ -1541,7 +1647,10 @@ def run_replay(args, clock):
         return 2
     try:
         removed = expire_recordings(recordings_dir, clock())
+        source_records = []
         records = []
+        replay_errors = []
+        invalid_recordings = 0
         for path in sorted(recordings_dir.glob("record-*.json")):
             if path.is_symlink() or not private_file(path):
                 raise CollectorError("private_recording_permissions_required", "blocked")
@@ -1549,48 +1658,97 @@ def run_replay(args, clock):
                 record = json.load(source)
             if record_expiry(record) is None:
                 raise CollectorError("recording_retention_metadata_invalid", "blocked")
+            source_records.append(record)
+            if not valid_recording_envelope(record, path.name):
+                invalid_recordings += 1
+                replay_errors.append("recording_envelope_invalid")
+                continue
             records.append(record)
-        if not records:
+        if not source_records:
             raise CollectorError("no_unexpired_recordings_available", "blocked")
         replay_counts = {
             "feed_pages": 0,
             "feed_posts": 0,
+            "posts_missing_timestamp": 0,
             "empty_feed_pages": 0,
             "comment_pages": 0,
             "comments": 0,
             "validation_failures": 0,
             "request_failures": 0,
+            "invalid_recordings": invalid_recordings,
         }
+        replay_counts["validation_failures"] += invalid_recordings
         feed_records = 0
         comment_records = 0
+        feed_validation_failures = 0
+        comment_validation_failures = 0
         for record in records:
-            response = record.get("response") or {}
-            if not isinstance(response, dict):
-                replay_counts["validation_failures"] += 1
+            endpoint = record["endpoint"]
+            if endpoint == FEED_ID:
+                feed_records += 1
+            else:
+                comment_records += 1
+            recorded_errors = record.get("validation_errors", [])
+            if recorded_errors:
+                replay_counts["validation_failures"] += len(recorded_errors)
+                replay_errors.extend(recorded_errors)
+                if endpoint == FEED_ID:
+                    feed_validation_failures += len(recorded_errors)
+                else:
+                    comment_validation_failures += len(recorded_errors)
                 continue
+            response = record["response"]
             status_code = response.get("http_status")
             body = response.get("body")
             if not isinstance(status_code, int) or not 200 <= status_code < 300 or body is None:
                 replay_counts["request_failures"] += 1
-                continue
-            try:
-                if record.get("endpoint") == FEED_ID:
-                    feed_records += 1
-                    posts, _, _ = feed_data(body)
-                    replay_counts["feed_pages"] += 1
-                    replay_counts["feed_posts"] += len(posts)
-                    replay_counts["empty_feed_pages"] += not posts
-                elif record.get("endpoint") == COMMENTS_ID:
-                    comment_records += 1
-                    comments = validate_comment_body(body)
-                    replay_counts["comment_pages"] += 1
-                    replay_counts["comments"] += len(comments)
+                recorded_error = record.get("error")
+                if isinstance(recorded_error, str) and re.fullmatch(r"[A-Za-z0-9_:-]{1,100}", recorded_error):
+                    replay_errors.append(recorded_error)
                 else:
+                    replay_errors.append("recorded_request_failed")
+                continue
+            if endpoint == FEED_ID:
+                try:
+                    posts, _, _ = feed_data(body)
+                except (TypeError, ValueError, json.JSONDecodeError):
                     replay_counts["validation_failures"] += 1
-            except (TypeError, ValueError, json.JSONDecodeError):
-                replay_counts["validation_failures"] += 1
-        feed_status = "supported" if replay_counts["feed_pages"] else "failed" if feed_records or replay_counts["validation_failures"] else "partial"
-        comment_status = "supported" if replay_counts["comment_pages"] else "failed" if comment_records else "partial"
+                    feed_validation_failures += 1
+                    replay_errors.append("feed_response_schema_invalid")
+                    continue
+                try:
+                    post_times = feed_post_times(posts)
+                except ValueError:
+                    replay_counts["validation_failures"] += 1
+                    feed_validation_failures += 1
+                    replay_errors.append("feed_response_payload_invalid")
+                    continue
+                replay_counts["feed_pages"] += 1
+                replay_counts["feed_posts"] += len(posts)
+                replay_counts["posts_missing_timestamp"] += sum(observed is None for observed in post_times)
+                replay_counts["empty_feed_pages"] += not posts
+            else:
+                try:
+                    comments = validate_comment_body(body)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    replay_counts["validation_failures"] += 1
+                    comment_validation_failures += 1
+                    replay_errors.append("comment_response_schema_invalid")
+                    continue
+                replay_counts["comment_pages"] += 1
+                replay_counts["comments"] += len(comments)
+        feed_status = (
+            "partial" if replay_counts["feed_pages"] and (feed_validation_failures or invalid_recordings)
+            else "supported" if replay_counts["feed_pages"]
+            else "failed" if feed_records or invalid_recordings
+            else "partial"
+        )
+        comment_status = (
+            "partial" if replay_counts["comment_pages"] and (comment_validation_failures or invalid_recordings)
+            else "supported" if replay_counts["comment_pages"]
+            else "failed" if comment_records
+            else "partial"
+        )
         live = sum(record.get("evidence_kind") == "live_provider_response" for record in records)
         synthetic = sum(record.get("evidence_kind") == "synthetic_offline" for record in records)
         status = "failed" if not replay_counts["feed_pages"] + replay_counts["comment_pages"] and (
@@ -1607,6 +1765,7 @@ def run_replay(args, clock):
             "live_recordings": live,
             "synthetic_recordings": synthetic,
             "counts": replay_counts,
+            "errors": list(dict.fromkeys(replay_errors)),
             "validation": {
                 "feed_schema": feed_status,
                 "comment_schema": comment_status,
@@ -1621,8 +1780,8 @@ def run_replay(args, clock):
         }
         report_path = recordings_dir / ("replay-" + uuid.uuid4().hex + ".json")
         now = clock()
-        replay_retention_days = min(record["retention_days"] for record in records)
-        source_expires = min(record_expiry(record) for record in records)
+        replay_retention_days = min(record["retention_days"] for record in source_records)
+        source_expires = min(record_expiry(record) for record in source_records)
         atomic_json(report_path, {
             **report,
             "stage": "reddit_replay_output",

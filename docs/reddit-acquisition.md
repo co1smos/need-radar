@@ -12,6 +12,28 @@ Implementation and bounded-acquisition authorization are recorded by the owner. 
 
 To clear the historical hold in a later, separately authorized activation, the supervisor must use actual provider/account evidence to determine the request outcome and actual charge; update the private canonical state under its ticket lock; add that actual charge to `spent_micro_usd` and increment `successful_requests` only if the evidence establishes success; and update `incident_hold` with the same incident reference, `status: "reconciled"`, the evidence-backed `outcome`, actual integer `charge_micro_usd` (including zero only when proven), an `evidence_ref`, and `reconciled_at`. The collector's ordinary `reconcile` command handles only its own persisted pending request and cannot resolve this historical incident. Do not use an acknowledgement, a free-text claim, or an assumed zero charge. Review the real manifest evidence and establish authorized deletion enforcement before any live run; this correction does not perform those steps or mark acquisition complete.
 
+## Cumulative review criteria
+
+This matrix carries forward the initial and resumed independent findings. “Code fixed” means the local regression is implemented; it does not clear a live gate or establish external evidence.
+
+| # | Criterion | Code status | Separate live status |
+|---|---|---|---|
+| 1 | Persist the unknown-outcome incident hold and block before credentials/dispatch. | Fixed; hold remains mandatory in new and migrated state. | Historical outcome and charge are still unknown and unreconciled. |
+| 2 | Redact URL components, embedded URLs, sensitive dictionary keys, and malformed URLs without leakage or key loss. | Fixed; malformed URLs fail closed as `[REDACTED_URL]`. | No live artifacts were inspected. |
+| 3 | Inherit earliest source expiry for replay and run summaries. | Fixed; derived expiry cannot extend its source. | Invocation cleanup is not an idle-time deletion guarantee. |
+| 4 | Require explicit synthetic credentials and guard tests/subprocesses from live paths/network. | Fixed in the collector and test guards. | No production credential was read. |
+| 5 | Restrict comment targets to valid post permalinks in approved communities. | Fixed; post IDs and decoded dot-segments are validated before dispatch/reservation. | Endpoint/provider permissions remain unverified. |
+| 6 | Exclude the primary checkout and every associated worktree from private artifact locations. | Fixed for execution from either primary or worker checkout. | No production recording path was accessed. |
+| 7 | Remove abandoned atomic-write files and expire retained request parameters without clearing accounting holds. | Fixed in invocation cleanup and state expiry. | An authorized idle-time deletion mechanism remains required. |
+| 8 | Persist malformed-payload failures and reject malformed expiry metadata safely. | Fixed; collection and replay share feed timestamp validation and preserve recorded validation errors. | No live response was used. |
+| 9 | Fail replay when no valid evidence remains and validate replay envelopes structurally. | Fixed; invalid envelopes are counted/reported, and unusable-only replay fails with a structured artifact. | Synthetic replay is not live acceptance evidence. |
+| 10 | Record verified overcharges and permanently stop spending after a limit breach. | Fixed; actual charge is retained and the breach blocks later dispatch. | No provider billing event was reconciled in this correction. |
+| 11 | Reconcile the historical request from actual provider/account evidence. | Not a code-only action; the enforced hold remains active. | Open; supervisor evidence and canonical-state reconciliation are required. |
+| 12 | Substantiate manifest claims for approved seeds/window, schemas, eligibility, permissions, billing ceilings, fallback, and retention. | Manifest assertions remain fail-closed but are not treated as proof. | Open; evidence review is required before dispatch. |
+| 13 | Establish authorized expiry enforcement and bounded observed end-to-end acquisition/replay proof. | Invocation cleanup is implemented; it does not guarantee deletion while idle. | Open; Reddit live acquisition and X (#9) remain unverified. |
+
+No canonical state or credential files were changed. No external evidence was created or inferred; the historical incident and all other live prerequisites remain separate holds.
+
 ## Public route evidence
 
 Public provider and Treg documentation was fetched on October 7, 2026; none of these checks establishes account eligibility or source/retention rights.

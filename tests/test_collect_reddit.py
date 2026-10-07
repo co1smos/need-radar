@@ -317,7 +317,7 @@ class CollectRedditCliTests(unittest.TestCase):
             "api_key": "first-secret",
             "access_token": "second-secret",
             "message": "signed https://first-secret.example/path/first-secret?X-Amz-Signature=signature-secret.",
-            "url": "https://first-secret.example/second-secret/path?token=third-secret",
+            "url": "https://first-secret.example/second-secret/path?token=third-secret&credential=fourth-secret",
         }
         sanitized = collect_reddit.sanitize(payload, ["first-secret", "second-secret", "third-secret"])
         serialized = json.dumps(sanitized)
@@ -325,10 +325,41 @@ class CollectRedditCliTests(unittest.TestCase):
         self.assertNotIn("first-secret", serialized)
         self.assertNotIn("second-secret", serialized)
         self.assertNotIn("third-secret", serialized)
+        self.assertNotIn("fourth-secret", serialized)
         self.assertNotIn("signature-secret", serialized)
         redacted_keys = [key for key in sanitized if key.startswith("[REDACTED")]
         self.assertEqual(len(redacted_keys), 2)
         self.assertEqual(len(set(sanitized)), len(sanitized))
+
+    def test_malformed_url_is_redacted_in_persisted_record(self):
+        for value in (
+            "https://fixture-user:fixture-password@example.com:bad/path?X-Amz-Credential=fixture-credential",
+            "https://fixture-user:fixture-password@[invalid/path?token=fixture-credential",
+            "/relative/path?token=fixture-credential",
+            "https://example.com/path\n?token=fixture-credential",
+            "https://example.com/path%ZZ?token=fixture-credential",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(collect_reddit.safe_url(value), "[REDACTED_URL]")
+
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        malformed = "https://fixture-user:fixture-password@example.com:bad/path?X-Amz-Credential=fixture-credential"
+        post["url"] = malformed
+        post["text"] = "copied from " + malformed
+        transport = FixtureTransport([response(200, page)])
+
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        persisted = "\n".join(path.read_text() for path in self.recordings_dir.glob("record-*.json"))
+        for secret in ("fixture-user", "fixture-password", "fixture-credential"):
+            self.assertNotIn(secret, persisted)
+        self.assertIn("[REDACTED_URL]", persisted)
 
     def test_post_permalink_must_belong_to_approved_community(self):
         self.assertEqual(
@@ -343,6 +374,35 @@ class CollectRedditCliTests(unittest.TestCase):
             "https://www.reddit.com/user/someone/",
         ):
             self.assertIsNone(collect_reddit.post_url({"url": url}, [], "example"))
+
+    def test_post_permalink_requires_valid_id_and_safe_path_before_comment_dispatch(self):
+        for url in (
+            "https://www.reddit.com/r/example/comments/../about/",
+            "https://www.reddit.com/r/example/comments/./title/",
+            "https://www.reddit.com/r/example/comments/%2e%2e/title/",
+            "https://www.reddit.com/r/example/comments/demo1/%252e%252e/",
+            "https://www.reddit.com/r/example/comments/demo-1/title/",
+            "https://www.reddit.com/r/example/comments/démø/title/",
+            "https://www.reddit.com/r/example/comments/demo1/../about/",
+        ):
+            with self.subTest(url=url):
+                self.assertIsNone(collect_reddit.post_url({"url": url}, [], "example"))
+
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["url"] = "https://www.reddit.com/r/example/comments/../about/"
+        transport = FixtureTransport([response(200, page)])
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-comment-pages", "1", "--max-posts", "1"),
+            transport,
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(len(transport.requests), 1)
+        self.assertEqual(urlsplit(transport.requests[0][0]).path, f"/call/{collect_reddit.FEED_ID}")
+        state = json.loads((self.state_dir / "state.json").read_text())
+        self.assertEqual(state["attempts"], 1)
 
     def test_post_permalink_userinfo_is_not_sanitized_into_a_comments_target(self):
         feed = fixture_body("feed-page-1.json")
@@ -366,6 +426,40 @@ class CollectRedditCliTests(unittest.TestCase):
     def test_repository_guard_covers_primary_checkout(self):
         primary = ROOT.parents[2]
         self.assertTrue(collect_reddit.repository_path(primary / "private-recordings"))
+
+    def test_repository_guard_discovers_worktrees_from_primary_and_worker(self):
+        primary = self.root / "primary"
+        common_git = primary / ".git"
+        common_git.mkdir(parents=True)
+        worker = self.root / "worker"
+        other_worktree = self.root / "other-worktree"
+        for name, worktree in (("worker", worker), ("other", other_worktree)):
+            entry = common_git / "worktrees" / name
+            entry.mkdir(parents=True)
+            worktree.mkdir()
+            (worktree / ".git").write_text(f"gitdir: {entry}\n")
+            gitfile = worktree / ".git"
+            gitfile_reference = os.path.relpath(gitfile, entry) if name == "other" else str(gitfile)
+            (entry / "gitdir").write_text(gitfile_reference + "\n")
+            (entry / "commondir").write_text("../..\n")
+
+        with patch.object(collect_reddit, "__file__", str(primary / "scripts" / "collect_reddit.py")):
+            self.assertTrue(collect_reddit.repository_path(other_worktree / "private-recordings"))
+            replay_args = collect_reddit.parse_args([
+                "replay",
+                "--recordings-dir", str(other_worktree / "private-recordings"),
+                "--state-dir", str(self.state_dir),
+            ])
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = collect_reddit.run_replay(replay_args, lambda: NOW)
+            self.assertEqual(code, 2)
+            self.assertIn("private_artifacts_must_be_outside_repository", stdout.getvalue())
+            self.assertFalse((other_worktree / "private-recordings").exists())
+
+        with patch.object(collect_reddit, "__file__", str(worker / "scripts" / "collect_reddit.py")):
+            self.assertTrue(collect_reddit.repository_path(primary / "private-recordings"))
+            self.assertTrue(collect_reddit.repository_path(other_worktree / "private-recordings"))
 
     def test_request_deadline_interrupts_blocking_operation(self):
         with self.assertRaisesRegex(TimeoutError, "request_deadline_exceeded"):
@@ -545,6 +639,99 @@ class CollectRedditCliTests(unittest.TestCase):
         self.assertEqual(len(artifacts), 1)
         self.assertIn("feed_response_payload_invalid", json.loads(artifacts[0].read_text())["errors"])
 
+    def test_replay_preserves_malformed_timestamp_failure(self):
+        page = fixture_body("feed-page-1.json")
+        page["data"]["subredditV3"]["elements"]["edges"][0]["node"]["createdAt"] = 1e300
+        transport = FixtureTransport([response(200, page)])
+        code, stdout, _ = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials(),
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("feed_response_payload_invalid", json.loads(stdout)["errors"])
+
+        code, stdout, _ = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir), "--state-dir", str(self.state_dir)
+        ])
+
+        self.assertEqual(code, 2)
+        report = json.loads(stdout)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["counts"]["feed_pages"], 0)
+        self.assertEqual(report["counts"]["validation_failures"], 1)
+        self.assertIn("feed_response_payload_invalid", report["errors"])
+        source_record = json.loads(next(self.recordings_dir.glob("record-*.json")).read_text())
+        self.assertEqual(source_record["validation_errors"], ["feed_response_payload_invalid"])
+        artifact = json.loads((self.recordings_dir / report["artifact"]).read_text())
+        self.assertEqual(artifact["status"], "failed")
+
+    def test_replay_preserves_recorded_unknown_request_failure(self):
+        transport = FixtureTransport([TimeoutError("synthetic timeout")])
+        code, _, _ = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"), transport, FakeCredentials()
+        )
+        self.assertEqual(code, 2)
+
+        code, stdout, _ = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir), "--state-dir", str(self.state_dir)
+        ])
+
+        self.assertEqual(code, 2)
+        report = json.loads(stdout)
+        self.assertEqual(report["counts"]["request_failures"], 1)
+        self.assertIn("request_outcome_unknown:TimeoutError", report["errors"])
+
+    def test_replay_keeps_mixed_valid_and_invalid_feed_evidence_partial(self):
+        invalid_page = fixture_body("feed-page-1.json")
+        invalid_page["data"]["subredditV3"]["elements"]["edges"][0]["node"]["createdAt"] = 1e300
+        transport = FixtureTransport([
+            response(200, fixture_body("feed-page-1.json")),
+            response(200, invalid_page),
+        ])
+        code, _, _ = self.run_cli(
+            self.args("--max-feed-pages", "2", "--max-posts", "0"),
+            transport,
+            FakeCredentials(),
+        )
+        self.assertEqual(code, 2)
+
+        code, stdout, _ = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir), "--state-dir", str(self.state_dir)
+        ])
+
+        self.assertEqual(code, 0)
+        report = json.loads(stdout)
+        self.assertEqual(report["status"], "partial")
+        self.assertEqual(report["counts"]["feed_pages"], 1)
+        self.assertEqual(report["counts"]["validation_failures"], 1)
+        self.assertIn("feed_response_payload_invalid", report["errors"])
+
+    def test_replay_keeps_valid_evidence_when_an_envelope_is_invalid(self):
+        transport = FixtureTransport([response(200, fixture_body("feed-page-2.json"))])
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"), transport, FakeCredentials()
+        )
+        self.assertEqual(code, 0, stderr)
+        source = next(self.recordings_dir.glob("record-*.json"))
+        valid_record = json.loads(source.read_text())
+        invalid_record = dict(valid_record)
+        invalid_record.pop("record_id")
+        invalid_path = self.recordings_dir / "record-invalid-envelope.json"
+        invalid_path.write_text(json.dumps(invalid_record))
+        invalid_path.chmod(0o600)
+
+        code, stdout, _ = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir), "--state-dir", str(self.state_dir)
+        ])
+
+        self.assertEqual(code, 0)
+        report = json.loads(stdout)
+        self.assertEqual(report["status"], "partial")
+        self.assertEqual(report["counts"]["feed_pages"], 1)
+        self.assertEqual(report["counts"]["invalid_recordings"], 1)
+        self.assertIn("recording_envelope_invalid", report["errors"])
+
     def test_replay_fails_when_all_recorded_pages_are_invalid(self):
         transport = FixtureTransport([response(200, {"code": 200, "data": {}})])
         self.run_cli(
@@ -560,6 +747,37 @@ class CollectRedditCliTests(unittest.TestCase):
         self.assertGreater(report["counts"]["validation_failures"], 0)
         artifact = self.recordings_dir / report["artifact"]
         self.assertEqual(json.loads(artifact.read_text())["status"], "failed")
+
+    def test_replay_reports_invalid_record_envelope_without_crashing(self):
+        transport = FixtureTransport([response(200, fixture_body("feed-page-2.json"))])
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"), transport, FakeCredentials()
+        )
+        self.assertEqual(code, 0, stderr)
+        source = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(source.read_text())
+        del record["record_id"]
+        source.write_text(json.dumps(record))
+        source.chmod(0o600)
+        malformed_record = json.loads(next(self.recordings_dir.glob("record-*.json")).read_text())
+        malformed_record["record_id"] = 12345678901234567890123456789012
+        malformed_path = self.recordings_dir / "record-malformed-id.json"
+        malformed_path.write_text(json.dumps(malformed_record))
+        malformed_path.chmod(0o600)
+
+        code, stdout, _ = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir), "--state-dir", str(self.state_dir)
+        ])
+
+        self.assertEqual(code, 2)
+        report = json.loads(stdout)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["counts"]["invalid_recordings"], 2)
+        self.assertEqual(report["counts"]["validation_failures"], 2)
+        self.assertEqual(report["record_ids"], [])
+        self.assertIn("recording_envelope_invalid", report["errors"])
+        artifact = json.loads((self.recordings_dir / report["artifact"]).read_text())
+        self.assertEqual(artifact["status"], "failed")
 
     def test_reconciliation_records_overcharge_and_permanently_blocks_spending(self):
         transport = FixtureTransport([TimeoutError("synthetic timeout")])
