@@ -2,7 +2,7 @@
 
 独立项目：持续发现 AI 开发/学习中具体、有价值、可解决、有合理规模切入口的 friction。
 
-**当前状态：设计讨论已完成，尚未实现或启用系统。当前没有需要用户补答的设计问题。**
+**当前状态：设计讨论已完成；ticket #1 的离线 serve tracer 已实现。未连接实时来源、模型、定时任务或 Discord。**
 
 项目路径：`/home/ubuntu/projects/need-radar`
 
@@ -52,8 +52,26 @@ Judge 对两版使用相同目标：是否发现了真实、有价值、sizeable
 
 仅改变 extraction；source/retrieval 的不同策略保留为后续单变量实验。没有个人喜好或个性化反馈模块。
 
+## Ticket #1：离线 serve tracer
+
+使用 Python 3 标准库运行合成 fixture；不安装依赖、不访问来源或调用模型：
+
+```sh
+demo_dir="$(mktemp -d)"
+python3 -m need_radar --output "$demo_dir"
+```
+
+CLI 输出 `status=success`，并在目录中保存有序 `snapshot.json`、解析后的 v0 `prompt.json`、明确标记为合成边界的 `model-response.json`、已校验的 `candidates.json`、规范 `report.md` 和 SQLite `lineage.sqlite3`。所有阶段保留输入/输出哈希和前序阶段链接。合成 fixture 不是实时来源或模型验证。
+
+已运行的离线检查命令：
+
+```sh
+python3 -m unittest discover -s tests -v
+python3 -m compileall -q need_radar tests
+```
+
 ## 接续约束
 
 Hermes session：`20261006_114451_8a8410`，全程保留，详见 [session record](docs/grill/session.md)。
 
-后续 agent 先读 [AGENTS.md](AGENTS.md)。本次只完成设计/讨论文档：没有应用代码、Git 初始化、依赖安装、付费数据接入、cron 或 Discord 发布。实施与上线需要另外授权。
+后续 agent 先读 [AGENTS.md](AGENTS.md)。ticket #1 仅实现离线 tracer；未做 Git 初始化、依赖安装、付费数据接入、cron 或 Discord 发布。任何实时接入与上线均需另行授权。
