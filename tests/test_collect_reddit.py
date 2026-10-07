@@ -498,12 +498,95 @@ print(safe_string({payload!r}))
         ):
             self.assertNotIn(secret, persisted)
 
+    def test_normalizes_unicode_escapes_before_secret_and_query_classification(self):
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["text"] = (
+            r"plain \u005cu0073ynthetic-token "
+            r"https://ordinary.example/\u005cu0073ynthetic-token "
+            "https://ordinary.example/?pass%5Cu0077ord=fixture-query-secret"
+        )
+
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            FixtureTransport([response(200, page)]),
+            FakeCredentials("synthetic-token"),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        persisted = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        for _ in range(collect_reddit.MAX_URL_DECODE_ROUNDS + 4):
+            persisted = unquote(collect_reddit.decode_escaped_ascii(persisted))
+        self.assertNotIn("synthetic-token", persisted)
+        self.assertNotIn("fixture-query-secret", persisted)
+
+    def test_residual_non_ascii_unicode_escapes_are_redacted_before_persistence(self):
+        persisted = self.collect_text_recording(r"unicode note=\u79d8\u5bc6")
+
+        self.assertNotIn("79d8", persisted)
+        self.assertNotIn("秘密", persisted)
+
+    def test_excessively_encoded_dictionary_key_fails_closed_with_lineage(self):
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post[r"\u0025" + "25" * 20 + "41"] = "fixture-untrusted-key-value"
+        transport = FixtureTransport([response(200, page)])
+
+        code, stdout, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 2, stderr)
+        report = json.loads(stdout)
+        self.assertIn("response_sanitization_failed", report["errors"])
+        self.assertEqual(len(transport.requests), 1)
+        state = json.loads((self.state_dir / "state.json").read_text())
+        self.assertIsNone(state["pending"])
+        self.assertEqual(state["successful_requests"], 1)
+        record = json.loads(next(self.recordings_dir.glob("record-*.json")).read_text())
+        self.assertEqual(record["error"], "response_sanitization_failed")
+        self.assertNotIn("fixture-untrusted-key-value", json.dumps(record))
+        replay_code, replay_stdout, _ = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+        self.assertEqual(replay_code, 2)
+        self.assertIn("response_sanitization_failed", json.loads(replay_stdout)["errors"])
+
+    def test_replay_rejects_sanitization_record_interrupted_before_settlement(self):
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post[r"\u0025" + "25" * 20 + "41"] = "fixture-untrusted-key-value"
+        with patch.object(collect_reddit.Collector, "settle", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_cli(
+                    self.args("--max-feed-pages", "1", "--max-posts", "0"),
+                    FixtureTransport([response(200, page)]),
+                    FakeCredentials(),
+                )
+
+        source = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(source.read_text())
+        self.assertFalse(record["processing_complete"])
+        self.assertNotIn("fixture-untrusted-key-value", json.dumps(record))
+        replay_code, replay_stdout, _ = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+        self.assertEqual(replay_code, 2)
+        self.assertIn("acquisition_processing_incomplete", json.loads(replay_stdout)["errors"])
+
     def test_redacts_multiline_private_key_backtick_and_unicode_escaped_key(self):
         page = fixture_body("feed-page-1.json")
         post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
         post["text"] = "\n".join((
             "private_key: -----BEGIN PRIVATE KEY-----",
             "fixture-private-block-secret",
+            "-----END PRIVATE KEY-----",
+            "private key:\n-----BEGIN PRIVATE KEY-----",
+            "fixture-spaced-private-block-secret",
             "-----END PRIVATE KEY-----",
             "password=`fixture backtick password secret`",
             'Cookie: session=fixture-cookie-before-url https://ordinary.example/path',
@@ -526,6 +609,7 @@ print(safe_string({payload!r}))
             persisted = unquote(persisted)
         for secret in (
             "fixture-private-block-secret",
+            "fixture-spaced-private-block-secret",
             "fixture backtick password secret",
             "fixture-cookie-before-url",
             "fixture-auth-first-line",

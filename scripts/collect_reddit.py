@@ -102,7 +102,7 @@ SENSITIVE_ASSIGNMENT_PREFIX = re.compile(
     |
     (?<![a-z0-9_])(?P<label>
         proxy-authorization|authorization|cookie|
-        api[_-]?(?:key|token)|private[_-]?key|secret[_-]?key|
+        api[_-]?(?:key|token)|private(?:[_-]|\s+)?key|secret[_-]?key|
         access[_-]?token|refresh[_-]?token|token|key|secret|
         auth|client[_-]?secret|password|passwd|credential|signature|sig|
         x-amz-(?:credential|security-token|signature)|
@@ -120,6 +120,10 @@ class CollectorError(Exception):
         super().__init__(code)
         self.code = code
         self.status = status
+
+
+class SanitizationError(ValueError):
+    pass
 
 
 @dataclass
@@ -284,13 +288,15 @@ def atomic_json(path, value):
 
 def redact_assignments(value):
     value = decode_escaped_ascii(value)
+    if value is None:
+        return "[REDACTED]"
     parts = []
     offset = 0
     while match := SENSITIVE_ASSIGNMENT_PREFIX.search(value, offset):
         parts.append(value[offset:match.end()])
         label = (match.group("label") or "").lower()
         start = match.end()
-        private_key = re.sub(r"[_-]", "", label) == "privatekey"
+        private_key = re.sub(r"[_\-\s]", "", label) == "privatekey"
         begin = re.compile(
             r"\s*-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----",
             re.IGNORECASE,
@@ -408,9 +414,9 @@ def safe_string(value, secrets=(), _depth=0):
     if _depth > MAX_NESTED_URLS:
         return "[REDACTED]"
     text = str(value).encode("utf-8", errors="replace").decode("utf-8")
-    for secret in secrets:
-        if secret:
-            text = text.replace(secret, "[REDACTED]")
+    text = decode_escaped_ascii(text)
+    if text is None:
+        return "[REDACTED]"
     decoded_parts = []
     offset = 0
     for match in EMBEDDED_URL.finditer(text):
@@ -444,10 +450,9 @@ def safe_text(value, secrets=(), _depth=0):
         return None
     if _depth > MAX_NESTED_URLS:
         return "[REDACTED]"
-    text = str(value)
-    for secret in secrets:
-        if secret:
-            text = text.replace(secret, "[REDACTED]")
+    text = decode_escaped_ascii(str(value))
+    if text is None:
+        return "[REDACTED]"
     decoded = decode_url_component(text)
     if decoded is None:
         return "[REDACTED]"
@@ -460,23 +465,34 @@ def safe_text(value, secrets=(), _depth=0):
 
 
 def decode_url_component(value):
+    if not isinstance(value, str):
+        return None
     for _ in range(MAX_URL_DECODE_ROUNDS):
-        decoded = urllib.parse.unquote(value)
+        decoded = decode_escaped_ascii(urllib.parse.unquote(value))
+        if decoded is None:
+            return None
         if decoded == value:
             return value
         value = decoded
-    if re.search(r"%[0-9a-f]{2}", value, re.IGNORECASE):
+    if re.search(r"%[0-9a-f]{2}|\\u[0-9a-f]{4}", value, re.IGNORECASE):
         return None
     return value
 
 
 def decode_escaped_ascii(value):
-    return re.sub(
-        r"\\u([0-9a-f]{4})",
-        lambda match: chr(int(match.group(1), 16)) if int(match.group(1), 16) < 128 else match.group(0),
-        value,
-        flags=re.IGNORECASE,
-    )
+    if not isinstance(value, str):
+        return None
+    for _ in range(MAX_URL_DECODE_ROUNDS):
+        decoded = re.sub(
+            r"\\u([0-9a-f]{4})",
+            lambda match: chr(int(match.group(1), 16)) if int(match.group(1), 16) < 128 else match.group(0),
+            value,
+            flags=re.IGNORECASE,
+        )
+        if decoded == value:
+            return None if re.search(r"\\u[0-9a-f]{4}", value, re.IGNORECASE) else value
+        value = decoded
+    return None
 
 
 def safe_url(value, secrets=(), _depth=0):
@@ -547,27 +563,18 @@ def sanitize(value, secrets=(), key="", _depth=0):
         for name, item in value.items():
             original = str(name)
             decoded_name = decode_url_component(original)
-            if decoded_name is not None:
-                for _ in range(MAX_URL_DECODE_ROUNDS):
-                    escaped_name = decode_escaped_ascii(decoded_name)
-                    if escaped_name == decoded_name:
-                        break
-                    decoded_name = decode_url_component(escaped_name)
-            invalid_encoding = decoded_name is None or re.search(
+            if decoded_name is None or re.search(
                 r"%(?![0-9a-f]{2})|\\u[0-9a-f]{4}", decoded_name, re.IGNORECASE
-            )
-            sensitive_name = not invalid_encoding and SENSITIVE_KEYS.search(decoded_name)
-            cleaned = (
-                "[REDACTED_KEY]"
-                if invalid_encoding or sensitive_name
-                else safe_string(decoded_name, secrets)
-            )
+            ):
+                raise SanitizationError("response_sanitization_failed")
+            sensitive_name = SENSITIVE_KEYS.search(decoded_name)
+            cleaned = "[REDACTED_KEY]" if sensitive_name else safe_string(decoded_name, secrets)
             unique = cleaned
             index = 2
             while unique in result:
                 unique = f"{cleaned}#{index}"
                 index += 1
-            result[unique] = "[REDACTED]" if invalid_encoding or sensitive_name else sanitize(
+            result[unique] = "[REDACTED]" if sensitive_name else sanitize(
                 item, secrets, decoded_name, _depth + 1
             )
         return result
@@ -610,10 +617,14 @@ def sanitize_body(body, secrets=()):
             return json.dumps(
                 sanitize(value, secrets), ensure_ascii=True, sort_keys=True, separators=(",", ":")
             )
+        except SanitizationError:
+            raise
         except (RecursionError, ValueError):
             return "[REDACTED_INVALID_JSON]"
     try:
         return sanitize(value, secrets)
+    except SanitizationError:
+        raise
     except (RecursionError, ValueError):
         return "[REDACTED_INVALID_JSON]"
 
@@ -1413,12 +1424,16 @@ class Collector:
             raise CollectorError("run_report_persistence_failed", "blocked") from None
         return report
 
-    def save_record(self, route_name, params, response=None, error=None, reservation=None, api_counts=None, request_headers=None):
+    def save_record(self, route_name, params, response=None, error=None, reservation=None, api_counts=None, request_headers=None, sanitized_body=None):
         route = ROUTES[route_name]
         now = self.clock()
         expires = now + dt.timedelta(days=self.retention_days)
         self.earliest_source_expiry = min(self.earliest_source_expiry or expires, expires)
-        body = sanitize_body(response.body, [self.credentials.token]) if response is not None else None
+        body = (
+            sanitized_body
+            if sanitized_body is not None
+            else sanitize_body(response.body, [self.credentials.token]) if response is not None else None
+        )
         headers = response_headers(response.headers, [self.credentials.token]) if response is not None else {}
         call_id = header(response.headers, "X-Treg-Call-Id") if response is not None else None
         charged_micro_usd = billing_cost(header(response.headers, "X-Treg-Cost-Micro")) if response else None
@@ -1674,10 +1689,16 @@ class Collector:
                     atomic_json(state_path, state)
                 raise CollectorError("request_outcome_unknown_reconciliation_required", "blocked") from None
             cursors = original_cursors(route_name, result.body)
-            body = sanitize_body(result.body, [self.credentials.token])
+            sanitization_error = None
+            try:
+                body = sanitize_body(result.body, [self.credentials.token])
+            except SanitizationError:
+                body = "[REDACTED_INVALID_JSON]"
+                sanitization_error = "response_sanitization_failed"
             successful_response = acquisition_succeeded(route_name, result.status, body)
             self.save_record(
                 route_name, params, response=result, reservation=reservation,
+                sanitized_body=body if sanitization_error else None,
                 api_counts={
                     "attempt": state["attempts"],
                     "response_bytes": len(result.body),
@@ -1702,6 +1723,8 @@ class Collector:
                 self.fail_record("response_exceeded_recording_size_limit")
             if result.status in (401, 403):
                 self.fail_record("provider_authentication_or_permission_failure")
+            if sanitization_error:
+                self.fail_record(sanitization_error)
             if result.status in (408, 425, 429, 500, 502, 503, 504) and local_retries < MAX_RETRIES:
                 local_retries += 1
                 try:
