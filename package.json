@@ -1,0 +1,16 @@
+{
+  "name": "need-radar-orchestration",
+  "private": true,
+  "scripts": {
+    "sandcastle": "tsx .sandcastle/main.mts",
+    "sandcastle:preflight": "tsx .sandcastle/main.mts --preflight",
+    "test:sandcastle-workflow": "node --test .sandcastle/workflow-core.test.mjs",
+    "typecheck:sandcastle-workflow": "tsc --noEmit --allowJs --checkJs false --module nodenext --moduleResolution nodenext --target es2022 --lib esnext --types node --skipLibCheck .sandcastle/main.mts"
+  },
+  "devDependencies": {
+    "@ai-hero/sandcastle": "0.12.0",
+    "@types/node": "26.4.1",
+    "tsx": "4.21.0",
+    "typescript": "7.0.2"
+  }
+}

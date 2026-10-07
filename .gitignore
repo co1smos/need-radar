@@ -226,6 +226,7 @@ __marimo__/
 # Sandcastle generated state (keep runner source/config trackable)
 /.sandcastle/worktrees/
 /.sandcastle/logs/
+/.sandcastle/runs/
 
 # Node/TypeScript orchestration artifacts
 node_modules/
