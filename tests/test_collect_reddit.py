@@ -482,6 +482,22 @@ print(safe_string({payload!r}))
         self.assertNotIn("fixture-escaped-json-secret", persisted)
         self.assertIn("safe-tail", persisted)
 
+    def test_redacts_private_secret_and_api_token_assignments_in_prose(self):
+        persisted = self.collect_text_recording(
+            'private_key="fixture-private-key-secret"; '
+            "SECRET-KEY: 'fixture-secret-key-secret'; "
+            'api_token = "fixture-api-token-secret"; '
+            "API-TOKEN=fixture-api-token-hyphen-secret"
+        )
+
+        for secret in (
+            "fixture-private-key-secret",
+            "fixture-secret-key-secret",
+            "fixture-api-token-secret",
+            "fixture-api-token-hyphen-secret",
+        ):
+            self.assertNotIn(secret, persisted)
+
     def test_redacts_folded_authorization_header_continuations(self):
         persisted = self.collect_text_recording(
             "Authorization: Bearer fixture-header-first-secret\r\n"
@@ -1506,6 +1522,38 @@ print(safe_string({payload!r}))
         self.assertNotEqual(code, 0)
         self.assertEqual(len(auth.requests), 1)
         self.assertIn("permission", stdout.lower())
+
+    def test_replay_marks_transient_attempt_complete_after_settled_retry(self):
+        transport = FixtureTransport([
+            response(503, {"error": "synthetic transient"}, cost=1000, call_id="retry-1"),
+            response(200, fixture_body("feed-page-2.json"), cost=1000, call_id="retry-2"),
+        ])
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials(),
+        )
+        self.assertEqual(code, 0, stderr)
+        records = [
+            json.loads(path.read_text())
+            for path in self.recordings_dir.glob("record-*.json")
+        ]
+        transient_record = next(
+            record for record in records if record["response"]["http_status"] == 503
+        )
+        self.assertTrue(transient_record["processing_complete"])
+        self.assertEqual(transient_record["error"], "transient_retry_response")
+
+        replay_code, replay_stdout, replay_stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(replay_code, 0, replay_stderr)
+        replay = json.loads(replay_stdout)
+        self.assertNotIn("acquisition_processing_incomplete", replay["errors"])
+        self.assertIn("transient_retry_response", replay["errors"])
+        self.assertEqual(replay["counts"]["billing_unknown_requests"], 0)
 
     def test_retry_after_is_honored_within_bound_and_long_wait_stops(self):
         waits = []

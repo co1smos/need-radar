@@ -102,7 +102,8 @@ SENSITIVE_ASSIGNMENT_PREFIX = re.compile(
     |
     (?<![a-z0-9_])(?P<label>
         proxy-authorization|authorization|cookie|
-        api[_-]?key|access[_-]?token|refresh[_-]?token|token|key|secret|
+        api[_-]?(?:key|token)|private[_-]?key|secret[_-]?key|
+        access[_-]?token|refresh[_-]?token|token|key|secret|
         auth|client[_-]?secret|password|passwd|credential|signature|sig|
         x-amz-(?:credential|security-token|signature)|
         x-goog-(?:credential|signature)|x-treg-token
@@ -1673,6 +1674,7 @@ class Collector:
                     )
                 except CollectorError as error:
                     self.fail_record(error.code, error.status)
+                self.annotate_record_error("transient_retry_response")
                 self.sleeper(delay)
                 continue
             if result.status in (408, 425, 429, 500, 502, 503, 504):
