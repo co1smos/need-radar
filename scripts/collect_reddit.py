@@ -36,6 +36,9 @@ MAX_RETRY_DELAY_SECONDS = 8
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 REQUEST_TIMEOUT_SECONDS = 30
 RETENTION_DAYS = 7
+MAX_URL_DECODE_ROUNDS = 16
+MAX_NESTED_URLS = 8
+MAX_BILLING_HEADER_DIGITS = 18
 FEED_ID = "tikhub.x.reddit-app-fetch-subreddit-feed"
 COMMENTS_ID = "scrapecreators.x.v1-reddit-post-comments"
 FEED_LANGUAGE_DEFAULT = "en-US"
@@ -265,17 +268,27 @@ def atomic_json(path, value):
         os.close(directory_fd)
 
 
-def safe_string(value, secrets=()):
+def safe_string(value, secrets=(), _depth=0):
     if value is None:
         return None
     text = str(value)
     for secret in secrets:
         if secret:
             text = text.replace(secret, "[REDACTED]")
+    if not EMBEDDED_URL.search(text):
+        decoded = decode_url_component(text)
+        if decoded is None:
+            return "[REDACTED]"
+        if decoded != text:
+            decoded_safe = safe_text(decoded, secrets)
+            if decoded_safe != decoded or EMBEDDED_URL.search(decoded):
+                text = decoded_safe
     text = SENSITIVE_ASSIGNMENT.sub(
         lambda match: (match.group(1) or match.group(2)) + "[REDACTED]", text
     )
-    return EMBEDDED_URL.sub(lambda match: safe_url(match.group(0), secrets), text)
+    return EMBEDDED_URL.sub(
+        lambda match: safe_url(match.group(0), secrets, _depth + 1), text
+    )
 
 
 def safe_text(value, secrets=()):
@@ -290,9 +303,22 @@ def safe_text(value, secrets=()):
     )
 
 
-def safe_url(value, secrets=()):
+def decode_url_component(value):
+    for _ in range(MAX_URL_DECODE_ROUNDS):
+        decoded = urllib.parse.unquote(value)
+        if decoded == value:
+            return value
+        value = decoded
+    if re.search(r"%[0-9a-f]{2}", value, re.IGNORECASE):
+        return None
+    return value
+
+
+def safe_url(value, secrets=(), _depth=0):
     if not isinstance(value, str):
         return value
+    if _depth > MAX_NESTED_URLS:
+        return "[REDACTED_URL]"
     if any(ord(character) <= 0x20 or ord(character) == 0x7f for character in value):
         return "[REDACTED_URL]"
     if re.search(r"%(?![0-9a-f]{2})", value, re.IGNORECASE):
@@ -304,7 +330,10 @@ def safe_url(value, secrets=()):
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
         return "[REDACTED_URL]"
     try:
-        host = urllib.parse.quote(safe_text(urllib.parse.unquote(parsed.hostname or ""), secrets), safe=".-:")
+        hostname = decode_url_component(parsed.hostname or "")
+        if hostname is None:
+            return "[REDACTED_URL]"
+        host = urllib.parse.quote(safe_string(hostname, secrets, _depth + 1), safe=".-:")
         if ":" in host and not host.startswith("["):
             host = "[" + host + "]"
         if parsed.port:
@@ -315,24 +344,29 @@ def safe_url(value, secrets=()):
         return "[REDACTED_URL]"
     query = []
     for key, item in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
-        if key.lower() in SENSITIVE_QUERY_KEYS or SENSITIVE_KEYS.search(key):
+        decoded_key = decode_url_component(key)
+        decoded_item = decode_url_component(item)
+        if decoded_key is None or decoded_item is None:
+            return "[REDACTED_URL]"
+        if decoded_key.strip().lower() in SENSITIVE_QUERY_KEYS or SENSITIVE_KEYS.search(decoded_key):
             item = "[REDACTED]"
         else:
-            decoded_item = item
-            for _ in range(8):
-                if EMBEDDED_URL.search(decoded_item):
-                    break
-                next_item = urllib.parse.unquote(decoded_item)
-                if next_item == decoded_item:
-                    break
-                decoded_item = next_item
-            if EMBEDDED_URL.search(decoded_item) or re.search(r"%[0-9a-f]{2}", decoded_item, re.IGNORECASE):
+            if EMBEDDED_URL.search(decoded_item):
                 item = "[REDACTED]"
-        query.append((safe_text(key, secrets), safe_text(item, secrets)))
+            else:
+                item = safe_string(decoded_item, secrets, _depth + 1)
+        key = safe_string(decoded_key, secrets, _depth + 1)
+        query.append((key, item))
+    decoded_path = decode_url_component(parsed.path)
+    if decoded_path is None:
+        return "[REDACTED_URL]"
     return urllib.parse.urlunsplit((
         parsed.scheme,
         host,
-        urllib.parse.quote(safe_text(urllib.parse.unquote(parsed.path), secrets), safe="/%:@-._~!$&'()*+,;=%"),
+        urllib.parse.quote(
+            safe_string(decoded_path, secrets, _depth + 1),
+            safe="/:@-._~!$&'()*+,;=",
+        ),
         urllib.parse.urlencode(query, doseq=True),
         "[REDACTED]" if parsed.fragment else "",
     ))
@@ -345,13 +379,24 @@ def sanitize(value, secrets=(), key=""):
         result = {}
         for name, item in value.items():
             original = str(name)
-            cleaned = "[REDACTED_KEY]" if SENSITIVE_KEYS.search(original) else safe_string(original, secrets)
+            decoded_name = decode_url_component(original)
+            invalid_encoding = decoded_name is None or re.search(
+                r"%(?![0-9a-f]{2})", decoded_name, re.IGNORECASE
+            )
+            sensitive_name = not invalid_encoding and SENSITIVE_KEYS.search(decoded_name)
+            cleaned = (
+                "[REDACTED_KEY]"
+                if invalid_encoding or sensitive_name
+                else safe_string(decoded_name, secrets)
+            )
             unique = cleaned
             index = 2
             while unique in result:
                 unique = f"{cleaned}#{index}"
                 index += 1
-            result[unique] = sanitize(item, secrets, original)
+            result[unique] = "[REDACTED]" if invalid_encoding or sensitive_name else sanitize(
+                item, secrets, decoded_name
+            )
         return result
     if isinstance(value, list):
         return [sanitize(item, secrets) for item in value]
@@ -386,8 +431,25 @@ def response_headers(headers, secrets=()):
     for key, value in headers.items():
         normalized = str(key).lower()
         if normalized in ALLOWED_RESPONSE_HEADERS:
+            if normalized == "x-treg-cost-micro":
+                cost = billing_cost(value)
+                if cost is None:
+                    continue
+                value = str(cost)
             result[normalized] = safe_string(value, secrets)
     return result
+
+
+def billing_cost(value):
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if len(normalized) > MAX_BILLING_HEADER_DIGITS or not re.fullmatch(r"[0-9]+", normalized):
+        return None
+    try:
+        return int(normalized)
+    except (ValueError, OverflowError):
+        return None
 
 
 def evidence_present(value):
@@ -827,6 +889,38 @@ def validate_comment_body(payload):
         raise ValueError("comments_response_not_success")
     if not isinstance(payload.get("comments"), list):
         raise ValueError("comments_schema_unknown")
+
+    def validate_more(more):
+        if (
+            not isinstance(more, dict)
+            or not isinstance(more.get("has_more"), bool)
+            or (more.get("cursor") is not None and not isinstance(more.get("cursor"), str))
+            or (more.get("next_cursor") is not None and not isinstance(more.get("next_cursor"), str))
+        ):
+            raise ValueError("comments_schema_unknown")
+
+    def validate_items(items, depth=0):
+        if depth > 32:
+            raise ValueError("comments_schema_unknown")
+        for comment in items:
+            if (
+                not isinstance(comment, dict)
+                or not isinstance(comment.get("id"), str)
+                or not comment["id"]
+                or not isinstance(comment.get("body"), str)
+            ):
+                raise ValueError("comments_schema_unknown")
+            if "replies" in comment:
+                replies = comment["replies"]
+                if not isinstance(replies, dict) or not isinstance(replies.get("items"), list):
+                    raise ValueError("comments_schema_unknown")
+                validate_items(replies["items"], depth + 1)
+                if "more" in replies:
+                    validate_more(replies["more"])
+
+    validate_items(payload["comments"])
+    if "more" in payload:
+        validate_more(payload["more"])
     return payload["comments"]
 
 
@@ -1090,6 +1184,7 @@ class Collector:
         body = sanitize_body(response.body, [self.credentials.token]) if response is not None else None
         headers = response_headers(response.headers, [self.credentials.token]) if response is not None else {}
         call_id = header(response.headers, "X-Treg-Call-Id") if response is not None else None
+        charged_micro_usd = billing_cost(header(response.headers, "X-Treg-Cost-Micro")) if response else None
         record = {
             "record_id": uuid.uuid4().hex,
             "ticket": TICKET,
@@ -1145,9 +1240,8 @@ class Collector:
             },
             "billing": {
                 "call_id": safe_string(call_id, [self.credentials.token]) if call_id else None,
-                "charged_micro_usd": safe_string(
-                    header(response.headers, "X-Treg-Cost-Micro"), [self.credentials.token]
-                ) if response else None,
+                "charged_micro_usd": str(charged_micro_usd) if charged_micro_usd is not None else None,
+                "charge_status": "reported" if charged_micro_usd is not None else "unknown",
                 "unit": route["billing_unit"],
                 "provider_reported_charge": body.get("credits_charged") if isinstance(body, dict) else None,
             },
@@ -1189,6 +1283,10 @@ class Collector:
             with path.open(encoding="utf-8") as source:
                 record = json.load(source)
             record["error"] = code
+            if code == "billing_amount_unknown_reconciliation_required":
+                record["billing"]["charged_micro_usd"] = None
+                record["billing"]["charge_status"] = "unknown"
+                record["response"]["headers"].pop("x-treg-cost-micro", None)
             atomic_json(path, record)
         except (OSError, UnicodeError, json.JSONDecodeError, CollectorError):
             raise CollectorError("record_error_persistence_failed", "blocked") from None
@@ -1233,11 +1331,8 @@ class Collector:
         if successful:
             state["successful_requests"] += 1
         state["reserved_success_slots"] -= 1
-        cost_value = header(response.headers, "X-Treg-Cost-Micro")
         call_id = header(response.headers, "X-Treg-Call-Id")
-        cost = None
-        if isinstance(cost_value, str) and re.fullmatch(r"[0-9]+", cost_value.strip()):
-            cost = int(cost_value.strip())
+        cost = billing_cost(header(response.headers, "X-Treg-Cost-Micro"))
         if cost is None:
             pending.update({
                 "charge_known": False,

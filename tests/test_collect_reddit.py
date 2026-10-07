@@ -12,7 +12,7 @@ import threading
 import time
 import unittest
 from datetime import datetime, timezone
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 from unittest.mock import patch
 
 
@@ -399,6 +399,64 @@ if os.environ.get("NEED_RADAR_OFFLINE_TESTS") == "1":
             collect_reddit.safe_url("https://example.com/?q=hello%20world"),
             "https://example.com/?q=hello+world",
         )
+
+    def test_encoded_url_components_and_query_keys_are_redacted_before_persistence(self):
+        self.assertEqual(
+            collect_reddit.safe_string("see https://example.com/?q=hello%20world"),
+            "see https://example.com/?q=hello+world",
+        )
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        encoded_path_secret = quote(quote("fixture/radar-1234", safe=""), safe="")
+        nested_key = "https://fixture-user:fixture-password@example.com/?X-Amz-Credential=fixture-key-secret"
+        encoded_key = quote(quote(nested_key, safe=""), safe="")
+        encoded_dictionary_url = quote(quote(
+            "https://fixture-dictionary-user:fixture-dictionary-password@example.com/public?X-Amz-Credential=fixture-dictionary-credential",
+            safe="",
+        ), safe="")
+        encoded_token_key = quote(quote("fixture/radar-1234", safe=""), safe="")
+        nested_value = "https://example.com/item?X-Amz-Credential=fixture-query-secret"
+        encoded_value = nested_value
+        for _ in range(12):
+            encoded_value = quote(encoded_value, safe="")
+        encoded_over_limit_path = "fixture/over-limit-secret"
+        for _ in range(20):
+            encoded_over_limit_path = quote(encoded_over_limit_path, safe="")
+        post["text"] = (
+            f"path https://example.com/{encoded_path_secret} "
+            f"query-key https://example.com/?{encoded_key}=value "
+            f"query-value https://example.com/?redirect={encoded_value} "
+            f"deep-path https://example.com/{encoded_over_limit_path}"
+        )
+        post[encoded_dictionary_url] = "source-derived dictionary key"
+        post[encoded_token_key] = "encoded runtime token key"
+        post["access%255Ftoken"] = "fixture-access-value"
+        transport = FixtureTransport([response(200, page)])
+
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials("fixture/radar-1234"),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        persisted = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        for _ in range(12):
+            persisted = unquote(persisted)
+        for secret in (
+            "fixture-user",
+            "fixture-password",
+            "fixture-key-secret",
+            "fixture-query-secret",
+            "fixture/over-limit-secret",
+            "fixture-dictionary-user",
+            "fixture-dictionary-password",
+            "fixture-dictionary-credential",
+            "fixture/radar-1234",
+            "fixture-access-value",
+        ):
+            self.assertNotIn(secret, persisted)
+        self.assertNotIn("access_token", persisted)
 
     def test_post_permalink_must_belong_to_approved_community(self):
         self.assertEqual(
@@ -1331,6 +1389,144 @@ if os.environ.get("NEED_RADAR_OFFLINE_TESTS") == "1":
         report = json.loads(stdout)
         self.assertIn("without a usable cursor", report["capabilities"]["source_coverage"]["evidence"])
         self.assertEqual(report["acquisition_attempts"], 2)
+
+    def test_malformed_comment_entries_and_nested_replies_fail_collection_and_replay(self):
+        malformed_bodies = (
+            {"success": True, "comments": [None, 123, {}]},
+            {
+                "success": True,
+                "comments": [{
+                    "id": "synthetic-comment",
+                    "body": "Synthetic comment",
+                    "replies": {"items": [None], "more": {"has_more": False, "cursor": None}},
+                }],
+            },
+            {
+                "success": True,
+                "comments": [{
+                    "id": "synthetic-comment",
+                    "body": "Synthetic comment",
+                    "replies": {"items": [], "more": {"has_more": "false", "cursor": None}},
+                }],
+            },
+            {"success": True, "comments": [], "more": {"has_more": False, "cursor": 123}},
+            {"success": True, "comments": [], "more": None},
+        )
+        for index, body in enumerate(malformed_bodies):
+            with self.subTest(index=index):
+                self.state_dir = self.root / f"state-{index}"
+                self.recordings_dir = self.root / f"recordings-{index}"
+                transport = FixtureTransport([
+                    response(200, fixture_body("feed-page-2.json")),
+                    response(200, body),
+                ])
+
+                code, stdout, _ = self.run_cli(
+                    self.args("--max-feed-pages", "1", "--max-comment-pages", "1", "--max-posts", "1"),
+                    transport,
+                    FakeCredentials(),
+                )
+
+                self.assertEqual(code, 2)
+                collection = json.loads(stdout)
+                self.assertEqual(collection["capabilities"]["comment_schema"]["status"], "failed")
+                self.assertEqual(collection["counts"]["comments_seen"], 0)
+                self.assertIn("comment_response_schema_invalid", collection["errors"])
+                comment_record = next(
+                    json.loads(path.read_text())
+                    for path in self.recordings_dir.glob("record-*.json")
+                    if json.loads(path.read_text())["endpoint"] == collect_reddit.COMMENTS_ID
+                )
+                self.assertIn("comment_response_schema_invalid", comment_record["validation_errors"])
+                self.assertIsNotNone(comment_record["parent_record_id"])
+                self.assertTrue(comment_record["run_id"])
+                self.assertTrue(comment_record["trace_id"])
+
+                replay_code, replay_stdout, _ = self.run_cli([
+                    "replay", "--recordings-dir", str(self.recordings_dir),
+                    "--state-dir", str(self.state_dir),
+                ])
+
+                self.assertEqual(replay_code, 0)
+                replay = json.loads(replay_stdout)
+                self.assertEqual(replay["validation"]["comment_schema"], "failed")
+                self.assertIn("comment_response_schema_invalid", replay["errors"])
+
+    def test_valid_nested_comment_replies_remain_supported(self):
+        body = {
+            "success": True,
+            "comments": [{
+                "id": "synthetic-comment",
+                "body": "Synthetic parent comment",
+                "replies": {
+                    "items": [{"id": "synthetic-reply", "body": "Synthetic nested reply"}],
+                    "more": {"has_more": False, "cursor": None},
+                },
+            }],
+            "more": {"has_more": False, "cursor": None},
+        }
+        transport = FixtureTransport([
+            response(200, fixture_body("feed-page-2.json")),
+            response(200, body),
+        ])
+
+        code, stdout, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-comment-pages", "1", "--max-posts", "1"),
+            transport,
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        report = json.loads(stdout)
+        self.assertEqual(report["capabilities"]["comment_schema"]["status"], "supported")
+        self.assertEqual(report["counts"]["comments_seen"], 1)
+
+        replay_code, replay_stdout, replay_stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(replay_code, 0, replay_stderr)
+        replay = json.loads(replay_stdout)
+        self.assertEqual(replay["validation"]["comment_schema"], "supported")
+        self.assertEqual(replay["counts"]["comments"], 1)
+
+    def test_overlong_billing_header_persists_unknown_hold_and_replay_failure(self):
+        oversized_charge = response(
+            200,
+            fixture_body("feed-page-2.json"),
+            cost="9" * 5000,
+        )
+        transport = FixtureTransport([oversized_charge])
+
+        code, stdout, _ = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("billing_amount_unknown_reconciliation_required", stdout)
+        self.assertEqual(len(transport.requests), 1)
+        state = json.loads((self.state_dir / "state.json").read_text())
+        self.assertFalse(state["pending"]["charge_known"])
+        self.assertEqual(state["reserved_micro_usd"], collect_reddit.ROUTES["feed"]["max_charge_micro_usd"])
+        record = json.loads(next(self.recordings_dir.glob("record-*.json")).read_text())
+        self.assertIsNone(record["billing"]["charged_micro_usd"])
+        self.assertEqual(record["error"], "billing_amount_unknown_reconciliation_required")
+        self.assertEqual(record["billing"]["charge_status"], "unknown")
+        self.assertNotIn("x-treg-cost-micro", record["response"]["headers"])
+        self.assertNotIn("9" * 5000, json.dumps(record))
+
+        replay_code, replay_stdout, _ = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(replay_code, 2)
+        replay = json.loads(replay_stdout)
+        self.assertEqual(replay["counts"]["billing_unknown_requests"], 1)
+        self.assertEqual(replay["capabilities"]["billing_evidence"]["status"], "blocked")
 
     def test_repeated_comment_cursor_stops_and_reports_incomplete_coverage(self):
         more = {"success": True, "comments": [], "more": {"has_more": True, "cursor": "same-cursor"}}
