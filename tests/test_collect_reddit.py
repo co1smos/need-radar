@@ -502,6 +502,16 @@ print(safe_string({payload!r}))
         self.assertNotIn("fixture-escaped-json-secret", persisted)
         self.assertIn("safe-tail", persisted)
 
+    def test_redacts_quoted_credentials_after_literal_escaped_whitespace(self):
+        persisted = self.collect_text_recording(
+            r'password:\n"first line fixture-newline-whitespace-secret"; '
+            r'api_token:\t\'first line fixture-tab-whitespace-secret\'; safe-tail'
+        )
+
+        self.assertNotIn("fixture-newline-whitespace-secret", persisted)
+        self.assertNotIn("fixture-tab-whitespace-secret", persisted)
+        self.assertIn("safe-tail", persisted)
+
     def test_redacts_private_secret_and_api_token_assignments_in_prose(self):
         persisted = self.collect_text_recording(
             'private_key="fixture-private-key-secret"; '

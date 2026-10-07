@@ -108,7 +108,7 @@ SENSITIVE_ASSIGNMENT_PREFIX = re.compile(
         x-amz-(?:credential|security-token|signature)|
         x-goog-(?:credential|signature)|x-treg-token
     )
-    (?:\\?["'])?\s*(?:\\?[:=])\s*
+    (?:\\?["'])?\s*(?:\\?[:=])(?:\s|\\[nrt])*
     '''
 )
 PRIVATE_KEY_BEGIN = re.compile(r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----", re.IGNORECASE)
