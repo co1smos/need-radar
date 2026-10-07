@@ -12,7 +12,7 @@ import threading
 import time
 import unittest
 from datetime import datetime, timezone
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 from unittest.mock import patch
 
 
@@ -26,12 +26,8 @@ SOCKET_AUDIT_EVENTS = {
     "socket.getnameinfo",
     "socket.sendto",
 }
-BLOCKED_SOCKET_EVENTS = []
-
-
 def block_socket_network(event, args):
     if event in SOCKET_AUDIT_EVENTS:
-        BLOCKED_SOCKET_EVENTS.append(event)
         raise AssertionError(f"socket activity blocked in offline tests: {event}")
 
 
@@ -242,45 +238,59 @@ class CollectRedditCliTests(unittest.TestCase):
         return result, stdout.getvalue(), stderr.getvalue()
 
     def test_public_cli_displays_help(self):
-        protected_paths = PROTECTED_PATHS
-        guard = (
-            "import os, pathlib, runpy, sys\n"
-            f"blocked_network = {SOCKET_AUDIT_EVENTS!r}\n"
-            f"protected = {tuple(map(str, protected_paths))!r}\n"
-            f"filesystem = {BLOCKED_FILESYSTEM_EVENTS!r}\n"
-            "def audit(event, args):\n"
-            "    if event in blocked_network:\n"
-            "        raise AssertionError('network access denied in subprocess')\n"
-            "    if event in filesystem:\n"
-            "        for value in args[:2]:\n"
-            "            if isinstance(value, (str, bytes, os.PathLike)):\n"
-            "                path = pathlib.Path(os.path.abspath(os.fsdecode(value)))\n"
-            "                if any(path == pathlib.Path(item) or pathlib.Path(item) in path.parents for item in protected):\n"
-            "                    raise AssertionError('live path access denied in subprocess')\n"
-            "sys.addaudithook(audit)\n"
+        scratch = pathlib.Path(os.environ.get("TMPDIR", tempfile.gettempdir()))
+        sitecustomize = f"""import os, pathlib, sys
+if os.environ.get("NEED_RADAR_OFFLINE_TESTS") == "1":
+    blocked_network = {SOCKET_AUDIT_EVENTS!r}
+    protected = {tuple(map(str, PROTECTED_PATHS))!r}
+    filesystem = {BLOCKED_FILESYSTEM_EVENTS!r}
+    def audit(event, args):
+        if event in blocked_network:
+            raise AssertionError("offline network access denied")
+        if event in filesystem:
+            for value in args[:2]:
+                if isinstance(value, (str, bytes, os.PathLike)):
+                    path = pathlib.Path(os.path.abspath(os.fsdecode(value)))
+                    if any(path == pathlib.Path(item) or pathlib.Path(item) in path.parents for item in protected):
+                        raise AssertionError("offline live path access denied")
+    sys.addaudithook(audit)
+"""
+        probe = (
+            "import runpy, sys\n"
+            "for action in (lambda: sys.audit('socket.getaddrinfo', 'treg.to', 443), "
+            "lambda: sys.audit('open', '/home/ubuntu/projects/need-radar/credentials.env', 'r', 0)):\n"
+            "    try: action()\n"
+            "    except AssertionError: pass\n"
+            "    else: raise AssertionError('offline subprocess guard failed open')\n"
             f"sys.argv = [{str(CLI)!r}, '--help']\n"
             "runpy.run_path(sys.argv[0], run_name='__main__')\n"
         )
-        with tempfile.TemporaryDirectory() as home:
+        with tempfile.TemporaryDirectory(dir=scratch) as home, tempfile.TemporaryDirectory(dir=scratch) as guard_dir:
+            (pathlib.Path(guard_dir) / "sitecustomize.py").write_text(sitecustomize)
             result = subprocess.run(
-                [sys.executable, "-c", guard],
+                [sys.executable, "-c", probe],
                 capture_output=True,
                 text=True,
                 check=False,
-                env={"HOME": home, "PATH": os.environ.get("PATH", ""), "PYTHONDONTWRITEBYTECODE": "1"},
+                env={
+                    "HOME": home,
+                    "PATH": os.environ.get("PATH", ""),
+                    "TMPDIR": str(scratch),
+                    "NEED_RADAR_OFFLINE_TESTS": "1",
+                    "PYTHONPATH": guard_dir,
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
             )
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("replay", result.stdout)
 
     def test_direct_connection_is_stopped_before_socket_creation(self):
-        BLOCKED_SOCKET_EVENTS.clear()
         address = (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", 443))
         with patch("socket.getaddrinfo", return_value=[address]) as resolve:
             with self.assertRaisesRegex(AssertionError, "socket.__new__"):
                 socket.create_connection(("treg.to", 443), timeout=1)
         resolve.assert_called()
-        self.assertEqual(BLOCKED_SOCKET_EVENTS, ["socket.__new__"])
 
     def test_live_incident_hold_blocks_before_credentials_and_dispatch(self):
         args = collect_reddit.parse_args(self.args("--max-feed-pages", "1", "--max-posts", "0"))
@@ -360,6 +370,35 @@ class CollectRedditCliTests(unittest.TestCase):
         for secret in ("fixture-user", "fixture-password", "fixture-credential"):
             self.assertNotIn(secret, persisted)
         self.assertIn("[REDACTED_URL]", persisted)
+
+    def test_nested_signed_url_is_redacted_in_persisted_artifacts(self):
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        nested_url = "https://example.com/item?X-Amz-Credential=fixture-nested-credential"
+        over_encoded_url = nested_url
+        for _ in range(10):
+            over_encoded_url = quote(over_encoded_url, safe="")
+        post["text"] = (
+            "redirect https://example.com/redirect?next="
+            + quote(nested_url, safe="")
+            + "&mirror="
+            + over_encoded_url
+        )
+        transport = FixtureTransport([response(200, page)])
+
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        persisted = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        self.assertNotIn("fixture-nested-credential", persisted)
+        self.assertEqual(
+            collect_reddit.safe_url("https://example.com/?q=hello%20world"),
+            "https://example.com/?q=hello+world",
+        )
 
     def test_post_permalink_must_belong_to_approved_community(self):
         self.assertEqual(
@@ -682,6 +721,88 @@ class CollectRedditCliTests(unittest.TestCase):
         self.assertEqual(report["counts"]["request_failures"], 1)
         self.assertIn("request_outcome_unknown:TimeoutError", report["errors"])
 
+    def test_replay_preserves_truncated_response_failure(self):
+        truncated = response(200, fixture_body("feed-page-2.json"))
+        truncated.truncated = True
+        transport = FixtureTransport([truncated])
+        code, _, _ = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials(),
+        )
+        self.assertEqual(code, 2)
+        source = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(source.read_text())
+        self.assertEqual(record["error"], "response_exceeded_recording_size_limit")
+        record["error"] = None
+        source.write_text(json.dumps(record))
+        source.chmod(0o600)
+
+        code, stdout, _ = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir), "--state-dir", str(self.state_dir)
+        ])
+
+        self.assertEqual(code, 2)
+        report = json.loads(stdout)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["counts"]["feed_pages"], 0)
+        self.assertIn("response_exceeded_recording_size_limit", report["errors"])
+
+    def test_replay_preserves_unknown_billing_failure(self):
+        unknown_billing = response(200, fixture_body("feed-page-2.json"))
+        del unknown_billing.headers["X-Treg-Cost-Micro"]
+        transport = FixtureTransport([unknown_billing])
+        code, _, _ = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials(),
+        )
+        self.assertEqual(code, 2)
+        source = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(source.read_text())
+        self.assertEqual(record["error"], "billing_amount_unknown_reconciliation_required")
+        record["error"] = None
+        source.write_text(json.dumps(record))
+        source.chmod(0o600)
+
+        code, stdout, _ = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir), "--state-dir", str(self.state_dir)
+        ])
+
+        self.assertEqual(code, 2)
+        report = json.loads(stdout)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["counts"]["feed_pages"], 0)
+        self.assertEqual(report["counts"]["billing_unknown_requests"], 1)
+        self.assertIn("billing_evidence_incomplete_reconciliation_required", report["errors"])
+        self.assertEqual(report["capabilities"]["billing_evidence"]["status"], "blocked")
+        self.assertEqual(report["billing_unknown_record_ids"], [record["record_id"]])
+
+    def test_replay_reports_billing_uncertainty_alongside_payload_failure(self):
+        page = fixture_body("feed-page-1.json")
+        page["data"]["subredditV3"]["elements"]["edges"][0]["node"]["createdAt"] = 1e300
+        transport = FixtureTransport([response(200, page)])
+        code, _, _ = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"), transport, FakeCredentials()
+        )
+        self.assertEqual(code, 2)
+        source = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(source.read_text())
+        record["billing"]["charged_micro_usd"] = None
+        source.write_text(json.dumps(record))
+        source.chmod(0o600)
+
+        code, stdout, _ = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir), "--state-dir", str(self.state_dir)
+        ])
+
+        self.assertEqual(code, 2)
+        report = json.loads(stdout)
+        self.assertEqual(report["counts"]["validation_failures"], 1)
+        self.assertEqual(report["counts"]["billing_unknown_requests"], 1)
+        self.assertIn("feed_response_payload_invalid", report["errors"])
+        self.assertEqual(report["capabilities"]["billing_evidence"]["status"], "blocked")
+
     def test_replay_keeps_mixed_valid_and_invalid_feed_evidence_partial(self):
         invalid_page = fixture_body("feed-page-1.json")
         invalid_page["data"]["subredditV3"]["elements"]["edges"][0]["node"]["createdAt"] = 1e300
@@ -778,6 +899,30 @@ class CollectRedditCliTests(unittest.TestCase):
         self.assertIn("recording_envelope_invalid", report["errors"])
         artifact = json.loads((self.recordings_dir / report["artifact"]).read_text())
         self.assertEqual(artifact["status"], "failed")
+
+    def test_expiry_timestamp_overflow_does_not_interrupt_replay_cleanup(self):
+        transport = FixtureTransport([response(200, fixture_body("feed-page-2.json"))])
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials(),
+        )
+        self.assertEqual(code, 0, stderr)
+        source = next(self.recordings_dir.glob("record-*.json"))
+        malformed = json.loads(source.read_text())
+        malformed["record_id"] = collect_reddit.uuid.uuid4().hex
+        malformed["recorded_at"] = "0001-01-01T00:00:00+01:00"
+        malformed_path = self.recordings_dir / ("record-" + malformed["record_id"] + ".json")
+        malformed_path.write_text(json.dumps(malformed))
+        malformed_path.chmod(0o600)
+
+        code, stdout, _ = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir), "--state-dir", str(self.state_dir)
+        ])
+
+        self.assertEqual(code, 0)
+        self.assertFalse(malformed_path.exists())
+        self.assertEqual(json.loads(stdout)["counts"]["feed_pages"], 1)
 
     def test_reconciliation_records_overcharge_and_permanently_blocks_spending(self):
         transport = FixtureTransport([TimeoutError("synthetic timeout")])

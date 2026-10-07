@@ -19,18 +19,31 @@ This matrix carries forward the initial and resumed independent findings. “Cod
 | # | Criterion | Code status | Separate live status |
 |---|---|---|---|
 | 1 | Persist the unknown-outcome incident hold and block before credentials/dispatch. | Fixed; hold remains mandatory in new and migrated state. | Historical outcome and charge are still unknown and unreconciled. |
-| 2 | Redact URL components, embedded URLs, sensitive dictionary keys, and malformed URLs without leakage or key loss. | Fixed; malformed URLs fail closed as `[REDACTED_URL]`. | No live artifacts were inspected. |
+| 2 | Redact URL components, embedded and multiply encoded nested URLs, sensitive dictionary keys, and malformed URLs without leakage or key loss. | Fixed; nested URL query values are bounded-decoded and redacted before persistence; malformed URLs fail closed as `[REDACTED_URL]`. Persisted-artifact regressions cover encoded nesting. | No live artifacts were inspected. |
 | 3 | Inherit earliest source expiry for replay and run summaries. | Fixed; derived expiry cannot extend its source. | Invocation cleanup is not an idle-time deletion guarantee. |
 | 4 | Require explicit synthetic credentials and guard tests/subprocesses from live paths/network. | Fixed in the collector and test guards. | No production credential was read. |
 | 5 | Restrict comment targets to valid post permalinks in approved communities. | Fixed; post IDs and decoded dot-segments are validated before dispatch/reservation. | Endpoint/provider permissions remain unverified. |
 | 6 | Exclude the primary checkout and every associated worktree from private artifact locations. | Fixed for execution from either primary or worker checkout. | No production recording path was accessed. |
 | 7 | Remove abandoned atomic-write files and expire retained request parameters without clearing accounting holds. | Fixed in invocation cleanup and state expiry. | An authorized idle-time deletion mechanism remains required. |
-| 8 | Persist malformed-payload failures and reject malformed expiry metadata safely. | Fixed; collection and replay share feed timestamp validation and preserve recorded validation errors. | No live response was used. |
-| 9 | Fail replay when no valid evidence remains and validate replay envelopes structurally. | Fixed; invalid envelopes are counted/reported, and unusable-only replay fails with a structured artifact. | Synthetic replay is not live acceptance evidence. |
+| 8 | Persist malformed-payload failures and reject malformed expiry metadata safely. | Fixed; collection and replay share feed timestamp validation, retain overflow-safe expiry cleanup, and preserve recorded validation errors. | No live response was used. |
+| 9 | Fail replay when no valid evidence remains and validate replay envelopes and dispatch/accounting outcomes structurally. | Fixed; replay rejects truncated responses, retains unresolved billing evidence as blocked, counts invalid envelopes, and fails with a structured artifact when no usable pages remain. | Synthetic replay is not live acceptance evidence. |
 | 10 | Record verified overcharges and permanently stop spending after a limit breach. | Fixed; actual charge is retained and the breach blocks later dispatch. | No provider billing event was reconciled in this correction. |
 | 11 | Reconcile the historical request from actual provider/account evidence. | Not a code-only action; the enforced hold remains active. | Open; supervisor evidence and canonical-state reconciliation are required. |
 | 12 | Substantiate manifest claims for approved seeds/window, schemas, eligibility, permissions, billing ceilings, fallback, and retention. | Manifest assertions remain fail-closed but are not treated as proof. | Open; evidence review is required before dispatch. |
 | 13 | Establish authorized expiry enforcement and bounded observed end-to-end acquisition/replay proof. | Invocation cleanup is implemented; it does not guarantee deletion while idle. | Open; Reddit live acquisition and X (#9) remain unverified. |
+
+## Issue #3 acceptance checklist
+
+| Criterion | Offline code acceptance | Live/supervisor evidence |
+|---|---|---|
+| Fail closed on missing route, permission, seed/window, billing, limit, or retention approval. | [x] Manifest preflight validates required claims and evidence references before credentials or requests. | [ ] Review actual evidence; manifest strings alone are not proof. |
+| Deterministic bounded feed/comment collection with pagination, bounded retries, and auth/limit stops. | [x] Exercised with synthetic transports and persistent budget tests; no provider fallback or browser loop. | [ ] Endpoint schemas, account eligibility, permissions, and enforceable charges remain unverified. |
+| Private sanitized response/provenance recordings and network-free replay. | [x] Persistence, redaction, lineage, expiry, replay validation, and billing uncertainty have offline regressions. | [ ] Confirm provider/source recording and removal rights; establish idle-time deletion enforcement. |
+| Honest capability and coverage reporting, including incomplete/truncated/billing-unknown cases. | [x] Reports distinguish supported/partial/failed/blocked and preserve failures without claiming complete acquisition. | [ ] A successful synthetic response is not live acquisition evidence. |
+| Runnable end-to-end check with an observed result. | [x] 55 focused Reddit tests and 74 total Python tests pass; Python compilation, CLI help, 25 workflow tests, and workflow typecheck pass. | [ ] No live request or provider/account verification was performed. |
+| Observability, provenance, redaction, and untrusted-source handling. | [x] Request inputs, configuration, outputs, billing/error evidence, lineage, and validation remain private and redacted before persistence. | [ ] Live retention terms and observed end-to-end evidence remain supervisor-owned. |
+
+The Python suites in this correction ran with a temporary Hermes-TMPDIR `sitecustomize.py` guard propagated through `PYTHONPATH`; it denied socket activity and access to canonical credential/state paths in the test process and Python subprocesses. The help-subprocess test also installs a temporary guard and probes the audit events directly. All fixture outcomes are synthetic/offline; the unresolved historical request and acquisition authorization gates remain active.
 
 No canonical state or credential files were changed. No external evidence was created or inferred; the historical incident and all other live prerequisites remain separate holds.
 
@@ -80,7 +93,7 @@ python3 -m py_compile scripts/collect_reddit.py tests/test_collect_reddit.py
 python3 scripts/collect_reddit.py --help
 ```
 
-The test-process socket and live-path guards are active in both unittest commands, including the help subprocess. Synthetic collection requires an explicitly injected test credential loader; tests do not fall back to the production credential file. The direct-connection regression uses a stub resolver and asserts the guard blocks before a socket is created; it does not run the collector transport or make a real connection.
+The test-process socket and live-path guards are active in both unittest commands. The help subprocess receives a temporary `sitecustomize.py` guard under `TMPDIR`, and verifies blocked socket and credential-path attempts before printing help. Synthetic collection requires an explicitly injected test credential loader; tests do not fall back to the production credential file. The direct-connection regression uses a stub resolver and asserts the guard blocks before a socket is created; it does not run the collector transport or make a real connection.
 
 There is intentionally no safe runnable live command in this checkout: the historical incident remains unresolved and external prerequisites remain unverified. Only after the supervisor completes the evidence-backed state reconciliation above, reviews all actual manifest evidence, and establishes authorized retention enforcement may a later activation review consider this bounded command shape; replace each bracketed value only with its approved input:
 

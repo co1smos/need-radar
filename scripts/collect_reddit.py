@@ -179,7 +179,10 @@ def parse_datetime(value):
     parsed = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
     if parsed.tzinfo is None:
         raise ValueError("timezone_required")
-    return parsed.astimezone(dt.timezone.utc)
+    try:
+        return parsed.astimezone(dt.timezone.utc)
+    except (OverflowError, OSError):
+        raise ValueError("timestamp_out_of_range") from None
 
 
 def private_directory(path):
@@ -314,6 +317,17 @@ def safe_url(value, secrets=()):
     for key, item in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
         if key.lower() in SENSITIVE_QUERY_KEYS or SENSITIVE_KEYS.search(key):
             item = "[REDACTED]"
+        else:
+            decoded_item = item
+            for _ in range(8):
+                if EMBEDDED_URL.search(decoded_item):
+                    break
+                next_item = urllib.parse.unquote(decoded_item)
+                if next_item == decoded_item:
+                    break
+                decoded_item = next_item
+            if EMBEDDED_URL.search(decoded_item) or re.search(r"%[0-9a-f]{2}", decoded_item, re.IGNORECASE):
+                item = "[REDACTED]"
         query.append((safe_text(key, secrets), safe_text(item, secrets)))
     return urllib.parse.urlunsplit((
         parsed.scheme,
@@ -848,6 +862,11 @@ def valid_recording_envelope(record, filename):
         and isinstance(record["response"].get("headers"), dict)
         and isinstance(record.get("billing"), dict)
         and isinstance(record.get("counts"), dict)
+        and (
+            record.get("error") is None
+            or isinstance(record.get("error"), str)
+            and re.fullmatch(r"[A-Za-z0-9_:-]{1,100}", record["error"])
+        )
         and isinstance(validation_errors, list)
         and all(isinstance(error, str) and re.fullmatch(r"[a-z0-9_]+", error) for error in validation_errors)
         and (
@@ -878,19 +897,17 @@ def record_expiry(record):
     try:
         recorded = parse_datetime(record.get("recorded_at"))
         expires = parse_datetime(record.get("expires_at"))
-    except (TypeError, ValueError):
-        return None
-    retention_days = record.get("retention_days")
-    if type(retention_days) is not int or not 1 <= retention_days <= RETENTION_DAYS:
-        return None
-    if record.get("source_expires_at") is not None:
-        try:
+        retention_days = record.get("retention_days")
+        if type(retention_days) is not int or not 1 <= retention_days <= RETENTION_DAYS:
+            return None
+        maximum_expiry = recorded + dt.timedelta(days=retention_days)
+        if record.get("source_expires_at") is not None:
             source_expires = parse_datetime(record["source_expires_at"])
-        except (TypeError, ValueError):
+            if expires != source_expires or expires > maximum_expiry:
+                return None
+        elif expires != maximum_expiry:
             return None
-        if expires != source_expires or expires > recorded + dt.timedelta(days=retention_days):
-            return None
-    elif expires != recorded + dt.timedelta(days=retention_days):
+    except (TypeError, ValueError, OverflowError, OSError):
         return None
     return expires
 
@@ -1164,6 +1181,22 @@ class Collector:
         except (OSError, CollectorError):
             raise CollectorError("record_validation_persistence_failed", "blocked") from None
 
+    def annotate_record_error(self, code):
+        if not self.counts["record_ids"]:
+            return
+        path = self.recordings_dir / self.counts["record_ids"][-1]
+        try:
+            with path.open(encoding="utf-8") as source:
+                record = json.load(source)
+            record["error"] = code
+            atomic_json(path, record)
+        except (OSError, UnicodeError, json.JSONDecodeError, CollectorError):
+            raise CollectorError("record_error_persistence_failed", "blocked") from None
+
+    def fail_record(self, code, status="failed"):
+        self.annotate_record_error(code)
+        raise CollectorError(code, status)
+
     def reserve(self, state_path, state, route_name, params):
         if state.get("limit_breach"):
             raise CollectorError("persistent_budget_limit_breach", "blocked")
@@ -1288,37 +1321,40 @@ class Collector:
             )
             try:
                 _, successful, _ = self.settle(state_path, state, result, reservation, successful_response)
-            except CollectorError:
-                raise
+            except CollectorError as error:
+                self.fail_record(error.code, error.status)
             served_via = header(result.headers, "X-Treg-Served-Via")
             cache = header(result.headers, "X-Treg-Cache")
             if served_via and str(served_via).lower().startswith("overflow:"):
                 state["limit_breach"] = True
                 atomic_json(state_path, state)
-                raise CollectorError("provider_overflow_fallback_detected", "failed")
+                self.fail_record("provider_overflow_fallback_detected")
             if cache and str(cache).lower() == "hit":
                 state["limit_breach"] = True
                 atomic_json(state_path, state)
-                raise CollectorError("provider_cache_hit_despite_bypass", "failed")
+                self.fail_record("provider_cache_hit_despite_bypass")
             if result.truncated:
-                raise CollectorError("response_exceeded_recording_size_limit", "failed")
+                self.fail_record("response_exceeded_recording_size_limit")
             if result.status in (401, 403):
-                raise CollectorError("provider_authentication_or_permission_failure", "failed")
+                self.fail_record("provider_authentication_or_permission_failure")
             if result.status in (408, 425, 429, 500, 502, 503, 504) and local_retries < MAX_RETRIES:
                 local_retries += 1
-                delay = retry_delay(
-                    header(result.headers, "Retry-After"),
-                    min(2**local_retries, MAX_RETRY_DELAY_SECONDS),
-                    self.clock(),
-                )
+                try:
+                    delay = retry_delay(
+                        header(result.headers, "Retry-After"),
+                        min(2**local_retries, MAX_RETRY_DELAY_SECONDS),
+                        self.clock(),
+                    )
+                except CollectorError as error:
+                    self.fail_record(error.code, error.status)
                 self.sleeper(delay)
                 continue
             if result.status in (408, 425, 429, 500, 502, 503, 504):
-                raise CollectorError("transient_retry_limit_exhausted", "failed")
+                self.fail_record("transient_retry_limit_exhausted")
             if not successful:
                 if 200 <= result.status < 300:
-                    raise CollectorError("provider_api_request_failed", "failed")
-                raise CollectorError("provider_http_request_failed", "failed")
+                    self.fail_record("provider_api_request_failed")
+                self.fail_record("provider_http_request_failed")
             return body
 
     def feed(self, state_path, state):
@@ -1675,6 +1711,7 @@ def run_replay(args, clock):
             "comments": 0,
             "validation_failures": 0,
             "request_failures": 0,
+            "billing_unknown_requests": 0,
             "invalid_recordings": invalid_recordings,
         }
         replay_counts["validation_failures"] += invalid_recordings
@@ -1682,6 +1719,7 @@ def run_replay(args, clock):
         comment_records = 0
         feed_validation_failures = 0
         comment_validation_failures = 0
+        billing_unknown_record_ids = []
         for record in records:
             endpoint = record["endpoint"]
             if endpoint == FEED_ID:
@@ -1696,8 +1734,49 @@ def run_replay(args, clock):
                     feed_validation_failures += len(recorded_errors)
                 else:
                     comment_validation_failures += len(recorded_errors)
-                continue
+            recorded_error = record.get("error")
             response = record["response"]
+            truncated = response["truncated"]
+            billing = record["billing"]
+            charged = billing.get("charged_micro_usd")
+            charge_known = isinstance(charged, str) and re.fullmatch(r"[0-9]+", charged.strip())
+            billing_reference_known = evidence_present(billing.get("call_id"))
+            billing_unknown = (
+                not charge_known
+                or not billing_reference_known
+                or recorded_error in {
+                    "billing_amount_unknown_reconciliation_required",
+                    "billing_call_id_missing_reconciliation_required",
+                }
+            )
+            if truncated:
+                replay_counts["validation_failures"] += 1
+                if endpoint == FEED_ID:
+                    feed_validation_failures += 1
+                else:
+                    comment_validation_failures += 1
+                replay_errors.append("response_exceeded_recording_size_limit")
+            if billing_unknown:
+                replay_counts["request_failures"] += 1
+                replay_counts["billing_unknown_requests"] += 1
+                billing_unknown_record_ids.append(record["record_id"])
+                if recorded_error not in {
+                    "billing_amount_unknown_reconciliation_required",
+                    "billing_call_id_missing_reconciliation_required",
+                }:
+                    replay_errors.append("billing_evidence_incomplete_reconciliation_required")
+            if recorded_error is not None:
+                if recorded_error != "response_exceeded_recording_size_limit" and not billing_unknown:
+                    replay_counts["request_failures"] += 1
+                if recorded_error == "billing_amount_unknown_reconciliation_required":
+                    if not billing_unknown:
+                        replay_counts["billing_unknown_requests"] += 1
+                if isinstance(recorded_error, str) and re.fullmatch(r"[A-Za-z0-9_:-]{1,100}", recorded_error):
+                    replay_errors.append(recorded_error)
+                else:
+                    replay_errors.append("recorded_request_failed")
+            if recorded_errors or truncated or billing_unknown or recorded_error is not None:
+                continue
             status_code = response.get("http_status")
             body = response.get("body")
             if not isinstance(status_code, int) or not 200 <= status_code < 300 or body is None:
@@ -1774,9 +1853,11 @@ def run_replay(args, clock):
                 "replay": {"status": "failed" if status == "failed" else "supported", "evidence": "no valid recorded pages" if status == "failed" else "read only from unexpired private recordings; no acquisition transport"},
                 "feed_schema": {"status": feed_status, "evidence": "replayed stored feed bodies" if replay_counts["feed_pages"] else "no valid recorded feed body"},
                 "comment_schema": {"status": comment_status, "evidence": "replayed stored comment bodies" if replay_counts["comment_pages"] else "no valid recorded comment body"},
+                "billing_evidence": {"status": "blocked" if replay_counts["billing_unknown_requests"] else "partial", "evidence": "one or more recordings lack a verified charge or call reference" if replay_counts["billing_unknown_requests"] else "provider-reported charge evidence only; no independent billing reconciliation"},
                 "source_coverage": {"status": "partial", "evidence": "recorded responses alone do not establish source completeness"},
             },
             "record_ids": [record["record_id"] for record in records],
+            "billing_unknown_record_ids": billing_unknown_record_ids,
         }
         report_path = recordings_dir / ("replay-" + uuid.uuid4().hex + ".json")
         now = clock()
