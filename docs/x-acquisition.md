@@ -26,12 +26,32 @@ These are public documentation claims, not verification of this account, source 
 - Cursor continuation is bounded by the approved page/item/attempt limits, ticket-wide request/spend ceilings, cycle detection, and transient retry limits. A missing cursor is not treated as exhaustion; an explicit null cursor still does not prove complete search coverage. X search/reply samples do not establish complete conversations.
 - `createdUtc` is checked against the UTC half-open interval `[since 00:00, until 00:00)`. Out-of-window items are excluded and counted in validation. Provider search completeness, date-boundary semantics, and freshness remain unverified.
 
+## Cumulative review checklist
+
+Both independent reviews' actionable code findings are addressed in this candidate; this is synthetic/offline code evidence only.
+
+- [x] Review 1 #1: the reusable collector enforces current review and canonical live state/recording paths; only explicitly marked offline transport can use caller-supplied paths.
+- [x] Review 1 #2: tests deny network access in the test process and CLI children; the separate issue #3 incident hold remains documented below.
+- [x] Review 1 #3: approved shorter retention is enforced, malformed/interrupted artifacts are cleaned before collection including paused returns, and replay refuses expiry. Cleanup remains invocation-driven; an authorized idle-period deletion process is still required before activation.
+- [x] Review 1 #4 and Review 2 #1: signed URLs, fragments, credential-bearing URL fields, and complete colon/assignment Authorization and Cookie payloads are sanitized before persistence.
+- [x] Review 1 #5: reservation/state replacement fsyncs the containing directory, including newly created state directories.
+- [x] Review 1 #6: bounded sanitized response and exclusion evidence, approval/policy lineage, collector version, and transformation diagnostics are retained privately and replay-validated.
+- [x] Review 1 #7: response bytes and total elapsed time are bounded; responses close and failed consumption preserves the reservation.
+- [x] Review 1 #8: collection rejects an approved query that sanitization would change.
+- [x] Review 1 #9 and Review 2 #5: acquisition failures remain failures when spend or attempt limits stop retry; the summary preserves both the error and limiting stop reason for nonzero CLI status.
+- [x] Review 2 #2: replay stdout contains counts and allowlisted reason codes only; source-item evidence stays in the private expiring recording.
+- [x] Review 2 #3: offline collection requires a caller-supplied token marked with the `synthetic-` prefix and never loads the production credential file.
+- [x] Review 2 #4: transport, billing, and redacted-cursor failures replay with the same recorded validation result.
+- [ ] Review 1 #10 and Review 2 #7 — **activation blocked**: independently verify exact query/window, provider account eligibility and managed credentials, schema and source/retention rights, success/failure/retry billing and enforceable per-request ceiling, overflow/substitution policy, canonical cumulative state and reservations, unknown-outcome reconciliation, and absence of competing collectors. Then obtain reviewed bounded live evidence for IDs/text/timestamps, relevance, pagination/window behavior, reconciled charges, sanitized provenance, and network-denied replay. Approval flags, references, catalog claims, code hashes, synthetic tests, and `network_requests: 0` do not establish these facts.
+- [ ] Review 2 #6 — **issue #3 activation hold**: retain the separate issue #3 `docs/reddit-acquisition.md` incident record; authorized provider/account evidence and reconciliation of its actual outcome/charge are still required. No charge or credential exposure is independently established here. This ticket does not edit or clear that hold.
+- [ ] Review 1 #3 — **idle deletion procedure**: arrange authorized periodic deletion for recordings and retained derived copies before activation. Invocation-driven cleanup does not guarantee expiry while idle.
+
 ## Offline verification
 
 Run the standard-library synthetic suite with network denial inherited by CLI subprocesses (no provider calls, credential reads, or live-state access):
 
 ```sh
-PYTHONPATH=tests python3 -m unittest discover -s tests -p 'test_collect_x.py' -v
+TMPDIR="$HOME/.hermes/cache/scratch" PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tests python3 -m unittest discover -s tests -p 'test_collect_x.py' -v
 ```
 
 The test audit hook denies socket/DNS/bind/connect events and blocks credential/live-state paths, including subprocesses. Fixture post IDs/text/timestamps and all provider responses are synthetic; passing tests are not live verification.

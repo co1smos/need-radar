@@ -29,6 +29,7 @@ CREDENTIALS_FILE = Path("/home/ubuntu/projects/need-radar/credentials.env")
 BUDGET_MICRO_USD = 250_000
 SUCCESS_LIMIT = 25
 RETENTION_SECONDS = 7 * 24 * 60 * 60
+OFFLINE_TOKEN_PREFIX = "synthetic-"
 MAX_RESPONSE_BYTES = 1_048_576
 RESPONSE_READ_CHUNK = 65_536
 TRANSIENT_STATUSES = {408, 425, 429, 500, 502, 503, 504}
@@ -56,6 +57,9 @@ KEY_VALUE_SECRET_PATTERN = re.compile(
     r"password|secret|signature|credential|token))"
     r"([\"']?\s*[=:]\s*)(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s&,;]+)"
 )
+AUTH_COOKIE_PAYLOAD_PATTERN = re.compile(
+    r"(?im)\b(proxy-authorization|authorization|cookie|set-cookie)\s*([:=])\s*[^\r\n]*"
+)
 URL_PATTERN = re.compile(r"\b[a-z][a-z0-9+.-]{0,31}://[^\s<>\"']+", re.IGNORECASE)
 SECRET_QUERY_KEY_PATTERN = re.compile(
     r"(?i)(?:authorization|cookie|api[_-]?key|access[_-]?token|refresh[_-]?token|"
@@ -64,6 +68,32 @@ SECRET_QUERY_KEY_PATTERN = re.compile(
 )
 SIGNED_URL_KEY_PATTERN = re.compile(r"(?i)(?:signature|sig|credential|token|x-amz-|x-goog-|awsaccesskeyid|googleaccessid|key-pair-id|policy)")
 SENSITIVE_HEADER_NAMES = {"authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key"}
+PUBLIC_ERROR_CODES = {
+    "billing_header_missing_or_invalid",
+    "found_flag_missing_or_invalid",
+    "http_error",
+    "invalid_json",
+    "items_missing_or_invalid",
+    "missing_id_or_text",
+    "missing_timestamp",
+    "next_cursor_invalid",
+    "next_cursor_redacted",
+    "output_not_object",
+    "provider_identity_mismatch",
+    "provider_overflow",
+    "response_deadline_exceeded",
+    "response_not_object",
+    "response_page_limit_exceeded",
+    "response_read_failed",
+    "response_size_limit_exceeded",
+    "response_timeout",
+    "result_not_object",
+    "served_source_identity_missing",
+    "served_source_changed",
+    "unknown_transport_outcome",
+}
+PUBLIC_EXCLUSION_REASONS = {"item_not_object", "missing_id_or_text", "missing_timestamp", "out_of_window"}
+PUBLIC_EVIDENCE_COMPLETENESS = {"bounded_partial", "empty_success", "invalid_response", "not_validated", "validated_items"}
 FAILURE_STOP_REASONS = {
     "authentication_failure",
     "cursor_cycle",
@@ -370,12 +400,8 @@ def _redact(value, secrets=()):
         if secret:
             value = value.replace(secret, "[REDACTED]")
     value = TOKEN_PATTERN.sub("Bearer [REDACTED]", value)
+    value = AUTH_COOKIE_PAYLOAD_PATTERN.sub(r"\1\2[REDACTED]", value)
     value = KEY_VALUE_SECRET_PATTERN.sub(r"\1\2[REDACTED]", value)
-    value = re.sub(
-        r"(?im)\b(authorization|proxy-authorization|cookie|set-cookie)\s*:\s*[^\r\n]*",
-        r"\1: [REDACTED]",
-        value,
-    )
 
     def redact_url(match):
         candidate = match.group(0)
@@ -666,6 +692,8 @@ def _replay_validation(record):
     response = record.get("response", {})
     billing = record.get("billing", {})
     status = response.get("http_status") if isinstance(response, dict) else None
+    if isinstance(response, dict) and response.get("failure") == "unknown_transport_outcome":
+        return {"errors": ["unknown_transport_outcome"]}
     if isinstance(billing, dict) and billing.get("charged_micro_usd") is None:
         return {"errors": ["billing_header_missing_or_invalid"]}
     if isinstance(response, dict) and response.get("failure"):
@@ -683,6 +711,9 @@ def _replay_validation(record):
             response["evidence_body"], approval, (), record.get("request", {}).get("limit", 1),
             context.get("expected_source_id") if isinstance(context, dict) else None,
         )
+        transformations = context.get("sanitized_transformations", []) if isinstance(context, dict) else []
+        if isinstance(transformations, list) and "next_cursor_redacted" in transformations:
+            return {"errors": ["next_cursor_redacted"]}
         return validation
     if isinstance(status, int):
         return {"errors": ["http_error"], "evidence_completeness": "not_validated"}
@@ -805,8 +836,8 @@ def _attempt_record(attempt_id, request, max_cost):
     }
 
 
-def _summary(state, stop_reason, run_id, pages, item_count, pagination):
-    return {
+def _summary(state, stop_reason, run_id, pages, item_count, pagination, acquisition_failure=None):
+    summary = {
         "ticket": TICKET,
         "run_id": run_id,
         "successful_requests": state["successful_requests"],
@@ -815,12 +846,15 @@ def _summary(state, stop_reason, run_id, pages, item_count, pagination):
         "pages_this_run": pages,
         "items_this_run": item_count,
         "stop_reason": stop_reason,
-        "outcome": "failed" if stop_reason in FAILURE_STOP_REASONS else "success" if stop_reason in {"empty_results", "provider_no_next_cursor"} else "bounded_stop",
+        "outcome": "failed" if acquisition_failure or stop_reason in FAILURE_STOP_REASONS else "success" if stop_reason in {"empty_results", "provider_no_next_cursor"} else "bounded_stop",
         "coverage": {
             "pagination": pagination,
             "conversation": "search/reply samples only; complete conversation coverage not established",
         },
     }
+    if acquisition_failure:
+        summary["acquisition_failure"] = acquisition_failure
+    return summary
 
 
 def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None, org=None, offline_transport=None, review=None):
@@ -843,6 +877,8 @@ def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None,
             raise CollectorError("live credentials must be loaded only from the approved credential file")
     elif not isinstance(offline_transport, OfflineTransport):
         raise CollectorError("test transports must be explicitly marked offline")
+    elif not isinstance(token, str) or not token.startswith(OFFLINE_TOKEN_PREFIX):
+        raise CollectorError("offline collection requires an explicit synthetic token")
     state_dir = Path(state_dir)
     recording_dir = Path(recording_dir) if recording_dir else state_dir / "recordings"
     request_transport = offline_transport if offline_transport is not None else _http_request
@@ -854,6 +890,7 @@ def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None,
     seen_cursors = set()
     parent_span = None
     selected_source_id = None
+    last_acquisition_failure = None
 
     with _ticket_lock(state_dir):
         _clean_expired(recording_dir, retention_seconds)
@@ -912,7 +949,10 @@ def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None,
             completed_page = False
             for _attempt_index in range(inputs["limits"]["max_attempts_per_page"]):
                 if state["attempt_count"] >= inputs["limits"]["max_total_attempts"]:
-                    return _summary(state, "attempt_limit", run_id, pages, item_count, "incomplete at approved total-attempt limit")
+                    return _summary(
+                        state, "attempt_limit", run_id, pages, item_count,
+                        "incomplete at approved total-attempt limit", last_acquisition_failure,
+                    )
                 available = BUDGET_MICRO_USD - state["charged_micro_usd"]
                 if available <= 0:
                     return _summary(state, "spend_limit", run_id, pages, item_count, "incomplete at spend limit")
@@ -971,7 +1011,7 @@ def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None,
                         "resolved_limits": dict(inputs["limits"]),
                         "request": request_provenance,
                         "request_headers": {key: value for key, value in headers.items() if key != "X-Treg-Token" and key != "X-Treg-Org"},
-                        "response": {"http_status": None, "failure": "transport outcome unknown"},
+                        "response": {"http_status": None, "failure": "unknown_transport_outcome"},
                         "billing": {"charged_micro_usd": None, "reserved_micro_usd": max_cost},
                         "validation": {"errors": ["unknown_transport_outcome"]},
                         "coverage": {"pagination": "unknown", "conversation": "search/reply samples only; complete conversation coverage not established"},
@@ -987,6 +1027,7 @@ def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None,
                     attempt["failure"] = "response status missing"
                     _save_state(state_dir, state)
                     return _summary(state, "unknown_charge_or_outcome", run_id, pages, item_count, "paused on unknown response")
+                last_acquisition_failure = "request_failure" if not 200 <= status < 300 else None
                 cost = _micro_header(response_headers)
                 call_id = _safe_header(response_headers, "X-Treg-Call-Id", (token, org))
                 try:
@@ -1040,7 +1081,13 @@ def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None,
                     "resolved_limits": dict(inputs["limits"]),
                     "request": request_provenance,
                     "request_headers": _safe_value({key: value for key, value in headers.items() if key not in {"X-Treg-Token", "X-Treg-Org"}}, (token, org)),
-                    "validation_context": {"expected_source_id": selected_source_id},
+                    "validation_context": {
+                        "expected_source_id": selected_source_id,
+                        "sanitized_transformations": [
+                            error for error in validation.get("errors", [])
+                            if error == "next_cursor_redacted"
+                        ],
+                    },
                     "response": {
                         "http_status": status,
                         "body_sha256": response_hash,
@@ -1117,7 +1164,10 @@ def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None,
                         if state["charged_micro_usd"] >= BUDGET_MICRO_USD:
                             page_record["coverage"]["pagination"] = "not continued after spend limit on transient failure"
                             _update_recording(recording_dir, page_record)
-                            return _summary(state, "spend_limit", run_id, pages, item_count, "incomplete after charged transient failure")
+                            return _summary(
+                                state, "spend_limit", run_id, pages, item_count,
+                                "incomplete after charged transient failure", last_acquisition_failure,
+                            )
                         delay = inputs["limits"]["retry_delay_seconds"]
                         if delay:
                             time.sleep(delay)
@@ -1126,7 +1176,10 @@ def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None,
                         continue
                     page_record["coverage"]["pagination"] = "not continued after request failure"
                     _update_recording(recording_dir, page_record)
-                    return _summary(state, "request_failure", run_id, pages, item_count, "incomplete after request failure")
+                    return _summary(
+                        state, "request_failure", run_id, pages, item_count,
+                        "incomplete after request failure", last_acquisition_failure,
+                    )
                 if response_data is None:
                     page_record["coverage"]["pagination"] = "not continued after response validation failure"
                     _update_recording(recording_dir, page_record)
@@ -1185,7 +1238,10 @@ def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None,
                 completed_page = True
                 break
             if not completed_page:
-                return _summary(state, "retry_limit", run_id, pages, item_count, "incomplete after bounded transient retries")
+                return _summary(
+                    state, "retry_limit", run_id, pages, item_count,
+                    "incomplete after bounded transient retries", last_acquisition_failure,
+                )
 
         return _summary(state, "page_limit", run_id, pages, item_count, "incomplete at approved page limit")
 
@@ -1193,13 +1249,52 @@ def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None,
 def _public_summary(record):
     response = record.get("response", {})
     body = response.get("body") if isinstance(response, dict) else None
+    validation = record.get("validation")
+    validation = validation if isinstance(validation, dict) else {}
+    errors = validation.get("errors")
+    errors = errors if isinstance(errors, list) else []
+    excluded_items = validation.get("excluded_items")
+    excluded_items = excluded_items if isinstance(excluded_items, list) else []
+    exclusion_reason_counts = {}
+    for excluded in excluded_items:
+        reason = excluded.get("reason") if isinstance(excluded, dict) else None
+        code = reason if isinstance(reason, str) and reason in PUBLIC_EXCLUSION_REASONS else "unclassified"
+        exclusion_reason_counts[code] = exclusion_reason_counts.get(code, 0) + 1
+    error_codes = {
+        error if error in PUBLIC_ERROR_CODES else "unclassified"
+        for error in errors
+        if isinstance(error, str)
+    }
+    error_count = len(errors)
+    excluded_count = len(excluded_items)
+
+    def count(name):
+        value = validation.get(name, 0)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+    evidence_completeness = validation.get("evidence_completeness")
+    recording_id = record.get("recording_id")
+    if not isinstance(recording_id, str) or not re.fullmatch(r"[0-9a-f]{32}", recording_id):
+        recording_id = None
+    http_status = response.get("http_status") if isinstance(response, dict) else None
+    if isinstance(http_status, bool) or not isinstance(http_status, int) or not 100 <= http_status <= 599:
+        http_status = None
     return {
         "source": "offline_recording",
-        "recording_id": record.get("recording_id"),
-        "http_status": response.get("http_status") if isinstance(response, dict) else None,
+        "recording_id": recording_id,
+        "http_status": http_status,
         "item_count": len(body.get("items", [])) if isinstance(body, dict) and isinstance(body.get("items"), list) else 0,
-        "validation": record.get("validation"),
-        "coverage": record.get("coverage"),
+        "validation": {
+            "error_count": error_count,
+            "error_codes": sorted(error_codes),
+            "excluded_item_count": excluded_count,
+            "exclusion_reason_counts": exclusion_reason_counts,
+            "invalid_item_count": count("invalid_item_count"),
+            "out_of_window_count": count("out_of_window_count"),
+            "evidence_completeness": evidence_completeness
+            if isinstance(evidence_completeness, str) and evidence_completeness in PUBLIC_EVIDENCE_COMPLETENESS
+            else None,
+        },
         "network_requests": 0,
     }
 

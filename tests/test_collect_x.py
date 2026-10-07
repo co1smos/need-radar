@@ -114,7 +114,12 @@ class LocalProvider:
 
 
 def cli_environment():
-    return {"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(ROOT / "tests")}
+    return {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": str(ROOT / "tests"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "TMPDIR": os.environ.get("TMPDIR", ""),
+    }
 
 
 class NetworkGuardTests(unittest.TestCase):
@@ -145,6 +150,22 @@ class LiveGateTests(unittest.TestCase):
                 collect_x.collect(approved_inputs())
         loader.assert_not_called()
 
+    def test_offline_collection_requires_explicit_synthetic_credentials(self):
+        for token in (None, "live-token-looking-value"):
+            with self.subTest(token_supplied=token is not None), tempfile.TemporaryDirectory() as temporary:
+                state_dir = Path(temporary) / "state"
+                offline_transport = collect_x.OfflineTransport(lambda *_args: None)
+                with mock.patch.object(collect_x, "_load_credentials", side_effect=AssertionError("credentials must not load")) as loader:
+                    with self.assertRaisesRegex(collect_x.CollectorError, "explicit synthetic token"):
+                        collect_x.collect(
+                            approved_inputs(),
+                            state_dir=state_dir,
+                            offline_transport=offline_transport,
+                            token=token,
+                        )
+                loader.assert_not_called()
+                self.assertFalse(state_dir.exists())
+
     def test_cli_maps_failed_collector_summary_to_nonzero(self):
         inputs = approved_inputs()
         with tempfile.TemporaryDirectory() as temporary:
@@ -158,7 +179,11 @@ class LiveGateTests(unittest.TestCase):
                 "checks": ["budget_reservations", "secret_handling"],
             }
             review_path.write_text(json.dumps(review))
-            summary = {"outcome": "failed", "stop_reason": "authentication_failure"}
+            summary = {
+                "outcome": "failed",
+                "stop_reason": "spend_limit",
+                "acquisition_failure": "request_failure",
+            }
             with mock.patch.object(collect_x, "collect", return_value=summary) as collect:
                 with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
                     status = collect_x.main([
@@ -460,6 +485,7 @@ class CollectionTests(unittest.TestCase):
                 self.assertEqual(result["successful_requests"], 1)
                 self.assertEqual(state["charged_micro_usd"], collect_x.BUDGET_MICRO_USD)
                 self.assertEqual(result["stop_reason"], "spend_limit")
+                self.assertEqual(result["outcome"], "bounded_stop")
                 stopped, _, _ = self.collect(provider, temporary, inputs)
                 self.assertEqual(stopped["stop_reason"], "spend_limit")
         finally:
@@ -573,7 +599,8 @@ class CollectionTests(unittest.TestCase):
         body["output"]["data"]["items"][0]["text"] = (
             'Synthetic text synthetic-secret Bearer abc123 api_key=leakme "token": "quoted-leak" '
             'https://url-user-secret:url-pass-secret@example.test/data?X-Amz-Signature=aws-leak&ok=signed-other-leak#fragment-secret '
-            'Cookie: sessionid=cookie-leak Authorization: Basic basic-leak'
+            'Cookie: sessionid=cookie-leak Authorization: Basic basic-leak '
+            'Authorization=Basic basic-assignment-secret\nCookie=sessionid=cookie-one; other=cookie-two'
         )
         provider = LocalProvider([{"body": body, "headers": {
             "X-Treg-Cost-Micro": "750",
@@ -592,6 +619,7 @@ class CollectionTests(unittest.TestCase):
                     "url-user-secret", "url-pass-secret", "aws-leak", "signed-other-leak", "fragment-secret",
                     "cookie-leak", "basic-leak", "field-token-secret", "authorization-field-secret",
                     "cookie-field-secret", "header-signature", "header-query-secret",
+                    "basic-assignment-secret", "cookie-one", "cookie-two",
                 ):
                     self.assertNotIn(secret, persisted)
                 self.assertIn("[REDACTED]", persisted)
@@ -747,6 +775,100 @@ class CollectionTests(unittest.TestCase):
         finally:
             provider.close()
 
+    def test_transport_failure_replays_recorded_validation(self):
+        def fail_request(*_args):
+            raise TimeoutError("synthetic transport timeout")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "state"
+            recording_dir = Path(temporary) / "recordings"
+            result = collect_x.collect(
+                approved_inputs(),
+                state_dir,
+                recording_dir,
+                token="synthetic-secret",
+                offline_transport=collect_x.OfflineTransport(fail_request),
+            )
+            recording_path = next(recording_dir.glob("*.json"))
+            recording = json.loads(recording_path.read_text())
+            self.assertEqual(result["stop_reason"], "unknown_charge_or_outcome")
+            self.assertEqual(recording["validation"]["errors"], ["unknown_transport_outcome"])
+            replay = collect_x.replay_recording(recording_path)
+            self.assertEqual(replay["replay_validation"], recording["validation"])
+
+    def test_missing_billing_failure_replays_recorded_validation(self):
+        provider = LocalProvider([{"body": response_body("empty.json"), "headers": {}}])
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                result, _, recording_dir = self.collect(provider, temporary)
+                recording_path = next(recording_dir.glob("*.json"))
+                recording = json.loads(recording_path.read_text())
+                self.assertEqual(result["stop_reason"], "unknown_charge_or_outcome")
+                self.assertEqual(recording["validation"]["errors"], ["billing_header_missing_or_invalid"])
+                replay = collect_x.replay_recording(recording_path)
+                self.assertEqual(replay["replay_validation"], recording["validation"])
+        finally:
+            provider.close()
+
+    def test_redacted_cursor_failure_replays_from_sanitized_diagnostic(self):
+        body = response_body("page-1.json")
+        body["output"]["data"]["nextCursor"] = "token=cursor-secret"
+        provider = LocalProvider([{"body": body, "headers": {"X-Treg-Cost-Micro": "750"}}])
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                self.collect(provider, temporary)
+                recording_path = next((Path(temporary) / "recordings").glob("*.json"))
+                recording = json.loads(recording_path.read_text())
+                self.assertEqual(recording["validation"]["errors"], ["next_cursor_redacted"])
+                self.assertEqual(recording["validation_context"]["sanitized_transformations"], ["next_cursor_redacted"])
+                self.assertNotIn("cursor-secret", recording_path.read_text())
+                replay = collect_x.replay_recording(recording_path)
+                self.assertEqual(replay["replay_validation"], recording["validation"])
+        finally:
+            provider.close()
+
+    def test_failed_transient_request_remains_failed_when_spend_cap_stops_retry(self):
+        provider = LocalProvider([{
+            "status": 503,
+            "body": response_body("transient-error.json"),
+            "headers": {"X-Treg-Cost-Micro": str(collect_x.BUDGET_MICRO_USD)},
+        }])
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                result, _, _ = self.collect(provider, temporary)
+                self.assertEqual(result["stop_reason"], "spend_limit")
+                self.assertEqual(result["acquisition_failure"], "request_failure")
+                self.assertEqual(result["outcome"], "failed")
+        finally:
+            provider.close()
+
+    def test_failed_transient_request_remains_failed_when_attempt_cap_stops_retry(self):
+        provider = LocalProvider([{
+            "status": 503,
+            "body": response_body("transient-error.json"),
+            "headers": {"X-Treg-Cost-Micro": "750"},
+        }])
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                state_dir = Path(temporary) / "state"
+                recording_dir = Path(temporary) / "recordings"
+                state = collect_x._new_state()
+                state["attempt_count"] = 1
+                state["attempts"].append({"status": "failed", "http_status": 503, "cost_micro_usd": 0})
+                collect_x._save_state(state_dir, state)
+                result = collect_x.collect(
+                    approved_inputs(max_total_attempts=2),
+                    state_dir,
+                    recording_dir,
+                    token="synthetic-secret",
+                    offline_transport=collect_x.OfflineTransport(provider),
+                )
+                self.assertEqual(result["stop_reason"], "attempt_limit")
+                self.assertEqual(result["acquisition_failure"], "request_failure")
+                self.assertEqual(result["outcome"], "failed")
+        finally:
+            provider.close()
+
     def test_excluded_item_is_preserved_with_reason(self):
         provider = LocalProvider([{"body": response_body("page-1.json"), "headers": {"X-Treg-Cost-Micro": "750"}}])
         try:
@@ -820,6 +942,43 @@ class CollectionTests(unittest.TestCase):
                 with self.assertRaisesRegex(collect_x.CollectorError, "expired"):
                     collect_x.replay_recording(expired)
                 self.assertFalse(expired.exists())
+        finally:
+            provider.close()
+
+    def test_replay_cli_exports_only_counts_and_reason_codes(self):
+        body = response_body("page-1.json")
+        body["output"]["data"]["items"] = [{
+            "id": "private-excluded-id",
+            "text": "private-excluded-source-text",
+            "createdUtc": collect_x._date_epoch("2026-10-03"),
+            "url": "https://example.test/private-excluded-url",
+        }]
+        provider = LocalProvider([{"body": body, "headers": {"X-Treg-Cost-Micro": "750"}}])
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                _, _, recording_dir = self.collect(provider, temporary)
+                recording = next(recording_dir.glob("*.json"))
+                command = subprocess.run(
+                    [sys.executable, str(ROOT / "scripts" / "collect_x.py"), "replay", "--recording", str(recording)],
+                    capture_output=True,
+                    text=True,
+                    env=cli_environment(),
+                    check=False,
+                )
+                self.assertEqual(command.returncode, 0, command.stderr)
+                summary = json.loads(command.stdout)
+                for private_value in (
+                    "private-excluded-id",
+                    "private-excluded-source-text",
+                    "private-excluded-url",
+                    str(collect_x._date_epoch("2026-10-03")),
+                ):
+                    self.assertNotIn(private_value, command.stdout)
+                self.assertEqual(summary["validation"]["excluded_item_count"], 1)
+                self.assertEqual(summary["validation"]["out_of_window_count"], 1)
+                self.assertEqual(summary["validation"]["exclusion_reason_counts"], {"out_of_window": 1})
+                self.assertNotIn("coverage", summary)
+                self.assertNotIn("excluded_items", summary["validation"])
         finally:
             provider.close()
 
