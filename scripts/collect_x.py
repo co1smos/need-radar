@@ -10,10 +10,13 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import stat
 import tempfile
+import threading
 import time
 import urllib.error
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import urllib.request
 import uuid
 
@@ -26,6 +29,8 @@ CREDENTIALS_FILE = Path("/home/ubuntu/projects/need-radar/credentials.env")
 BUDGET_MICRO_USD = 250_000
 SUCCESS_LIMIT = 25
 RETENTION_SECONDS = 7 * 24 * 60 * 60
+MAX_RESPONSE_BYTES = 1_048_576
+RESPONSE_READ_CHUNK = 65_536
 TRANSIENT_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 REQUIRED_GATES = (
     "approved_query_window",
@@ -40,19 +45,93 @@ REQUIRED_GATES = (
 )
 REQUIRED_REVIEW_CHECKS = {"budget_reservations", "secret_handling"}
 TOKEN_PATTERN = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
+SECRET_FIELD_PATTERN = re.compile(
+    r"(?i)(?:[a-z0-9]+[_-])*(?:proxy[_-]?authorization|authorization|cookie|set[_-]?cookie|"
+    r"api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|"
+    r"password|secret|signature|credential|token)"
+)
 KEY_VALUE_SECRET_PATTERN = re.compile(
-    r"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|password|secret|token)"
+    r"(?i)\b((?:[a-z0-9]+[_-])*(?:proxy[_-]?authorization|authorization|cookie|set[_-]?cookie|"
+    r"api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|"
+    r"password|secret|signature|credential|token))"
     r"([\"']?\s*[=:]\s*)(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s&,;]+)"
 )
+URL_PATTERN = re.compile(r"\b[a-z][a-z0-9+.-]{0,31}://[^\s<>\"']+", re.IGNORECASE)
+SECRET_QUERY_KEY_PATTERN = re.compile(
+    r"(?i)(?:authorization|cookie|api[_-]?key|access[_-]?token|refresh[_-]?token|"
+    r"auth[_-]?token|password|secret|signature|sig|credential|token|x-amz-.+|"
+    r"awsaccesskeyid|googleaccessid|key-pair-id|policy)"
+)
+SIGNED_URL_KEY_PATTERN = re.compile(r"(?i)(?:signature|sig|credential|token|x-amz-|x-goog-|awsaccesskeyid|googleaccessid|key-pair-id|policy)")
+SENSITIVE_HEADER_NAMES = {"authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key"}
+FAILURE_STOP_REASONS = {
+    "authentication_failure",
+    "cursor_cycle",
+    "provider_overflow",
+    "provider_page_limit_exceeded",
+    "provider_source_changed",
+    "reported_cost_exceeds_reservation",
+    "request_failure",
+    "response_validation_failure",
+    "response_read_failure",
+    "response_size_limit_exceeded",
+    "retry_limit",
+    "unreconciled_attempt",
+    "unknown_charge_or_outcome",
+}
 
 
 class CollectorError(Exception):
     pass
 
 
+class ResponseDeadlineExceeded(TimeoutError):
+    pass
+
+
+class ResponseReadError(Exception):
+    def __init__(self, reason, partial):
+        super().__init__(reason)
+        self.reason = reason
+        self.partial = partial
+
+
 def _safe_mkdir(path):
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = Path(path)
+    missing = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        _fsync_directory(directory.parent)
     os.chmod(path, 0o700)
+    _fsync_directory(path)
+
+
+def _fsync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _has_symlink_component(path):
+    current = Path(path).absolute()
+    for component in reversed((current, *current.parents)):
+        try:
+            if stat.S_ISLNK(component.lstat().st_mode):
+                return True
+        except FileNotFoundError:
+            return False
+    return False
 
 
 def _private_json(path, value):
@@ -66,7 +145,7 @@ def _private_json(path, value):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary_name, path)
-        os.chmod(path, 0o600)
+        _fsync_directory(path.parent)
     except BaseException:
         try:
             os.unlink(temporary_name)
@@ -91,8 +170,8 @@ def load_state(state_dir):
     if not path.exists():
         return _new_state()
     try:
-        metadata = path.stat()
-        if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
             raise CollectorError("ticket state permissions are unsafe")
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -225,6 +304,15 @@ def validate_approval(inputs):
         evidence = gates.get(gate)
         if not isinstance(evidence, dict) or evidence.get("verified") is not True or not isinstance(evidence.get("evidence"), str) or not evidence["evidence"].strip():
             raise CollectorError("execution gate is not verified: " + gate)
+    retention = gates["retention_and_removal"]
+    retention_seconds = retention.get("retention_seconds")
+    if (
+        isinstance(retention_seconds, bool)
+        or not isinstance(retention_seconds, int)
+        or not 1 <= retention_seconds <= RETENTION_SECONDS
+        or retention.get("derived_removal_verified") is not True
+    ):
+        raise CollectorError("execution gate has no valid source/provider retention and removal limit")
     return inputs
 
 
@@ -282,11 +370,58 @@ def _redact(value, secrets=()):
         if secret:
             value = value.replace(secret, "[REDACTED]")
     value = TOKEN_PATTERN.sub("Bearer [REDACTED]", value)
-    return KEY_VALUE_SECRET_PATTERN.sub(r"\1\2[REDACTED]", value)
+    value = KEY_VALUE_SECRET_PATTERN.sub(r"\1\2[REDACTED]", value)
+    value = re.sub(
+        r"(?im)\b(authorization|proxy-authorization|cookie|set-cookie)\s*:\s*[^\r\n]*",
+        r"\1: [REDACTED]",
+        value,
+    )
+
+    def redact_url(match):
+        candidate = match.group(0)
+        trailing = candidate[len(candidate.rstrip(".,;:!?)")):]
+        candidate = candidate.rstrip(".,;:!?)")
+        try:
+            parsed = urlsplit(candidate)
+            hostname = parsed.hostname
+            if hostname is None:
+                return "[REDACTED_URL]" + trailing
+            host = f"[{hostname}]" if ":" in hostname else hostname
+            if parsed.port is not None:
+                host += ":" + str(parsed.port)
+            query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+            signed = any(SIGNED_URL_KEY_PATTERN.search(key) for key, _value in query_pairs)
+            query = [
+                (key, "[REDACTED]" if signed or SECRET_QUERY_KEY_PATTERN.fullmatch(key) else item)
+                for key, item in query_pairs
+            ]
+            safe_url = urlunsplit((parsed.scheme, host, parsed.path, urlencode(query), ""))
+            return safe_url + trailing
+        except ValueError:
+            return "[REDACTED_URL]" + trailing
+
+    return URL_PATTERN.sub(redact_url, value)
+
+
+def _safe_value(value, secrets=()):
+    if isinstance(value, str):
+        return _redact(value, secrets)
+    if isinstance(value, list):
+        return [_safe_value(item, secrets) for item in value]
+    if isinstance(value, dict):
+        return {
+            _redact(str(key), secrets): "[REDACTED]"
+            if SECRET_FIELD_PATTERN.fullmatch(str(key))
+            else _safe_value(item, secrets)
+            for key, item in value.items()
+        }
+    return value
 
 
 def _safe_header(headers, name, secrets):
     value = headers.get(name)
+    if name.casefold() in SENSITIVE_HEADER_NAMES:
+        return "[REDACTED]" if value is not None else None
     return _redact(str(value), secrets) if value is not None else None
 
 
@@ -360,13 +495,16 @@ def _extract_response(body, inputs, secrets, requested_limit, expected_source_id
     errors = []
     out_of_window = 0
     invalid_items = 0
+    excluded_items = []
     for item in data["items"]:
         safe_item, error = _safe_response_item(item, secrets, start_epoch, end_epoch)
         if error == "out_of_window":
             out_of_window += 1
+            excluded_items.append({"item": _safe_value(item, secrets), "reason": error})
         elif error:
             invalid_items += 1
             errors.append(error)
+            excluded_items.append({"item": _safe_value(item, secrets), "reason": error})
         elif safe_item:
             safe_items.append(safe_item)
     cursor_present = "nextCursor" in data
@@ -397,6 +535,7 @@ def _extract_response(body, inputs, secrets, requested_limit, expected_source_id
         "errors": errors,
         "invalid_item_count": invalid_items,
         "out_of_window_count": out_of_window,
+        "excluded_items": excluded_items,
         "evidence_completeness": "validated_items" if safe_items else "empty_success",
     }
     return response, validation
@@ -406,11 +545,12 @@ def _hash(value):
     return hashlib.sha256(value).hexdigest()
 
 
-def _safe_recording(recording_dir, record):
+def _safe_recording(recording_dir, record, retention_seconds):
     recording_id = uuid.uuid4().hex
     record["recording_id"] = recording_id
     record["recorded_at_epoch"] = int(time.time())
-    record["expires_at_epoch"] = record["recorded_at_epoch"] + RETENTION_SECONDS
+    record["retention_seconds"] = retention_seconds
+    record["expires_at_epoch"] = record["recorded_at_epoch"] + retention_seconds
     path = Path(recording_dir) / (recording_id + ".json")
     _private_json(path, record)
     return recording_id
@@ -421,36 +561,75 @@ def _update_recording(recording_dir, record):
     _private_json(path, record)
 
 
-def _clean_expired(recording_dir, now=None):
+def _clean_expired(recording_dir, retention_seconds=RETENTION_SECONDS, now=None):
     now = int(time.time() if now is None else now)
-    _safe_mkdir(Path(recording_dir))
-    for path in Path(recording_dir).glob("*.json"):
+    directory = Path(recording_dir)
+    _safe_mkdir(directory)
+    removed = False
+    for path in directory.iterdir():
+        if not (path.name.endswith(".json") or path.name.startswith(".pending-")):
+            continue
         try:
+            metadata = path.lstat()
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+                path.unlink()
+                removed = True
+                continue
             record = json.loads(path.read_text(encoding="utf-8"))
-            recorded_at = record.get("recorded_at_epoch") if isinstance(record, dict) else None
-            expires_at = record.get("expires_at_epoch") if isinstance(record, dict) else None
+            if not isinstance(record, dict):
+                path.unlink()
+                removed = True
+                continue
+            recorded_at = record.get("recorded_at_epoch")
+            expires_at = record.get("expires_at_epoch")
+            stored_retention = record.get("retention_seconds")
             expired = (
+                path.name.startswith(".pending-")
+                or
                 not isinstance(recorded_at, int)
                 or isinstance(recorded_at, bool)
                 or not isinstance(expires_at, int)
                 or isinstance(expires_at, bool)
-                or expires_at != recorded_at + RETENTION_SECONDS
-                or now >= expires_at
+                or isinstance(stored_retention, bool)
+                or not isinstance(stored_retention, int)
+                or not 1 <= stored_retention <= RETENTION_SECONDS
+                or expires_at != recorded_at + stored_retention
+                or now >= min(expires_at, recorded_at + retention_seconds)
             )
             if expired:
                 path.unlink()
-        except (OSError, json.JSONDecodeError):
-            continue
+                removed = True
+        except (json.JSONDecodeError, UnicodeError):
+            path.unlink()
+            removed = True
+        except OSError:
+            raise CollectorError("recording cleanup failed; acquisition paused") from None
+    if removed:
+        _fsync_directory(directory)
 
 
 def replay_recording(path, now=None):
     path = Path(path)
     try:
-        mode = stat.S_IMODE(path.stat().st_mode)
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+            path.unlink()
+            _fsync_directory(path.parent)
+            raise CollectorError("recording permissions are unsafe")
+        mode = stat.S_IMODE(metadata.st_mode)
         record = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except CollectorError:
+        raise
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        try:
+            path.unlink()
+            _fsync_directory(path.parent)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise CollectorError("unreadable recording could not be removed; replay blocked") from None
         raise CollectorError("recording is missing or unreadable") from None
-    if mode & 0o077:
+    if mode & 0o077 or not isinstance(record, dict):
         raise CollectorError("recording permissions are unsafe")
     current = int(time.time() if now is None else now)
     recorded_at = record.get("recorded_at_epoch") if isinstance(record, dict) else None
@@ -460,17 +639,54 @@ def replay_recording(path, now=None):
         or isinstance(recorded_at, bool)
         or not isinstance(expires_at, int)
         or isinstance(expires_at, bool)
-        or expires_at != recorded_at + RETENTION_SECONDS
+        or isinstance(record.get("retention_seconds"), bool)
+        or not isinstance(record.get("retention_seconds"), int)
+        or not 1 <= record["retention_seconds"] <= RETENTION_SECONDS
+        or expires_at != recorded_at + record["retention_seconds"]
         or current >= expires_at
         or recorded_at > current + 60
     ):
         try:
             path.unlink()
+            _fsync_directory(path.parent)
         except FileNotFoundError:
             pass
+        except OSError:
+            raise CollectorError("expired recording could not be removed; replay blocked") from None
         raise CollectorError("recording expired or has invalid retention metadata")
     record["source"] = "offline_recording"
+    record["replay_collector_sha256"] = _script_sha256()
+    record["replay_validation"] = _replay_validation(record)
+    if record.get("replay_validation") != record.get("validation"):
+        raise CollectorError("recorded validation does not match retained response evidence")
     return record
+
+
+def _replay_validation(record):
+    response = record.get("response", {})
+    billing = record.get("billing", {})
+    status = response.get("http_status") if isinstance(response, dict) else None
+    if isinstance(billing, dict) and billing.get("charged_micro_usd") is None:
+        return {"errors": ["billing_header_missing_or_invalid"]}
+    if isinstance(response, dict) and response.get("failure"):
+        return {"errors": [response["failure"]], "evidence_completeness": "bounded_partial"}
+    if isinstance(billing, dict) and str(billing.get("served_via", "")).startswith("overflow:"):
+        return {"errors": ["provider_overflow"]}
+    if isinstance(status, int) and 200 <= status < 300:
+        if response.get("body_format") != "json":
+            return {"errors": ["invalid_json"], "evidence_completeness": "invalid_response"}
+        approval = record.get("approval")
+        if not isinstance(approval, dict):
+            raise CollectorError("recording lacks approved policy evidence")
+        context = record.get("validation_context", {})
+        _replayed, validation = _extract_response(
+            response["evidence_body"], approval, (), record.get("request", {}).get("limit", 1),
+            context.get("expected_source_id") if isinstance(context, dict) else None,
+        )
+        return validation
+    if isinstance(status, int):
+        return {"errors": ["http_error"], "evidence_completeness": "not_validated"}
+    return {"errors": ["unknown_transport_outcome"]}
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -478,13 +694,104 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class OfflineTransport:
+    def __init__(self, handler):
+        if not callable(handler):
+            raise TypeError("offline transport handler must be callable")
+        self.handler = handler
+
+    def __call__(self, *args):
+        return self.handler(*args)
+
+
+class _BufferedResponse:
+    def __init__(self, status, headers, body, truncated=False, failure=None, elapsed_seconds=None):
+        self.status = status
+        self.headers = headers
+        self.body = body
+        self.truncated = truncated
+        self.failure = failure
+        self.elapsed_seconds = elapsed_seconds
+        self.closed = False
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            size = len(self.body)
+        result, self.body = self.body[:size], self.body[size:]
+        return result
+
+    def close(self):
+        self.closed = True
+
+
+@contextmanager
+def _request_deadline(seconds):
+    if not hasattr(signal, "setitimer") or threading.current_thread() is not threading.main_thread():
+        raise CollectorError("live request deadline cannot be enforced in this execution context")
+    if any(signal.getitimer(signal.ITIMER_REAL)):
+        raise CollectorError("live request deadline conflicts with an existing process timer")
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def expire(_signum, _frame):
+        raise ResponseDeadlineExceeded("request deadline exceeded")
+
+    signal.signal(signal.SIGALRM, expire)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+def _read_response(response):
+    chunks = []
+    size = 0
+    reader = getattr(response, "read1", None) or response.read
+    try:
+        while size <= MAX_RESPONSE_BYTES:
+            chunk = reader(min(RESPONSE_READ_CHUNK, MAX_RESPONSE_BYTES + 1 - size))
+            if not chunk:
+                return b"".join(chunks), False
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > MAX_RESPONSE_BYTES:
+                raise ResponseReadError("response_size_limit_exceeded", b"".join(chunks)[:MAX_RESPONSE_BYTES])
+    except ResponseDeadlineExceeded:
+        raise ResponseReadError("response_deadline_exceeded", b"".join(chunks)) from None
+    except TimeoutError:
+        raise ResponseReadError("response_timeout", b"".join(chunks)) from None
+    except OSError:
+        raise ResponseReadError("response_read_failed", b"".join(chunks)) from None
+    finally:
+        response.close()
+    raise ResponseReadError("response_size_limit_exceeded", b"".join(chunks)[:MAX_RESPONSE_BYTES])
+
+
 def _http_request(url, data, headers, timeout):
     request = urllib.request.Request(url, data=data, headers=headers, method="POST")
     opener = urllib.request.build_opener(_NoRedirect())
+    started = time.monotonic()
+    response = None
     try:
-        return opener.open(request, timeout=timeout)
-    except urllib.error.HTTPError as error:
-        return error
+        with _request_deadline(timeout):
+            try:
+                response = opener.open(request, timeout=timeout)
+            except urllib.error.HTTPError as error:
+                response = error
+            status = getattr(response, "status", getattr(response, "code", None))
+            response_headers = response.headers
+            try:
+                body, truncated = _read_response(response)
+                failure = None
+            except ResponseReadError as error:
+                body, truncated, failure = error.partial, True, error.reason
+            return _BufferedResponse(
+                status, response_headers, body, truncated, failure, time.monotonic() - started
+            )
+    finally:
+        if response is not None:
+            response.close()
 
 
 def _attempt_record(attempt_id, request, max_cost):
@@ -508,6 +815,7 @@ def _summary(state, stop_reason, run_id, pages, item_count, pagination):
         "pages_this_run": pages,
         "items_this_run": item_count,
         "stop_reason": stop_reason,
+        "outcome": "failed" if stop_reason in FAILURE_STOP_REASONS else "success" if stop_reason in {"empty_results", "provider_no_next_cursor"} else "bounded_stop",
         "coverage": {
             "pagination": pagination,
             "conversation": "search/reply samples only; complete conversation coverage not established",
@@ -515,11 +823,30 @@ def _summary(state, stop_reason, run_id, pages, item_count, pagination):
     }
 
 
-def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None, org=None, transport=None, credential_loader=None):
+def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None, org=None, offline_transport=None, review=None):
     inputs = validate_approval(inputs)
+    live = offline_transport is None
+    if live:
+        validate_review(review)
+        if not hasattr(signal, "setitimer") or threading.current_thread() is not threading.main_thread() or any(signal.getitimer(signal.ITIMER_REAL)):
+            raise CollectorError("live request deadline cannot be enforced in this execution context")
+        if os.path.abspath(state_dir) != os.path.abspath(DEFAULT_STATE_DIR):
+            raise CollectorError("live collection requires the canonical ticket state path")
+        if _has_symlink_component(DEFAULT_STATE_DIR) or _has_symlink_component(DEFAULT_STATE_DIR / "recordings"):
+            raise CollectorError("live collection refuses symlinked ticket state paths")
+        expected_recording_dir = DEFAULT_STATE_DIR / "recordings"
+        if recording_dir is not None and (
+            os.path.abspath(recording_dir) != os.path.abspath(expected_recording_dir)
+        ):
+            raise CollectorError("live collection requires the canonical ticket recording path")
+        if token is not None or org is not None:
+            raise CollectorError("live credentials must be loaded only from the approved credential file")
+    elif not isinstance(offline_transport, OfflineTransport):
+        raise CollectorError("test transports must be explicitly marked offline")
     state_dir = Path(state_dir)
     recording_dir = Path(recording_dir) if recording_dir else state_dir / "recordings"
-    request_transport = transport or _http_request
+    request_transport = offline_transport if offline_transport is not None else _http_request
+    retention_seconds = inputs["gates"]["retention_and_removal"]["retention_seconds"]
     run_id = uuid.uuid4().hex
     pages = 0
     item_count = 0
@@ -529,10 +856,10 @@ def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None,
     selected_source_id = None
 
     with _ticket_lock(state_dir):
+        _clean_expired(recording_dir, retention_seconds)
         state = load_state(state_dir)
         if any(attempt.get("status") in {"reserved", "unknown"} for attempt in state["attempts"]):
             return _summary(state, "unreconciled_attempt", run_id, pages, item_count, "paused on unknown outcome")
-        _clean_expired(recording_dir)
         if state["successful_requests"] >= SUCCESS_LIMIT:
             return _summary(state, "success_limit", run_id, pages, item_count, "success limit reached")
         if state["charged_micro_usd"] >= BUDGET_MICRO_USD:
@@ -540,19 +867,24 @@ def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None,
         if state["attempt_count"] >= inputs["limits"]["max_total_attempts"]:
             return _summary(state, "attempt_limit", run_id, pages, item_count, "approved total-attempt limit reached")
         if token is None:
-            if credential_loader is None:
-                credential_loader = _load_credentials
-            token, org = credential_loader()
+            token, org = _load_credentials()
         if not isinstance(token, str) or not token:
             raise CollectorError("Treg token is missing")
 
         cursor = None
-        query = _redact(
+        query = (
             inputs["query"].strip()
             + " since:" + inputs["window"]["since"]
-            + " until:" + inputs["window"]["until"],
-            (token, org),
+            + " until:" + inputs["window"]["until"]
         )
+        safe_query = _redact(query, (token, org))
+        if safe_query != query:
+            raise CollectorError("approved query would change during secret sanitization; no request sent")
+        approval_evidence = _safe_value(inputs, (token, org))
+        review_evidence = {
+            "collector_sha256": review["collector_sha256"],
+            "checks": sorted(review["checks"]),
+        } if live else None
         for _page_index in range(inputs["limits"]["max_pages"]):
             if state["successful_requests"] >= SUCCESS_LIMIT:
                 return _summary(state, "success_limit", run_id, pages, item_count, "incomplete at successful-request limit")
@@ -604,6 +936,7 @@ def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None,
                 }
                 if org:
                     headers["X-Treg-Org"] = org
+                response_obj = None
                 try:
                     response_obj = request_transport(
                         ENDPOINT,
@@ -613,7 +946,12 @@ def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None,
                     )
                     status = getattr(response_obj, "status", getattr(response_obj, "code", None))
                     response_headers = response_obj.headers
-                    response_bytes = response_obj.read()
+                    read_failure = getattr(response_obj, "failure", None)
+                    try:
+                        response_bytes, _truncated = _read_response(response_obj)
+                    except ResponseReadError as error:
+                        response_bytes = error.partial
+                        read_failure = error.reason
                 except Exception:
                     attempt["status"] = "unknown"
                     attempt["failure"] = "transport outcome unknown"
@@ -624,7 +962,10 @@ def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None,
                         "run_id": run_id,
                         "span_id": attempt_id,
                         "parent_span_id": parent_span,
+                        "collector_sha256": _script_sha256(),
                         "approval_id": _redact(inputs["approval_id"], (token, org)),
+                        "approval": approval_evidence,
+                        "independent_review": review_evidence,
                         "approved_provider": inputs["provider"],
                         "provider_route": ROUTE,
                         "resolved_limits": dict(inputs["limits"]),
@@ -634,9 +975,12 @@ def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None,
                         "billing": {"charged_micro_usd": None, "reserved_micro_usd": max_cost},
                         "validation": {"errors": ["unknown_transport_outcome"]},
                         "coverage": {"pagination": "unknown", "conversation": "search/reply samples only; complete conversation coverage not established"},
-                    })
+                    }, retention_seconds)
                     _save_state(state_dir, state)
                     return _summary(state, "unknown_charge_or_outcome", run_id, pages, item_count, "paused on unknown transport outcome")
+                finally:
+                    if response_obj is not None:
+                        response_obj.close()
 
                 if status is None:
                     attempt["status"] = "unknown"
@@ -647,12 +991,16 @@ def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None,
                 call_id = _safe_header(response_headers, "X-Treg-Call-Id", (token, org))
                 try:
                     body = json.loads(response_bytes.decode("utf-8"))
+                    body_is_json = True
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     body = None
+                    body_is_json = False
                 response_hash = _hash(response_bytes)
                 response_data = None
                 validation = {"errors": ["http_error"], "evidence_completeness": "not_validated"}
-                if 200 <= status < 300 and body is not None:
+                if read_failure:
+                    validation = {"errors": [read_failure], "evidence_completeness": "bounded_partial"}
+                elif 200 <= status < 300 and body_is_json:
                     response_data, validation = _extract_response(
                         body, inputs, (token, org), page_limit, selected_source_id
                     )
@@ -663,8 +1011,15 @@ def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None,
                 if provider_overflow:
                     response_data = None
                     validation = {"errors": ["provider_overflow"]}
+                if read_failure:
+                    validation = {"errors": [read_failure], "evidence_completeness": "bounded_partial"}
 
-                safe_body = response_data if response_data is not None else None
+                evidence_body = _safe_value(body, (token, org)) if body_is_json else None
+                if not body_is_json and response_bytes:
+                    try:
+                        evidence_body = {"text": _redact(response_bytes.decode("utf-8"), (token, org))}
+                    except UnicodeDecodeError:
+                        evidence_body = None
                 provider_reported_cost = None
                 if isinstance(body, dict):
                     root = body.get("result", body)
@@ -676,16 +1031,28 @@ def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None,
                     "run_id": run_id,
                     "span_id": attempt_id,
                     "parent_span_id": parent_span,
+                    "collector_sha256": _script_sha256(),
                     "approval_id": _redact(inputs["approval_id"], (token, org)),
+                    "approval": approval_evidence,
+                    "independent_review": review_evidence,
                     "approved_provider": inputs["provider"],
                     "provider_route": ROUTE,
                     "resolved_limits": dict(inputs["limits"]),
                     "request": request_provenance,
-                    "request_headers": {key: value for key, value in headers.items() if key not in {"X-Treg-Token", "X-Treg-Org"}},
+                    "request_headers": _safe_value({key: value for key, value in headers.items() if key not in {"X-Treg-Token", "X-Treg-Org"}}, (token, org)),
+                    "validation_context": {"expected_source_id": selected_source_id},
                     "response": {
                         "http_status": status,
                         "body_sha256": response_hash,
-                        "body": safe_body,
+                        "body_bytes": len(response_bytes),
+                        "elapsed_seconds": getattr(response_obj, "elapsed_seconds", None),
+                        "body_hash_scope": "captured_prefix" if read_failure else "complete_response",
+                        "body_complete": read_failure is None,
+                        "failure": read_failure,
+                        "evidence_omitted": bool(response_bytes and evidence_body is None and not body_is_json),
+                        "body_format": "json" if body_is_json else "text" if evidence_body is not None else "binary",
+                        "body": response_data,
+                        "evidence_body": evidence_body,
                         "provider_reported_cost_usd": provider_reported_cost,
                     },
                     "billing": {
@@ -702,7 +1069,7 @@ def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None,
                     "validation": validation,
                     "coverage": {"pagination": "pending", "conversation": "search/reply samples only; complete conversation coverage not established"},
                 }
-                recording_id = _safe_recording(recording_dir, page_record)
+                recording_id = _safe_recording(recording_dir, page_record, retention_seconds)
                 attempt["recording_id"] = recording_id
                 attempt["http_status"] = status
                 attempt["call_id"] = call_id
@@ -737,6 +1104,10 @@ def collect(inputs, state_dir=DEFAULT_STATE_DIR, recording_dir=None, token=None,
                     page_record["coverage"]["pagination"] = "not continued after Treg overflow response"
                     _update_recording(recording_dir, page_record)
                     return _summary(state, "provider_overflow", run_id, pages, item_count, "stopped after Treg overflow response")
+                if read_failure:
+                    page_record["coverage"]["pagination"] = "not continued after bounded response read failure"
+                    _update_recording(recording_dir, page_record)
+                    return _summary(state, "response_read_failure", run_id, pages, item_count, "incomplete after bounded response read failure")
                 if status in {401, 403}:
                     page_record["coverage"]["pagination"] = "not continued after authentication/permission failure"
                     _update_recording(recording_dir, page_record)
@@ -857,26 +1228,32 @@ def main(argv=None):
             if not args.review_file:
                 raise CollectorError("independent budget/secret review is required; no request sent")
             inputs = validate_approval(_read_json_file(args.approval_file, "approved input record"))
-            validate_review(_read_json_file(args.review_file, "independent review"))
-            result = collect(inputs, credential_loader=_load_credentials)
+            review = _read_json_file(args.review_file, "independent review")
+            validate_review(review)
+            result = collect(inputs, review=review)
             print(json.dumps(result, sort_keys=True))
-            return 0
+            return 1 if result["outcome"] == "failed" else 0
         if args.command == "replay":
             record = replay_recording(args.recording)
             print(json.dumps(_public_summary(record), sort_keys=True))
             return 0
         if args.command == "status":
             state = load_state(args.state_dir)
+            unreconciled = sum(attempt.get("status") in {"reserved", "unknown"} for attempt in state["attempts"])
+            cap_violations = sum(attempt.get("status") == "cap_violation" for attempt in state["attempts"])
             print(json.dumps({
                 "ticket": TICKET,
+                "status": "paused" if unreconciled or cap_violations else "ready",
                 "successful_requests": state["successful_requests"],
                 "success_limit": SUCCESS_LIMIT,
                 "charged_micro_usd": state["charged_micro_usd"],
                 "spend_limit_micro_usd": BUDGET_MICRO_USD,
                 "attempt_count": state["attempt_count"],
-                "unreconciled_attempts": sum(attempt.get("status") in {"reserved", "unknown"} for attempt in state["attempts"]),
+                "failed_attempts": sum(attempt.get("status") == "failed" for attempt in state["attempts"]),
+                "cap_violations": cap_violations,
+                "unreconciled_attempts": unreconciled,
             }, sort_keys=True))
-            return 0
+            return 1 if unreconciled or cap_violations else 0
     except CollectorError as error:
         parser.exit(2, "collect_x: " + str(error) + "\n")
     except (OSError, ValueError, TypeError):

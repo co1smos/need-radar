@@ -1,6 +1,6 @@
 # X acquisition (ticket 9)
 
-Status: implementation and synthetic/offline verification only. No live X request has been made. The candidate code path is pinned to Treg's `anyapi.x.search.posts` direct-call route; this implementation choice is not live-route authorization, and public route eligibility is not proof of account access, source-use rights, or retention rights.
+Status: candidate corrections and synthetic/offline verification only; live acquisition remains **UNVERIFIED**. No live X request has been made. The candidate code path is pinned to Treg's `anyapi.x.search.posts` direct-call route; this implementation choice is not live-route authorization, and public route eligibility is not proof of account access, source-use rights, or retention rights.
 
 ## Verified public route facts
 
@@ -20,19 +20,21 @@ These are public documentation claims, not verification of this account, source 
 - Each request reserves the remaining dollar balance before dispatch. The route cap is sent on every attempt. Every successful HTTP response, including an empty or invalid response, counts toward 25; all reported charges, including failed attempts, count toward USD 0.25. Unknown charge/outcome pauses later acquisition.
 - Approval inputs must provide the exact query, date window, route/provider, source policy, and request limits; the collector supplies no retrieval seeds. Every execution gate and an independent review matching the collector SHA-256 are required before credential loading.
 - Every recording also retains the approval ID/provider and resolved limits. Gate evidence is required for approved query/window, account eligibility, source rights, route schema, billing, route cost cap, provider limits, retention/removal, and internal source policy.
-- Responses are sanitized before private persistence. Recordings preserve request/window/cursor, limits, hashes, response validation, actual Treg charge/call ID, served-via metadata, and coverage. Expired or invalid-retention recordings are removed before replay/use; retention is seven days.
+- Responses are bounded to 1 MiB and a total live request/response deadline, then sanitized before private persistence. Recordings preserve bounded response evidence, approval/policy evidence, collector hash, request/window/cursor, limits, validation/exclusion reasons, actual Treg charge/call ID, served-via metadata, and coverage.
+- The `retention_and_removal` gate must specify `retention_seconds` from 1 through 604800 and `derived_removal_verified: true`. The collector enforces the lesser of this approved source/provider duration and seven days, cleaning expired, malformed, and interrupted pending recordings before collection (including unresolved-attempt returns) and refusing replay after expiry.
+- Cleanup is invocation-driven; no collector run means expiry-time deletion is not guaranteed. Before activation, an authorized operator must arrange periodic deletion for this recordings directory and remove retained copies/derived exports under the same or stricter deadline. The collector does not schedule cleanup or manage copies outside its directory.
 - Cursor continuation is bounded by the approved page/item/attempt limits, ticket-wide request/spend ceilings, cycle detection, and transient retry limits. A missing cursor is not treated as exhaustion; an explicit null cursor still does not prove complete search coverage. X search/reply samples do not establish complete conversations.
 - `createdUtc` is checked against the UTC half-open interval `[since 00:00, until 00:00)`. Out-of-window items are excluded and counted in validation. Provider search completeness, date-boundary semantics, and freshness remain unverified.
 
 ## Offline verification
 
-Run the standard-library synthetic transport suite (no provider, credentials, or external network calls):
+Run the standard-library synthetic suite with network denial inherited by CLI subprocesses (no provider calls, credential reads, or live-state access):
 
 ```sh
-python3 -m unittest discover -s tests -p 'test_collect_x.py' -v
+PYTHONPATH=tests python3 -m unittest discover -s tests -p 'test_collect_x.py' -v
 ```
 
-Expected observed result for this implementation: all 21 tests pass. They exercise the bounded transport path, paging/window validation, response-size and source-change stops, retries/authentication, cumulative budgets, reservation, redaction, retention, concurrency, fail-closed gates, and CLI offline replay. Fixture post IDs/text/timestamps and all provider responses are synthetic; this is not live verification.
+The test audit hook denies socket/DNS/bind/connect events and blocks credential/live-state paths, including subprocesses. Fixture post IDs/text/timestamps and all provider responses are synthetic; passing tests are not live verification.
 
 Replay one private recording without network access:
 
@@ -48,11 +50,15 @@ python3 scripts/collect_x.py status --state-dir /private/path/to/test-state
 
 ## Live command for supervisor review only
 
-Do not run until every approval gate is verified and an independent budget/secret review is approved for the exact current collector hash. The owner approved seven-day local recording retention, subject to stricter provider/source terms. No approved query/window, account eligibility verification, source-rights evidence, provider-retention check, overflow/source-policy verification, or independent review artifact is present from this offline implementation run.
+Do not run until every live prerequisite is independently evidenced and an independent budget/secret review is approved for the exact current collector hash. The owner-approved maximum is seven-day private retention, subject to stricter provider/source terms. This correction did not inspect credentials, live counters, or provider/account settings and made no live request; acquisition remains **UNVERIFIED**.
 
-The private approval JSON must contain `approval_id`, fixed `provider` (`treg-managed-anyapi`) and `route` (`anyapi.x.search.posts`), exact `query` without inline `since:`/`until:` dates, `query_type`, `window` (`since`/`until` ISO dates), `internal_source_policy`, validated `limits`, and all these gates: `approved_query_window`, `provider_account_eligibility`, `source_access_rights`, `route_schema`, `route_billing`, `route_cost_cap`, `provider_limits`, `retention_and_removal`, `internal_source_policy`. Each gate has shape `{"verified": true, "evidence": "private evidence reference"}`. Synthetic fixture evidence is never suitable for a live approval.
+The private approval JSON must contain `approval_id`, fixed `provider` (`treg-managed-anyapi`) and `route` (`anyapi.x.search.posts`), exact `query` without inline `since:`/`until:` dates, `query_type`, `window` (`since`/`until` ISO dates), `internal_source_policy`, validated `limits`, and all these gates: `approved_query_window`, `provider_account_eligibility`, `source_access_rights`, `route_schema`, `route_billing`, `route_cost_cap`, `provider_limits`, `retention_and_removal`, `internal_source_policy`. Each gate has shape `{"verified": true, "evidence": "private evidence reference"}`; `retention_and_removal` also requires `retention_seconds` and `derived_removal_verified: true`. These private assertions are not independent proof. Synthetic fixture evidence is never suitable for live approval.
 
-The request-limit values are approval inputs, not hidden defaults: `page_size` 1–50, `max_pages` 1–25, `max_items` 1 through `page_size * max_pages`, `max_attempts_per_page` 1–3, `max_total_attempts` 1 through `max_pages * max_attempts_per_page`, `timeout_seconds` greater than 0 through 300, and `retry_delay_seconds` 0–30. Ticket-wide success/spend ceilings remain hard-coded at 25 successful responses and USD 0.25 regardless of these per-run bounds.
+Before dispatch, separately verify the exact approved query/window and retrieval inputs, account eligibility and managed-credential mode, route schema and source/retention rights, success/failure/retry billing, enforceable per-request cost ceiling, overflow/substitution policy, canonical cumulative counters/reservations, unknown outcomes, and competing collectors. Following independent code review, observed live IDs/text/timestamps, relevance, pagination/window behavior, charge reconciliation, sanitized provenance, and network-denied replay remain required. Catalog eligibility, approval flags, code review, and synthetic runs do not establish these facts.
+
+The Need Radar issue #3 `docs/reddit-acquisition.md` record dated October 7, 2026 documents a separate accidental request with unknown billing and a deleted temporary unknown-outcome state. No independent evidence establishes its charge or credential exposure. That issue #3 safety hold remains unresolved for **issue #3** live dispatch. This issue #9 correction does not edit or clear the #3 hold and does not establish any X live facts.
+
+The request-limit values are approval inputs, not hidden defaults: `page_size` 1–50, `max_pages` 1–25, `max_items` 1 through `page_size * max_pages`, `max_attempts_per_page` 1–3, `max_total_attempts` 1 through `max_pages * max_attempts_per_page`, `timeout_seconds` greater than 0 through 300, and `retry_delay_seconds` 0–30. The live timeout is a total wall-clock deadline across request/response; collection fails closed if it cannot safely enforce that bound. Ticket-wide success/spend ceilings remain hard-coded at 25 successful responses and USD 0.25 regardless of these per-run bounds.
 
 The private review JSON must match the current `scripts/collect_x.py` SHA-256 and contain `ticket: 9`, `result: "approved"`, and checks `budget_reservations` and `secret_handling`. A reviewer can calculate the code hash with `sha256sum scripts/collect_x.py`.
 

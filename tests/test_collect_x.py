@@ -1,23 +1,28 @@
 import json
+import io
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.error import HTTPError
-from urllib.request import Request, build_opener
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "tests"))
+import network_guard
+
+network_guard.install()
+
 import collect_x
 
 
-def approved_inputs(**limit_overrides):
+def approved_inputs(retention_seconds=collect_x.RETENTION_SECONDS, **limit_overrides):
     limits = {
         "page_size": 2,
         "max_pages": 3,
@@ -38,7 +43,11 @@ def approved_inputs(**limit_overrides):
         "limits": limits,
         "internal_source_policy": "explicitly-allow-synthetic-source",
         "gates": {
-            gate: {"verified": True, "evidence": "synthetic test fixture"}
+            gate: {
+                "verified": True,
+                "evidence": "synthetic test fixture",
+                **({"retention_seconds": retention_seconds, "derived_removal_verified": True} if gate == "retention_and_removal" else {}),
+            }
             for gate in collect_x.REQUIRED_GATES
         },
     }
@@ -48,6 +57,23 @@ def response_body(name):
     return json.loads((ROOT / "fixtures" / "x" / name).read_text())
 
 
+class MemoryResponse:
+    def __init__(self, status, headers, body):
+        self.status = status
+        self.headers = headers
+        self.body = body if isinstance(body, bytes) else json.dumps(body).encode()
+        self.closed = False
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            size = len(self.body)
+        body, self.body = self.body[:size], self.body[size:]
+        return body
+
+    def close(self):
+        self.closed = True
+
+
 class LocalProvider:
     def __init__(self, steps, before_reply=None, delay=0):
         self.steps = list(steps)
@@ -55,72 +81,131 @@ class LocalProvider:
         self.before_reply = before_reply
         self.delay = delay
         self.requests = []
+        self.responses = []
         self.active = 0
         self.max_active = 0
         self.lock = threading.Lock()
 
-        provider = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_POST(self):
-                request_body = self.rfile.read(int(self.headers["Content-Length"]))
-                with provider.lock:
-                    provider.active += 1
-                    provider.max_active = max(provider.max_active, provider.active)
-                    index = len(provider.requests)
-                    request = {
-                        "body": json.loads(request_body),
-                        "headers": dict(self.headers.items()),
-                    }
-                    provider.requests.append(request)
-                    step = provider.steps.pop(0) if provider.steps else provider.last_step
-                    provider.last_step = step
-                if provider.before_reply:
-                    provider.before_reply(request)
-                if provider.delay:
-                    time.sleep(provider.delay)
-                if callable(step):
-                    step = step(request, index)
-                status = step.get("status", 200)
-                payload = step.get("body", {})
-                response = json.dumps(payload).encode()
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(response)))
-                for key, value in step.get("headers", {}).items():
-                    self.send_header(key, str(value))
-                self.end_headers()
-                self.wfile.write(response)
-                with provider.lock:
-                    provider.active -= 1
-
-            def log_message(self, *_args):
-                pass
-
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-        self.url = f"http://127.0.0.1:{self.server.server_port}/call/anyapi.x.search.posts"
-
-    def __call__(self, _url, data, headers, timeout):
-        request = Request(self.url, data=data, headers=headers, method="POST")
+    def __call__(self, _url, data, headers, _timeout):
+        with self.lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            index = len(self.requests)
+            request = {"body": json.loads(data), "headers": dict(headers)}
+            self.requests.append(request)
+            step = self.steps.pop(0) if self.steps else self.last_step
+            self.last_step = step
         try:
-            return build_opener().open(request, timeout=timeout)
-        except HTTPError as error:
-            return error
+            if self.before_reply:
+                self.before_reply(request)
+            if self.delay:
+                time.sleep(self.delay)
+            if callable(step):
+                step = step(request, index)
+            response = MemoryResponse(step.get("status", 200), step.get("headers", {}), step.get("body", {}))
+            self.responses.append(response)
+            return response
+        finally:
+            with self.lock:
+                self.active -= 1
 
     def close(self):
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join()
+        pass
+
+
+def cli_environment():
+    return {"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(ROOT / "tests")}
+
+
+class NetworkGuardTests(unittest.TestCase):
+    def test_network_credentials_and_live_state_are_denied(self):
+        with self.assertRaisesRegex(PermissionError, "network access"):
+            socket.socket()
+        with self.assertRaisesRegex(PermissionError, "credential access"):
+            sys.audit("open", network_guard.CREDENTIALS_PATH, "r", 0)
+        with self.assertRaisesRegex(PermissionError, "live state access"):
+            sys.audit("open", str(Path(network_guard.LIVE_STATE_PATH) / "state.json"), "r", 0)
+
+    def test_cli_children_inherit_network_denial(self):
+        result = subprocess.run(
+            [sys.executable, "-c", "import socket; socket.socket()"],
+            capture_output=True,
+            text=True,
+            env=cli_environment(),
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("network access is disabled", result.stderr)
 
 
 class LiveGateTests(unittest.TestCase):
+    def test_live_review_is_enforced_inside_reusable_collector(self):
+        with mock.patch.object(collect_x, "_load_credentials", side_effect=AssertionError("must not load credentials")) as loader:
+            with self.assertRaisesRegex(collect_x.CollectorError, "review"):
+                collect_x.collect(approved_inputs())
+        loader.assert_not_called()
+
+    def test_cli_maps_failed_collector_summary_to_nonzero(self):
+        inputs = approved_inputs()
+        with tempfile.TemporaryDirectory() as temporary:
+            approval_path = Path(temporary) / "approval.json"
+            review_path = Path(temporary) / "review.json"
+            approval_path.write_text(json.dumps(inputs))
+            review = {
+                "ticket": 9,
+                "collector_sha256": collect_x._script_sha256(),
+                "result": "approved",
+                "checks": ["budget_reservations", "secret_handling"],
+            }
+            review_path.write_text(json.dumps(review))
+            summary = {"outcome": "failed", "stop_reason": "authentication_failure"}
+            with mock.patch.object(collect_x, "collect", return_value=summary) as collect:
+                with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                    status = collect_x.main([
+                        "collect", "--ticket", "9", "--approval-file", str(approval_path),
+                        "--review-file", str(review_path),
+                    ])
+            self.assertEqual(status, 1)
+            self.assertEqual(json.loads(output.getvalue()), summary)
+            collect.assert_called_once_with(inputs, review=review)
+
+    def test_status_reports_unreconciled_attempt_and_returns_nonzero(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "state"
+            state = collect_x._new_state()
+            state["attempt_count"] = 1
+            state["attempts"].append({"status": "unknown", "cost_micro_usd": 0})
+            collect_x._save_state(state_dir, state)
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                status = collect_x.main(["status", "--state-dir", str(state_dir)])
+            self.assertEqual(status, 1)
+            self.assertEqual(json.loads(output.getvalue())["status"], "paused")
+
+    def test_live_review_does_not_allow_custom_budget_paths(self):
+        review = {
+            "ticket": 9,
+            "collector_sha256": collect_x._script_sha256(),
+            "result": "approved",
+            "checks": ["budget_reservations", "secret_handling"],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(collect_x, "_http_request") as request:
+                with self.assertRaisesRegex(collect_x.CollectorError, "canonical"):
+                    collect_x.collect(
+                        approved_inputs(),
+                        state_dir=Path(temporary) / "state",
+                        recording_dir=Path(temporary) / "recordings",
+                        token="synthetic-secret",
+                        review=review,
+                    )
+                request.assert_not_called()
+
+
     def test_live_collection_without_recorded_approval_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
             state_dir = Path(temporary) / "state"
             recording_dir = Path(temporary) / "recordings"
-            environment = {"PATH": os.environ.get("PATH", "")}
+            environment = cli_environment()
             result = subprocess.run(
                 [
                     sys.executable,
@@ -148,7 +233,7 @@ class CollectionTests(unittest.TestCase):
             recording_dir,
             token=token,
             org="synthetic-team",
-            transport=provider,
+            offline_transport=collect_x.OfflineTransport(provider),
             **kwargs,
         ), state_dir, recording_dir
 
@@ -383,18 +468,28 @@ class CollectionTests(unittest.TestCase):
     def test_reservation_is_persisted_before_dispatch_and_headers_are_allowlisted(self):
         with tempfile.TemporaryDirectory() as temporary:
             state_dir = Path(temporary) / "state"
+            synced_directories = []
+            original_fsync = os.fsync
+
+            def track_fsync(descriptor):
+                descriptor_path = f"/proc/self/fd/{descriptor}"
+                if os.path.isdir(descriptor_path):
+                    synced_directories.append(os.readlink(descriptor_path))
+                original_fsync(descriptor)
 
             def inspect_reservation(_request):
                 state = collect_x.load_state(state_dir)
                 self.assertEqual(state["attempts"][-1]["status"], "reserved")
                 self.assertEqual(state["attempts"][-1]["reserved_micro_usd"], 250000)
+                self.assertIn(str(state_dir), synced_directories)
 
             provider = LocalProvider(
                 [{"body": response_body("empty.json"), "headers": {"X-Treg-Cost-Micro": "750"}}],
                 before_reply=inspect_reservation,
             )
             try:
-                self.collect(provider, temporary)
+                with mock.patch.object(collect_x.os, "fsync", side_effect=track_fsync):
+                    self.collect(provider, temporary)
                 headers = provider.requests[0]["headers"]
                 self.assertEqual(headers["X-Treg-Token"], "synthetic-secret")
                 self.assertEqual(headers["X-Treg-Org"], "synthetic-team")
@@ -465,15 +560,25 @@ class CollectionTests(unittest.TestCase):
                 self.assertEqual(result["successful_requests"], 1)
                 self.assertEqual(recording["response"]["body"]["items"], [])
                 self.assertEqual(recording["validation"]["evidence_completeness"], "empty_success")
+                self.assertEqual(result["outcome"], "success")
+                self.assertTrue(provider.responses[0].closed)
         finally:
             provider.close()
 
     def test_secret_redaction_precedes_private_persistence(self):
         body = response_body("page-1.json")
+        body["TREG_TOKEN"] = "field-token-secret"
+        body["Authorization"] = "authorization-field-secret"
+        body["Set-Cookie"] = "cookie-field-secret"
         body["output"]["data"]["items"][0]["text"] = (
-            'Synthetic text synthetic-secret Bearer abc123 api_key=leakme "token": "quoted-leak"'
+            'Synthetic text synthetic-secret Bearer abc123 api_key=leakme "token": "quoted-leak" '
+            'https://url-user-secret:url-pass-secret@example.test/data?X-Amz-Signature=aws-leak&ok=signed-other-leak#fragment-secret '
+            'Cookie: sessionid=cookie-leak Authorization: Basic basic-leak'
         )
-        provider = LocalProvider([{"body": body, "headers": {"X-Treg-Cost-Micro": "750"}}])
+        provider = LocalProvider([{"body": body, "headers": {
+            "X-Treg-Cost-Micro": "750",
+            "X-Treg-Call-Id": "https://example.test/call?X-Amz-Signature=header-signature&x=header-query-secret",
+        }}])
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 _, _, recording_dir = self.collect(provider, temporary)
@@ -483,10 +588,174 @@ class CollectionTests(unittest.TestCase):
                 self.assertNotIn("abc123", persisted)
                 self.assertNotIn("leakme", persisted)
                 self.assertNotIn("quoted-leak", persisted)
+                for secret in (
+                    "url-user-secret", "url-pass-secret", "aws-leak", "signed-other-leak", "fragment-secret",
+                    "cookie-leak", "basic-leak", "field-token-secret", "authorization-field-secret",
+                    "cookie-field-secret", "header-signature", "header-query-secret",
+                ):
+                    self.assertNotIn(secret, persisted)
                 self.assertIn("[REDACTED]", persisted)
                 self.assertEqual(recording_path.stat().st_mode & 0o777, 0o600)
                 self.assertEqual(recording_dir.stat().st_mode & 0o777, 0o700)
                 self.assertNotIn("X-Treg-Token", json.loads(persisted))
+        finally:
+            provider.close()
+
+    def test_query_is_rejected_if_redaction_would_change_approved_text(self):
+        provider = LocalProvider([{"body": response_body("empty.json"), "headers": {"X-Treg-Cost-Micro": "750"}}])
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                inputs = approved_inputs()
+                inputs["query"] = "AI access_token=synthetic-secret workflow"
+                with self.assertRaisesRegex(collect_x.CollectorError, "query.*sanitiz"):
+                    self.collect(provider, temporary, inputs)
+                self.assertEqual(provider.requests, [])
+        finally:
+            provider.close()
+
+    def test_shorter_approved_retention_and_corrupt_artifacts_are_cleaned(self):
+        provider = LocalProvider([{"body": response_body("empty.json"), "headers": {"X-Treg-Cost-Micro": "750"}}])
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                result, _, recording_dir = self.collect(provider, temporary, approved_inputs(retention_seconds=2 * 86400))
+                recording_path = next(recording_dir.glob("*.json"))
+                recording = json.loads(recording_path.read_text())
+                self.assertEqual(recording["expires_at_epoch"] - recording["recorded_at_epoch"], 2 * 86400)
+                self.assertEqual(recording["collector_sha256"], collect_x._script_sha256())
+                self.assertEqual(recording["approval"]["gates"]["retention_and_removal"]["retention_seconds"], 2 * 86400)
+                self.assertEqual(result["outcome"], "success")
+
+                corrupt = recording_dir / "corrupt.json"
+                pending = recording_dir / ".pending-interrupted"
+                corrupt.write_text("{")
+                pending.write_text("partial")
+                target = recording_dir / "outside-target"
+                symlink = recording_dir / "linked.json"
+                target.write_text("must not be read")
+                symlink.symlink_to(target)
+                collect_x._clean_expired(recording_dir)
+                self.assertFalse(corrupt.exists())
+                self.assertFalse(pending.exists())
+                self.assertFalse(symlink.exists())
+                self.assertTrue(target.exists())
+        finally:
+            provider.close()
+
+    def test_cleanup_runs_before_unreconciled_attempt_return(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "state"
+            recording_dir = Path(temporary) / "recordings"
+            state = collect_x._new_state()
+            state["attempt_count"] = 1
+            state["attempts"].append({"status": "unknown", "cost_micro_usd": 0})
+            collect_x._save_state(state_dir, state)
+            recording_dir.mkdir(mode=0o700)
+            corrupt = recording_dir / "bad.json"
+            pending = recording_dir / ".pending-crash"
+            corrupt.write_text("bad json")
+            pending.write_text("partial")
+            result = collect_x.collect(
+                approved_inputs(), state_dir, recording_dir, token="synthetic-secret",
+                offline_transport=collect_x.OfflineTransport(LocalProvider([])),
+            )
+            self.assertEqual(result["stop_reason"], "unreconciled_attempt")
+            self.assertFalse(corrupt.exists())
+            self.assertFalse(pending.exists())
+
+    def test_response_read_has_size_deadline_and_close_bounds(self):
+        class SlowResponse(MemoryResponse):
+            def read(self, size=-1):
+                time.sleep(0.01)
+                return super().read(min(size, 1))
+
+        response = SlowResponse(200, {}, b"x" * (collect_x.MAX_RESPONSE_BYTES + 1))
+        started = time.monotonic()
+        with collect_x._request_deadline(0.04):
+            with self.assertRaises(collect_x.ResponseReadError):
+                collect_x._read_response(response)
+        self.assertLess(time.monotonic() - started, 0.3)
+        self.assertTrue(response.closed)
+
+    def test_live_http_adapter_enforces_deadline_without_network(self):
+        class SlowResponse:
+            status = 200
+            headers = {"X-Treg-Cost-Micro": "750"}
+            closed = False
+
+            def read(self, _size):
+                time.sleep(0.01)
+                return b"x"
+
+            def close(self):
+                self.closed = True
+
+        response = SlowResponse()
+        opener = mock.Mock()
+        opener.open.return_value = response
+        started = time.monotonic()
+        with mock.patch.object(collect_x.urllib.request, "build_opener", return_value=opener):
+            result = collect_x._http_request("https://invalid.test", b"{}", {}, 0.04)
+        self.assertLess(time.monotonic() - started, 0.3)
+        self.assertEqual(result.failure, "response_deadline_exceeded")
+        self.assertTrue(response.closed)
+
+    def test_oversized_response_is_capped_recorded_and_accounted(self):
+        provider = LocalProvider([{
+            "body": b"x" * (collect_x.MAX_RESPONSE_BYTES + 1),
+            "headers": {"X-Treg-Cost-Micro": "750"},
+        }])
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                result, state_dir, recording_dir = self.collect(provider, temporary)
+                record = json.loads(next(recording_dir.glob("*.json")).read_text())
+                state = collect_x.load_state(state_dir)
+                self.assertEqual(result["stop_reason"], "response_read_failure")
+                self.assertEqual(result["outcome"], "failed")
+                self.assertEqual(record["response"]["body_bytes"], collect_x.MAX_RESPONSE_BYTES)
+                self.assertFalse(record["response"]["body_complete"])
+                self.assertEqual(state["successful_requests"], 1)
+                self.assertEqual(state["charged_micro_usd"], 750)
+                self.assertTrue(provider.responses[0].closed)
+        finally:
+            provider.close()
+
+    def test_json_null_failure_can_be_replayed(self):
+        provider = LocalProvider([{"body": None, "headers": {"X-Treg-Cost-Micro": "750"}}])
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                self.collect(provider, temporary)
+                recording = next((Path(temporary) / "recordings").glob("*.json"))
+                replay = collect_x.replay_recording(recording)
+                self.assertEqual(replay["response"]["body_format"], "json")
+                self.assertEqual(replay["replay_validation"]["errors"], ["response_not_object"])
+        finally:
+            provider.close()
+
+    def test_schema_failure_retains_sanitized_body_for_replay_validation(self):
+        body = {"error": "invalid provider schema", "url": "https://example.test/?X-Amz-Signature=hidden"}
+        provider = LocalProvider([{"body": body, "headers": {"X-Treg-Cost-Micro": "750"}}])
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                result, _, recording_dir = self.collect(provider, temporary)
+                recording_path = next(recording_dir.glob("*.json"))
+                record = json.loads(recording_path.read_text())
+                self.assertEqual(result["outcome"], "failed")
+                self.assertEqual(record["response"]["evidence_body"]["error"], "invalid provider schema")
+                self.assertNotIn("hidden", json.dumps(record))
+                replay = collect_x.replay_recording(recording_path)
+                self.assertEqual(replay["replay_validation"], record["validation"])
+        finally:
+            provider.close()
+
+    def test_excluded_item_is_preserved_with_reason(self):
+        provider = LocalProvider([{"body": response_body("page-1.json"), "headers": {"X-Treg-Cost-Micro": "750"}}])
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                self.collect(provider, temporary)
+                record = json.loads(next((Path(temporary) / "recordings").glob("*.json")).read_text())
+                excluded = record["validation"]["excluded_items"]
+                self.assertEqual(excluded[0]["reason"], "out_of_window")
+                self.assertEqual(excluded[0]["item"]["id"], "990000000000000002")
         finally:
             provider.close()
 
@@ -533,9 +802,10 @@ class CollectionTests(unittest.TestCase):
                 self.assertEqual(replayed["response"]["body"]["items"], [])
                 command = subprocess.run(
                     [sys.executable, str(ROOT / "scripts" / "collect_x.py"), "replay", "--recording", str(recording)],
-                    capture_output=True,
-                    text=True,
-                    check=False,
+                capture_output=True,
+                text=True,
+                env=cli_environment(),
+                check=False,
                 )
                 self.assertEqual(command.returncode, 0, command.stderr)
                 self.assertEqual(json.loads(command.stdout)["network_requests"], 0)
@@ -570,7 +840,7 @@ class CollectionTests(unittest.TestCase):
                 ],
                 capture_output=True,
                 text=True,
-                env={"PATH": os.environ.get("PATH", "")},
+                env=cli_environment(),
                 check=False,
             )
             self.assertEqual(result.returncode, 2)
