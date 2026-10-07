@@ -2,7 +2,7 @@
 
 独立项目：持续发现 AI 开发/学习中具体、有价值、可解决、有合理规模切入口的 friction。
 
-**当前状态：设计讨论已完成，尚未实现或启用系统。当前没有需要用户补答的设计问题。**
+**当前状态：设计讨论已完成；ticket #1 的离线 serve tracer 已实现。未连接实时来源、模型、定时任务或 Discord。**
 
 项目路径：`/home/ubuntu/projects/need-radar`
 
@@ -52,8 +52,30 @@ Judge 对两版使用相同目标：是否发现了真实、有价值、sizeable
 
 仅改变 extraction；source/retrieval 的不同策略保留为后续单变量实验。没有个人喜好或个性化反馈模块。
 
+## Ticket #1：离线 serve tracer
+
+使用 Python 3 标准库运行合成 fixture；不安装依赖、不访问来源或调用模型：
+
+```sh
+demo_dir="$(mktemp -d)"
+python3 -m need_radar --output "$demo_dir"
+```
+
+CLI 输出 `status=success`，并在目录中保存有序 `snapshot.json`、解析后的 v0 `prompt.json`、明确标记为合成边界的 `model-response.json`、已校验的 `candidates.json`、规范 `report.md` 和 SQLite `lineage.sqlite3`。所有阶段保留输入/输出哈希和前序阶段链接。合成 fixture 不是实时来源或模型验证。
+
+`report.md` 是规范报告，并明确标注合成/离线状态与验证边界：引用校验只确认摘录是保留文本的精确子串，不判断语义支持。Fixture 在任何产物写入前先做秘密值脱敏；不合规输入会退出失败，只写 `validation.json` 和对应 lineage，不会生成成功 snapshot。
+
+脱敏覆盖敏感字段名、常见 token 形式以及 `Authorization`、`Cookie` 等凭证文本，是尽力而为而非通用秘密检测；未知格式仍可能漏过，因此不要提供真实凭证。无法解析的 JSON 也会保存不含原始输入的 `invalid_input` 记录及 lineage。
+
+已运行的离线检查命令：
+
+```sh
+python3 -m unittest discover -s tests -v
+python3 -m compileall -q need_radar tests
+```
+
 ## 接续约束
 
 Hermes session：`20261006_114451_8a8410`，全程保留，详见 [session record](docs/grill/session.md)。
 
-后续 agent 先读 [AGENTS.md](AGENTS.md)。本次只完成设计/讨论文档：没有应用代码、Git 初始化、依赖安装、付费数据接入、cron 或 Discord 发布。实施与上线需要另外授权。
+后续 agent 先读 [AGENTS.md](AGENTS.md)。ticket #1 仅实现离线 tracer；未做 Git 初始化、依赖安装、付费数据接入、cron 或 Discord 发布。任何实时接入与上线均需另行授权。
