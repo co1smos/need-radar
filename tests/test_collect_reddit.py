@@ -341,6 +341,46 @@ if os.environ.get("NEED_RADAR_OFFLINE_TESTS") == "1":
         self.assertEqual(len(redacted_keys), 2)
         self.assertEqual(len(set(sanitized)), len(sanitized))
 
+    def test_malformed_quoted_redaction_is_bounded_in_subprocess(self):
+        scratch = pathlib.Path(os.environ.get("TMPDIR", tempfile.gettempdir()))
+        payload = 'password="' + "\\" * 30 + "unterminated fixture-regression-secret"
+        probe = f"""import os, pathlib, sys
+sys.path.insert(0, {str(ROOT / 'scripts')!r})
+blocked_network = {SOCKET_AUDIT_EVENTS!r}
+protected = {tuple(map(str, PROTECTED_PATHS))!r}
+filesystem = {BLOCKED_FILESYSTEM_EVENTS!r}
+def audit(event, args):
+    if event in blocked_network:
+        raise AssertionError("offline network access denied")
+    if event in filesystem:
+        for value in args[:2]:
+            if isinstance(value, (str, bytes, os.PathLike)):
+                path = pathlib.Path(os.path.abspath(os.fsdecode(value)))
+                if any(path == pathlib.Path(item) or pathlib.Path(item) in path.parents for item in protected):
+                    raise AssertionError("offline live path access denied")
+sys.addaudithook(audit)
+from collect_reddit import safe_string
+print(safe_string({payload!r}))
+"""
+
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=ROOT,
+            env={
+                "HOME": str(scratch),
+                "PATH": os.environ.get("PATH", ""),
+                "TMPDIR": str(scratch),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+            timeout=2,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("fixture-regression-secret", result.stdout)
+
     def test_mixed_encoded_text_and_authorization_are_redacted_before_persistence(self):
         page = fixture_body("feed-page-1.json")
         post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
@@ -489,6 +529,63 @@ if os.environ.get("NEED_RADAR_OFFLINE_TESTS") == "1":
         ])
         self.assertEqual(replay_code, 0, replay_stderr)
         self.assertNotIn("fixture-", replay_stdout)
+
+    def test_redacts_credentials_across_url_boundaries_and_escaped_labels(self):
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["text"] = "\n".join((
+            r'source says {"\u0070\u0061\u0073\u0073\u0077\u006f\u0072\u0064": "fixture-unicode-label-secret"}',
+            'password="before \\"fixture-escaped-quote-secret\\" after"',
+            'Authorization: Bearer "fixture-authorization-secret"',
+            'Cookie: session=fixture-cookie-before-url; redirect=https://ordinary.example/path; refresh=fixture-cookie-after-url',
+            'See https://example.org/?X-Amz-Credential="fixture-query-url-secret"',
+            'See https://fixture-user:"fixture-userinfo-secret"@example.org/path',
+            'password="first line\nfixture-multiline-suffix-secret"',
+        ))
+        transport = FixtureTransport([response(200, page)])
+
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        persisted = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        for _ in range(collect_reddit.MAX_URL_DECODE_ROUNDS + 2):
+            persisted = unquote(persisted)
+        leaked = [secret for secret in (
+            "fixture-unicode-label-secret",
+            "fixture-escaped-quote-secret",
+            "fixture-multiline-suffix-secret",
+            "fixture-authorization-secret",
+            "fixture-cookie-before-url",
+            "fixture-cookie-after-url",
+            "fixture-query-url-secret",
+            "fixture-userinfo-secret",
+        ) if secret in persisted]
+        self.assertEqual(leaked, [])
+
+    def test_multiline_authorization_and_cookie_values_are_redacted_before_persistence(self):
+        texts = (
+            'Authorization: "fixture-auth-first-line\nfixture-auth-multiline-secret"',
+            'Cookie: "session=fixture-cookie-first-line\nfixture-cookie-multiline-secret"',
+        )
+        for text in texts:
+            page = fixture_body("feed-page-1.json")
+            page["data"]["subredditV3"]["elements"]["edges"][0]["node"]["text"] = text
+            code, _, stderr = self.run_cli(
+                self.args("--max-feed-pages", "1", "--max-posts", "0"),
+                FixtureTransport([response(200, page)]),
+                FakeCredentials(),
+            )
+            self.assertEqual(code, 0, stderr)
+
+        persisted = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        self.assertNotIn("fixture-auth-first-line", persisted)
+        self.assertNotIn("fixture-auth-multiline-secret", persisted)
+        self.assertNotIn("fixture-cookie-first-line", persisted)
+        self.assertNotIn("fixture-cookie-multiline-secret", persisted)
 
     def test_malformed_url_is_redacted_in_persisted_record(self):
         for value in (

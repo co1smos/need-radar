@@ -96,24 +96,21 @@ SENSITIVE_QUERY_KEYS = {
     "x-goog-signature",
     "x-treg-token",
 }
-SENSITIVE_ASSIGNMENT = re.compile(
-    r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]+|"
-    r"\b((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|key|secret|auth|client[_-]?secret|password|passwd|cookie|credential|signature|sig)\b\s*[:=]\s*)[^\s,;&]+"
+SENSITIVE_ASSIGNMENT_PREFIX = re.compile(
+    r'''(?ix)
+    (?P<bearer>\bbearer\s+)
+    |
+    (?<![a-z0-9_])(?P<label>
+        proxy-authorization|authorization|cookie|
+        api[_-]?key|access[_-]?token|refresh[_-]?token|token|key|secret|
+        auth|client[_-]?secret|password|passwd|credential|signature|sig|
+        x-amz-(?:credential|security-token|signature)|
+        x-goog-(?:credential|signature)|x-treg-token
+    )
+    ["']?\s*[:=]\s*
+    '''
 )
-AUTHORIZATION_ASSIGNMENT = re.compile(
-    r'''(?im)(\b(?:proxy-)?authorization["']?\s*[:=]\s*)[^\r\n]*'''
-)
-COOKIE_ASSIGNMENT = re.compile(r'''(?im)(\bcookie["']?\s*[:=]\s*)[^\r\n]*''')
-QUOTED_SENSITIVE_ASSIGNMENT = re.compile(
-    r'''(?P<prefix>["']?\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|key|secret|auth|client[_-]?secret|password|passwd|cookie|credential|signature|sig)\b["']?\s*[:=]\s*)
-    (?:
-        (?P<quote>["'])(?:\\.|(?! (?P=quote))[\s\S])*?(?P=quote)
-        |
-        (?P<unclosed_quote>["'])(?:\\.|(?! (?P=unclosed_quote))[\s\S])*\Z
-    )''',
-    re.IGNORECASE | re.DOTALL | re.VERBOSE,
-)
-EMBEDDED_URL = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+EMBEDDED_URL = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 
 
 class CollectorError(Exception):
@@ -284,17 +281,47 @@ def atomic_json(path, value):
 
 
 def redact_assignments(value):
-    value = AUTHORIZATION_ASSIGNMENT.sub(lambda match: match.group(1) + "[REDACTED]", value)
-    value = COOKIE_ASSIGNMENT.sub(lambda match: match.group(1) + "[REDACTED]", value)
-
-    def redact_quoted(match):
-        quote = match.group("quote") or match.group("unclosed_quote")
-        return match.group("prefix") + quote + "[REDACTED]" + (quote if match.group("quote") else "")
-
-    value = QUOTED_SENSITIVE_ASSIGNMENT.sub(redact_quoted, value)
-    return SENSITIVE_ASSIGNMENT.sub(
-        lambda match: (match.group(1) or match.group(2)) + "[REDACTED]", value
+    value = re.sub(
+        r"\\u([0-9a-f]{4})",
+        lambda match: chr(int(match.group(1), 16)) if int(match.group(1), 16) < 128 else match.group(0),
+        value,
+        flags=re.IGNORECASE,
     )
+    parts = []
+    offset = 0
+    while match := SENSITIVE_ASSIGNMENT_PREFIX.search(value, offset):
+        parts.append(value[offset:match.end()])
+        label = (match.group("label") or "").lower()
+        start = match.end()
+        if start < len(value) and value[start] in "\"'":
+            quote = value[start]
+            line_end = value.find("\n", start + 1)
+            limit = len(value) if line_end < 0 else line_end
+            end = start + 1
+            while end < limit:
+                if value[end] == "\\":
+                    end += 2
+                elif value[end] == quote:
+                    end += 1
+                    break
+                else:
+                    end += 1
+            else:
+                end = len(value)
+            if label in {"authorization", "proxy-authorization", "cookie"} and end < len(value):
+                line_end = value.find("\n", end)
+                end = len(value) if line_end < 0 else line_end
+        elif label in {"authorization", "proxy-authorization", "cookie"}:
+            line_end = value.find("\n", start)
+            end = len(value) if line_end < 0 else line_end
+        else:
+            end = start
+            while end < len(value) and value[end] not in "\r\n ,;&<>":
+                end += 1
+        parts.append("[REDACTED]")
+        offset = end
+    parts.append(value[offset:])
+    return "".join(parts)
 
 
 def safe_string(value, secrets=(), _depth=0):
