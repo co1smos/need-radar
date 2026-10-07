@@ -111,6 +111,7 @@ SENSITIVE_ASSIGNMENT_PREFIX = re.compile(
     (?:\\?["'])?\s*(?:\\?[:=])\s*
     '''
 )
+PRIVATE_KEY_BEGIN = re.compile(r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----", re.IGNORECASE)
 EMBEDDED_URL = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 URL_SCHEME = re.compile(r"https?://", re.IGNORECASE)
 
@@ -292,21 +293,25 @@ def redact_assignments(value):
         return "[REDACTED]"
     parts = []
     offset = 0
+    search_offset = 0
+    while begin := PRIVATE_KEY_BEGIN.search(value, search_offset):
+        end_marker = re.compile(
+            r"-----END " + re.escape(begin.group(1)) + r"-----", re.IGNORECASE
+        ).search(value, begin.end())
+        parts.extend((value[offset:begin.start()], "[REDACTED]"))
+        offset = len(value) if end_marker is None else end_marker.end()
+        search_offset = offset
+        if end_marker is None:
+            break
+    if parts:
+        parts.append(value[offset:])
+        value = "".join(parts)
+    parts = []
+    offset = 0
     while match := SENSITIVE_ASSIGNMENT_PREFIX.search(value, offset):
         parts.append(value[offset:match.end()])
         label = (match.group("label") or "").lower()
         start = match.end()
-        private_key = re.sub(r"[_\-\s]", "", label) == "privatekey"
-        begin = re.compile(
-            r"\s*-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----",
-            re.IGNORECASE,
-        ).match(value, start)
-        if private_key and begin:
-            end_marker = "-----END " + begin.group(1) + "-----"
-            marker_end = value.find(end_marker, begin.end())
-            offset = len(value) if marker_end < 0 else marker_end + len(end_marker)
-            parts.append("[REDACTED]")
-            continue
         unterminated_quote = False
         quoted_value = False
         quote_start = start + 1 if value.startswith((r'\"', r"\'"), start) else start
@@ -484,13 +489,17 @@ def decode_escaped_ascii(value):
         return None
     for _ in range(MAX_URL_DECODE_ROUNDS):
         decoded = re.sub(
-            r"\\u([0-9a-f]{4})",
-            lambda match: chr(int(match.group(1), 16)) if int(match.group(1), 16) < 128 else match.group(0),
+            r"\\u([0-9a-f]{4})|\\/",
+            lambda match: (
+                chr(int(match.group(1), 16))
+                if match.group(1) and int(match.group(1), 16) < 128
+                else "/" if match.group(0) == r"\/" else match.group(0)
+            ),
             value,
             flags=re.IGNORECASE,
         )
         if decoded == value:
-            return None if re.search(r"\\u[0-9a-f]{4}", value, re.IGNORECASE) else value
+            return None if re.search(r"\\u[0-9a-f]{4}|\\/", value, re.IGNORECASE) else value
         value = decoded
     return None
 
@@ -520,7 +529,7 @@ def safe_url(value, secrets=(), _depth=0):
         if parsed.port:
             host += ":" + str(parsed.port)
         if parsed.username is not None or parsed.password is not None:
-            host = "[REDACTED]@" + host
+            host = "%5BREDACTED%5D@" + host
     except ValueError:
         return "[REDACTED_URL]"
     query = []
@@ -2090,6 +2099,7 @@ def run_replay(args, clock):
         records = []
         replay_errors = []
         invalid_recordings = 0
+        replay_sanitized_recordings = 0
         for path in sorted(recordings_dir.glob("record-*.json")):
             if path.is_symlink() or not private_file(path):
                 raise CollectorError("private_recording_permissions_required", "blocked")
@@ -2098,6 +2108,21 @@ def run_replay(args, clock):
             if record_expiry(record) is None:
                 raise CollectorError("recording_retention_metadata_invalid", "blocked")
             source_records.append(record)
+            try:
+                sanitized_record = sanitize(record)
+            except (RecursionError, UnicodeError, ValueError):
+                invalid_recordings += 1
+                replay_errors.append("recording_sanitization_failed")
+                continue
+            if sanitized_record != record:
+                record = {**sanitized_record, "replay_sanitization_applied": True}
+                request = record.get("request")
+                if isinstance(request, dict) and isinstance(request.get("parameters"), dict):
+                    record["request_parameters_sha256"] = hashlib.sha256(
+                        json.dumps(request["parameters"], sort_keys=True).encode("utf-8")
+                    ).hexdigest()
+                atomic_json(path, record)
+                replay_sanitized_recordings += 1
             if not valid_recording_envelope(record, path.name):
                 invalid_recordings += 1
                 replay_errors.append("recording_envelope_invalid")
@@ -2116,6 +2141,7 @@ def run_replay(args, clock):
             "request_failures": 0,
             "billing_unknown_requests": 0,
             "invalid_recordings": invalid_recordings,
+            "replay_sanitized_recordings": replay_sanitized_recordings,
         }
         replay_counts["validation_failures"] += invalid_recordings
         feed_records = 0

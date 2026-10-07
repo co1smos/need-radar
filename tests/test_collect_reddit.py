@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -521,10 +522,12 @@ print(safe_string({payload!r}))
         self.assertNotIn("fixture-query-secret", persisted)
 
     def test_residual_non_ascii_unicode_escapes_are_redacted_before_persistence(self):
-        persisted = self.collect_text_recording(r"unicode note=\u79d8\u5bc6")
+        self.collect_text_recording(r"unicode note=\u79d8\u5bc6")
+        record = json.loads(next(self.recordings_dir.glob("record-*.json")).read_text())
+        text = record["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]["text"]
 
-        self.assertNotIn("79d8", persisted)
-        self.assertNotIn("秘密", persisted)
+        self.assertNotIn("79d8", text)
+        self.assertNotIn("秘密", text)
 
     def test_excessively_encoded_dictionary_key_fails_closed_with_lineage(self):
         page = fixture_body("feed-page-1.json")
@@ -621,6 +624,88 @@ print(safe_string({payload!r}))
         ):
             self.assertNotIn(secret, persisted)
         self.assertIn("safe-tail", persisted)
+
+    def test_redacts_standalone_and_unterminated_private_key_blocks_before_persistence(self):
+        persisted = self.collect_text_recording(
+            "before\n-----BEGIN PRIVATE KEY-----\n"
+            "fixture-standalone-private-key-secret\n-----END PRIVATE KEY-----\n"
+            "between\n-----BEGIN RSA PRIVATE KEY-----\n"
+            "fixture-unterminated-private-key-secret"
+        )
+
+        self.assertNotIn("fixture-standalone-private-key-secret", persisted)
+        self.assertNotIn("fixture-unterminated-private-key-secret", persisted)
+        self.assertIn("between", persisted)
+
+    def test_redacts_escaped_slashes_before_url_and_secret_scanning(self):
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["text"] = (
+            r'prose {"api":"fixture\/runtime-token"} URL '
+            r'https:\/\/fixture-user:fixture-password@example.org\/fixture\/runtime-token'
+            r'?X-Amz-Credential=fixture-escaped-url-secret'
+        )
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            FixtureTransport([response(200, page)]),
+            FakeCredentials("fixture/runtime-token"),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        persisted = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        for _ in range(collect_reddit.MAX_URL_DECODE_ROUNDS + 4):
+            persisted = unquote(persisted).replace(r"\/", "/")
+        for secret in (
+            "fixture/runtime-token",
+            "fixture-user",
+            "fixture-password",
+            "fixture-escaped-url-secret",
+        ):
+            self.assertNotIn(secret, persisted)
+
+    def test_replay_redacts_legacy_recordings_before_reuse(self):
+        self.collect_text_recording("safe synthetic text")
+        source = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(source.read_text())
+        post = record["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        record["request"]["parameters"]["password"] = "fixture-replay-request-secret"
+        post["text"] = (
+            "-----BEGIN PRIVATE KEY-----\nfixture-replay-private-key-secret\n"
+            "-----END PRIVATE KEY----- See "
+            "https://fixture-user:fixture-password@example.org/path"
+            "?X-Amz-Credential=fixture-replay-url-secret"
+        )
+        source.write_text(json.dumps(record))
+
+        code, stdout, stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["counts"]["replay_sanitized_recordings"], 1)
+        sanitized_record = json.loads(source.read_text())
+        persisted = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        parameters = sanitized_record["request"]["parameters"]
+        self.assertEqual(parameters["[REDACTED_KEY]"], "[REDACTED]")
+        self.assertEqual(
+            sanitized_record["request_parameters_sha256"],
+            hashlib.sha256(json.dumps(parameters, sort_keys=True).encode("utf-8")).hexdigest(),
+        )
+        replay_code, replay_stdout, replay_stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+        self.assertEqual(replay_code, 0, replay_stderr)
+        self.assertEqual(json.loads(replay_stdout)["counts"]["replay_sanitized_recordings"], 0)
+        for secret in (
+            "fixture-replay-private-key-secret",
+            "fixture-user",
+            "fixture-password",
+            "fixture-replay-url-secret",
+            "fixture-replay-request-secret",
+        ):
+            self.assertNotIn(secret, persisted)
 
     def test_redacts_folded_authorization_header_continuations(self):
         persisted = self.collect_text_recording(
