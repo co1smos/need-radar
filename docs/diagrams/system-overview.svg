@@ -12,13 +12,13 @@
 <rect x="40" y="105" width="1200" height="49" rx="10" fill="#eaf0ff" stroke="#c6d5f5" stroke-width="1.4"/>
 <text x="61" y="136" font-size="19" style="fill:#284c85" font-weight="600">Hermes scheduling (planned)  |  configurable collection  |  daily analysis + serve delivery</text>
 <rect x="40" y="185" width="210" height="104" rx="14" fill="#fff" stroke="#dbe3ed" stroke-width="1.4"/>
-<text x="62" y="220" font-size="23" font-weight="700">Reddit + X</text>
-<text x="62" y="248" font-size="17" class="muted">Shared source set</text>
-<text x="62" y="272" font-size="17" class="muted">and retrieval rules</text>
+<text x="62" y="220" font-size="23" font-weight="700">CORE: Reddit + X</text>
+<text x="62" y="248" font-size="17" class="muted">GitHub = optional extension</text>
+<text x="62" y="272" font-size="17" class="muted">HN backlog; no YouTube</text>
 <rect x="290" y="185" width="250" height="104" rx="14" fill="#fff" stroke="#dbe3ed" stroke-width="1.4"/>
-<text x="312" y="220" font-size="23" font-weight="700">Treg access</text>
-<text x="312" y="248" font-size="17" class="muted">Provider endpoint pinned</text>
-<text x="312" y="272" font-size="17" class="muted">Live test pending</text>
+<text x="312" y="220" font-size="23" font-weight="700">Source access</text>
+<text x="312" y="248" font-size="17" class="muted">Core: Reddit/X selected route</text>
+<text x="312" y="272" font-size="17" class="muted">Optional: GitHub official API/CLI</text>
 <rect x="580" y="185" width="660" height="104" rx="14" fill="#fff" stroke="#dbe3ed" stroke-width="1.4"/>
 <rect x="580" y="201" width="4" height="72" rx="2" fill="#f59e0b"/>
 <text x="602" y="220" font-size="23" font-weight="700">Deterministic collector</text>
@@ -115,5 +115,5 @@
 <path d="M1040 514 H1260 V488 H1290" class="telemetry"/>
 <path d="M1220 678 H1290" class="telemetry"/>
 <path d="M1220 1066 H1290" class="telemetry"/>
-<text x="40" y="1210" font-size="16" class="muted">Optional later: GitHub / HN sources. OpenMagpie = alternative ingestion; Agent-Reach = optional enrichment.</text>
+<text x="40" y="1210" font-size="16" class="muted">Core: Reddit / X. GitHub optional after core. HN backlog. OpenMagpie alternative; Agent-Reach optional.</text>
 </svg>

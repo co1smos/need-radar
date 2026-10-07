@@ -19,6 +19,8 @@
 | 文档 | 用途 |
 |---|---|
 | [整体架构图](docs/architecture.md) | 已排版 SVG、浏览器版、可编辑 Mermaid 和模块边界 |
+| [Ticket review](docs/tickets-review.md) | 唯一当前 ticket review draft；架构讨论已收敛，尚未发布到 tracker |
+| [Target & source scope](docs/target-scope.md) | AI application-layer 目标边界；核心 Reddit + X；GitHub 可选且不阻塞核心；HN backlog |
 | [Runtime selections](docs/runtime-selections.md) | 已确认模型/频道、Treg 凭证何时需要、尚未启用的配置 |
 | [具体问题与实际回答全文](docs/grill/qa-transcript.md) | Q1–Q30 原始提问、Hermes 建议、对应的代理回答及实际结束消息，已核对原会话 |
 | [ChatGPT × Hermes 讨论摘要](docs/grill/discussion.md) | 中文结论、原始记录导航和后续实验例子；不是问答全文 |

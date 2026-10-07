@@ -8,7 +8,7 @@ It reconciles the authoritative owner intent in [owner-brief.md](owner-brief.md)
 It incorporates the settled proxy answers in [grill/02-proxy-answers.md](grill/02-proxy-answers.md).
 Dependency observations and remaining factual preflights are in [evidence-notes.md](evidence-notes.md).
 Decision authority and provenance are summarized in [decisions.md](decisions.md).
-The product discovers concrete, valuable, evidenced friction in building with or learning to build with AI.
+The product discovers concrete, valuable, evidenced **AI application-layer** friction in building with or learning to build AI applications. See [target-scope.md](target-scope.md) for the active source boundary and the distinction from model-internal / low-level AI infrastructure work.
 A finding identifies an affected user, goal, obstacle, evidence, and a plausibly bounded intervention.
 Small but consequential problems qualify; venture scale, monetization, novelty, and willingness to pay are not assumed.
 There is no personal-interest recommender, owner-preference score, or continuous personal-feedback feature.
@@ -28,7 +28,7 @@ Treg is a tentative preferred acquisition candidate, not a validated or mandator
 Its endpoint behavior, terms, authorization, retention rights, coverage, pagination, IDs, freshness, quotas, billing units, and VPS reliability require a separately authorized live preflight.
 OpenMagpie is an alternative ingestion subsystem, not a parallel mandatory layer.
 Agent-Reach is optional later enrichment or fallback, not part of the first data path.
-Direct GitHub or Hacker News APIs are considered only when those sources are activated.
+The core initial source set is Reddit + X. GitHub Issues/Discussions is an optional extension after the Reddit+X end-to-end path is working and must not block the core pilot; when added, prefer official GitHub APIs/CLI. Hacker News remains backlog and is considered only if explicitly activated later.
 Select one minimal acquisition path before adding integrations.
 ## Experimental boundary
 Source, retrieval, and extraction are separate experiment dimensions.

@@ -4,7 +4,7 @@ Date: 2026-10-06. Status: authoritative recap of this conversation; not an imple
 
 ## 1. Product intent (owner approved)
 
-An independent project that continuously discovers concrete friction in building with or learning to build with AI. The output should identify valuable, meaningfully sized, evidence-backed problems that can plausibly be improved through a reasonably scoped tool, repository, software feature, automation, or LLM workflow. Deterministic solutions are equally acceptable. This is not restricted to venture-scale startup ideas or monetizable SaaS.
+An independent project that continuously discovers concrete **AI application-layer** friction in building with or learning to build with AI. The output should identify valuable, meaningfully sized, evidence-backed problems that can plausibly be improved through a reasonably scoped tool, repository, software feature, harness capability, plugin/integration, automation, or LLM workflow. Deterministic solutions are equally acceptable. Model-internal research and low-level training/inference/GPU optimization are not the primary target. This is not restricted to venture-scale startup ideas or monetizable SaaS.
 
 Examples of broad starting points: automatic model routing; practical AI-learning repositories. The system must narrow these into a specific affected user, goal, obstacle, evidence, and possible small intervention, rather than merely reporting 'AI costs too much' or 'people want to learn AI'. A small issue is eligible; sizeable refers to meaningful friction/value, not invented market size.
 
@@ -16,7 +16,7 @@ No personal-interest recommender or in-product owner-feedback system. The owner 
 - AI should implement after authorization; the owner reviews direction, architecture, and genuine tradeoffs, not hand-codes the system.
 - Simplicity is first priority; reuse existing solutions and avoid speculative infrastructure. Runtime cost is also important.
 - Collect daily at minimum; collection can be more frequent than a daily report. The exact polling cadence is a reversible configuration choice, not a promised requirement.
-- Reddit and X are desired acquisition targets. Tags/communities are acceptable seeds. GitHub Issues/Discussions and Hacker News are additional source candidates, not mandatory simultaneous integrations.
+- Core active sources are Reddit and X. GitHub Issues/Discussions is an optional extension after the Reddit+X path works end to end, and must not block the core product/pilot. When added, GitHub should emphasize popular, actively used open-source AI application-layer projects whose users expose concrete workflow/integration/agent/tool friction; owner examples include Hermes Agent, pi agent, and OpenClaw (verify exact repository slugs before implementation). Hacker News is backlog, and YouTube is not in the current source plan. Tags/communities/repos are acceptable seeds.
 - No token-expensive LLM-driven browser scraping loop. Deterministic collectors and existing data-access services are preferred. Do not assume Playwright itself consumes LLM tokens; deterministic HTML-to-PDF use is different.
 - Hermes is the preferred scheduler/agent/Discord entry point for now, subject to actual installed capabilities. No need to reproduce its gateway or scheduling framework.
 - Failures must be diagnosed, including silent failures and incorrect deterministic inputs. AI may later propose repairs; production mutation/autodeploy is not authorized.
@@ -89,6 +89,8 @@ The owner selected **DeepSeek V4.1 Flash** and provided Discord channel **`15571
 These inputs are documented in [runtime-selections.md](runtime-selections.md). Model access/provider, budgets, retention/export permissions and send time remain activation gates. No implementation, global Hermes model change, schedule or message is authorized by supplying these design inputs. [architecture.md](architecture.md) now contains an actual SVG diagram and editable Mermaid source.
 
 The original interview below remains historical context; references to unknown model/channel choices are superseded by this update only where applicable.
+
+A later owner update also fixed the product/source target in [target-scope.md](target-scope.md): the core first-round sources are Reddit and X; GitHub Issues/Discussions is an optional extension after the core end-to-end path works and is not a blocker; HN is backlog; YouTube is excluded; findings should focus on AI application-layer builder friction rather than model/infra internals. This later update supersedes earlier optional-source wording where it conflicts.
 
 ## 8. Questions for Hermes to stress-test
 

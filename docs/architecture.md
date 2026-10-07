@@ -8,7 +8,7 @@
 
 ## 怎么读这张图
 
-**上半部只有一套采集。** Reddit/X 经选定的 Treg provider endpoint 进入薄采集程序。程序执行有边界的请求、规范化、exact dedupe，保存原始证据与发现来源，再冻结当天的共同输入。Treg 是优先核查的候选，不是已经验证可用的服务。它不代替本地状态、实验规则或应用内 tracing。
+**上半部只有一套共享采集路径。** 核心首轮 source 是 Reddit + X，经各自 acquisition/normalization 进入同一个 shared evidence path。GitHub Issues/Discussions 是 Reddit+X end-to-end 稳定后的 optional extension，不阻塞 core pilot；加入时优先走官方 API/CLI。程序执行有边界的请求、规范化、exact dedupe，保存原始证据与发现来源，再冻结当天的共同输入。Treg 是 Reddit/X 优先核查的候选，不是已经验证可用的服务。Hacker News 仅在 backlog；YouTube 不在当前 source plan。具体 target/source contract 见 [target-scope.md](target-scope.md)。
 
 **中间只改变 extraction。** 同一个 deterministic context builder 给 v0 和 v1 提供相同帖子、评论范围、排序、batch 和资源上限。v0 找明确抱怨/请求；v1 找 workaround/重复操作背后的真实负担。两边都用用户选定的 DeepSeek V4.1 Flash；正式 endpoint/provider 仍待接入检查。
 
@@ -27,7 +27,7 @@
 | 报告 | 同一份 Markdown；复用 renderer，Quarto/Chromium 尚待 fixture 验证 |
 | Observability | 自己补业务关键 span/输入输出关联；复用 OpenTelemetry/Langfuse 等候选基础设施，不重建观测平台 |
 
-OpenMagpie 是可替代采集子系统，不与 Treg 路径同时强制部署。Agent-Reach 是后续可能的 enrichment/fallback；GitHub/HN 是后续 source，不把它们变成第一版的前置条件。
+OpenMagpie 是可替代采集子系统，不与 Treg 路径同时强制部署。Agent-Reach 是后续可能的 enrichment/fallback。GitHub Issues/Discussions 是 optional extension；Hacker News 仍是 backlog，YouTube 不在当前 source plan。
 
 ## 已记录的具体配置
 
@@ -44,8 +44,8 @@ OpenMagpie 是可替代采集子系统，不与 Treg 路径同时强制部署。
 flowchart TB
   H["Hermes 调度 / 执行入口<br/>计划配置，尚未启用"]
   subgraph SHARED["一套共同采集与输入"]
-    SRC["Reddit / X<br/>同一 source + retrieval"]
-    T["Treg / 选定 provider endpoint<br/>候选，待 live preflight"]
+    SRC["CORE: Reddit / X<br/>GitHub Issues+Discussions = optional extension"]
+    T["Core access: Reddit/X via selected route<br/>Optional GitHub via official API/CLI"]
     C["Deterministic collector<br/>bounded requests / normalize / exact dedupe"]
     DB[("SQLite + 文件<br/>原始证据 / discovery provenance")]
     S["冻结的共同输入 snapshot<br/>同一内容字节 / 顺序 / evidence scope"]
