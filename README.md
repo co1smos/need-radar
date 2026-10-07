@@ -63,6 +63,8 @@ python3 -m need_radar --output "$demo_dir"
 
 CLI 输出 `status=success`，并在目录中保存有序 `snapshot.json`、解析后的 v0 `prompt.json`、明确标记为合成边界的 `model-response.json`、已校验的 `candidates.json`、规范 `report.md` 和 SQLite `lineage.sqlite3`。所有阶段保留输入/输出哈希和前序阶段链接。合成 fixture 不是实时来源或模型验证。
 
+`report.md` 是规范报告，并明确标注合成/离线状态与验证边界：引用校验只确认摘录是保留文本的精确子串，不判断语义支持。Fixture 在任何产物写入前先做秘密值脱敏；不合规输入会退出失败，只写 `validation.json` 和对应 lineage，不会生成成功 snapshot。
+
 已运行的离线检查命令：
 
 ```sh
