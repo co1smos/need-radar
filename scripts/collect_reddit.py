@@ -10,9 +10,11 @@ import math
 import os
 import pathlib
 import re
+import signal
 import stat
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -22,6 +24,7 @@ from dataclasses import dataclass
 
 
 TICKET = "3"
+INCIDENT_REF = "need-radar-issue-3:unknown-outcome-request"
 STATE_DEFAULT = pathlib.Path("/home/ubuntu/.local/state/need-radar/ticket-3")
 APPROVAL_DEFAULT = STATE_DEFAULT / "approval.json"
 CREDENTIALS_PATH = pathlib.Path("/home/ubuntu/projects/need-radar/credentials.env")
@@ -90,8 +93,9 @@ SENSITIVE_QUERY_KEYS = {
 }
 SENSITIVE_ASSIGNMENT = re.compile(
     r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]+|"
-    r"\b((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|key|secret|auth|client[_-]?secret|password|passwd|cookie|authorization)\b\s*[:=]\s*)[^\s,;&]+"
+    r"\b((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|key|secret|auth|client[_-]?secret|password|passwd|cookie|authorization|signature|sig)\b\s*[:=]\s*)[^\s,;&]+"
 )
+EMBEDDED_URL = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
 
 class CollectorError(Exception):
@@ -126,18 +130,19 @@ class UrllibTransport:
             raise CollectorError("request_host_rejected", "blocked")
         request = urllib.request.Request(url, headers=headers, method="GET")
         opener = urllib.request.build_opener(NoRedirect())
-        try:
-            response = opener.open(request, timeout=timeout)
-        except urllib.error.HTTPError as error:
-            response = error
-        with response:
-            body = response.read(MAX_RESPONSE_BYTES + 1)
-            return HTTPResponse(
-                response.status,
-                dict(response.headers.items()),
-                body[:MAX_RESPONSE_BYTES],
-                len(body) > MAX_RESPONSE_BYTES,
-            )
+        with request_deadline(timeout):
+            try:
+                response = opener.open(request, timeout=timeout)
+            except urllib.error.HTTPError as error:
+                response = error
+            with response:
+                body = response.read(MAX_RESPONSE_BYTES + 1)
+                return HTTPResponse(
+                    response.status,
+                    dict(response.headers.items()),
+                    body[:MAX_RESPONSE_BYTES],
+                    len(body) > MAX_RESPONSE_BYTES,
+                )
 
 
 def utc_now():
@@ -146,6 +151,26 @@ def utc_now():
 
 def timestamp(value):
     return value.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+@contextlib.contextmanager
+def request_deadline(seconds):
+    if not hasattr(signal, "SIGALRM") or threading.current_thread() is not threading.main_thread():
+        raise CollectorError("request_deadline_unavailable", "blocked")
+    if any(signal.getitimer(signal.ITIMER_REAL)):
+        raise CollectorError("request_deadline_unavailable", "blocked")
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def deadline_expired(_signum, _frame):
+        raise TimeoutError("request_deadline_exceeded")
+
+    signal.signal(signal.SIGALRM, deadline_expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def parse_datetime(value):
@@ -178,31 +203,59 @@ def private_file(path):
 def repository_path(path):
     root = pathlib.Path(__file__).resolve().parents[1]
     resolved = pathlib.Path(path).resolve()
-    return resolved == root or root in resolved.parents
+    roots = {root}
+    if root.parent.name == "worktrees" and root.parent.parent.name == ".sandcastle":
+        primary = root.parent.parent.parent.resolve()
+        roots.add(primary)
+        git_dir = primary / ".git"
+        if git_dir.is_dir():
+            worktrees = git_dir / "worktrees"
+            if worktrees.is_dir():
+                for entry in worktrees.iterdir():
+                    try:
+                        gitfile = pathlib.Path((entry / "gitdir").read_text(encoding="utf-8").strip()).resolve()
+                    except OSError:
+                        continue
+                    roots.add(gitfile.parent)
+    return any(resolved == candidate or candidate in resolved.parents for candidate in roots)
 
 
 def atomic_json(path, value):
     private_directory(path.parent)
-    descriptor, temp_name = tempfile.mkstemp(prefix=".pending-", dir=path.parent)
+    directory_fd = os.open(path.parent, os.O_RDONLY)
     try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            json.dump(value, output, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temp_name, path)
-        os.chmod(path, 0o600)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
+        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        descriptor, temp_name = tempfile.mkstemp(prefix=".pending-", dir=path.parent)
         try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                json.dump(value, output, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temp_name, path)
+            os.chmod(path, 0o600)
             os.fsync(directory_fd)
         finally:
-            os.close(directory_fd)
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temp_name)
     finally:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(temp_name)
+        fcntl.flock(directory_fd, fcntl.LOCK_UN)
+        os.close(directory_fd)
 
 
 def safe_string(value, secrets=()):
+    if value is None:
+        return None
+    text = str(value)
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    text = SENSITIVE_ASSIGNMENT.sub(
+        lambda match: (match.group(1) or match.group(2)) + "[REDACTED]", text
+    )
+    return EMBEDDED_URL.sub(lambda match: safe_url(match.group(0), secrets), text)
+
+
+def safe_text(value, secrets=()):
     if value is None:
         return None
     text = str(value)
@@ -220,24 +273,28 @@ def safe_url(value, secrets=()):
     try:
         parsed = urllib.parse.urlsplit(value)
     except ValueError:
-        return safe_string(value, secrets)
+        return safe_text(value, secrets)
     if not parsed.scheme or not parsed.netloc:
-        return safe_string(value, secrets)
+        return safe_text(value, secrets)
     try:
-        host = parsed.hostname or ""
+        host = urllib.parse.quote(safe_text(urllib.parse.unquote(parsed.hostname or ""), secrets), safe=".-:")
+        if ":" in host and not host.startswith("["):
+            host = "[" + host + "]"
         if parsed.port:
             host += ":" + str(parsed.port)
+        if parsed.username is not None or parsed.password is not None:
+            host = "[REDACTED]@" + host
     except ValueError:
-        return safe_string(value, secrets)
+        return safe_text(value, secrets)
     query = []
     for key, item in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
         if key.lower() in SENSITIVE_QUERY_KEYS:
             item = "[REDACTED]"
-        query.append((key, safe_string(item, secrets)))
+        query.append((safe_text(key, secrets), safe_text(item, secrets)))
     return urllib.parse.urlunsplit((
         parsed.scheme,
         host,
-        parsed.path,
+        urllib.parse.quote(safe_text(urllib.parse.unquote(parsed.path), secrets), safe="/%:@-._~!$&'()*+,;=%"),
         urllib.parse.urlencode(query, doseq=True),
         "[REDACTED]" if parsed.fragment else "",
     ))
@@ -247,7 +304,17 @@ def sanitize(value, secrets=(), key=""):
     if SENSITIVE_KEYS.search(key):
         return "[REDACTED]"
     if isinstance(value, dict):
-        return {str(name): sanitize(item, secrets, str(name)) for name, item in value.items()}
+        result = {}
+        for name, item in value.items():
+            original = str(name)
+            cleaned = "[REDACTED_KEY]" if SENSITIVE_KEYS.search(original) else safe_string(original, secrets)
+            unique = cleaned
+            index = 2
+            while unique in result:
+                unique = f"{cleaned}#{index}"
+                index += 1
+            result[unique] = sanitize(item, secrets, original)
+        return result
     if isinstance(value, list):
         return [sanitize(item, secrets) for item in value]
     if isinstance(value, str):
@@ -417,13 +484,28 @@ def default_state():
         "reserved_success_slots": 0,
         "pending": None,
         "limit_breach": False,
+        "incident_hold": {"reference": INCIDENT_REF, "status": "unresolved", "outcome": "unknown", "charge_micro_usd": None},
         "reconciliations": [],
     }
 
 
+def expire_pending_parameters(state, now):
+    pending = state.get("pending")
+    if not isinstance(pending, dict) or "request_parameters" not in pending:
+        return False
+    try:
+        expires = parse_datetime(pending.get("request_parameters_expires_at"))
+    except (TypeError, ValueError):
+        expires = now
+    if expires <= now:
+        del pending["request_parameters"]
+        return True
+    return False
+
+
 def load_state(path):
     if not path.exists():
-        return default_state()
+        return default_state(), True
     if path.is_symlink() or not private_file(path):
         raise CollectorError("private_budget_state_required", "blocked")
     try:
@@ -432,24 +514,38 @@ def load_state(path):
     except (OSError, UnicodeError, json.JSONDecodeError):
         raise CollectorError("budget_state_unreadable", "blocked") from None
     required = default_state()
-    if not isinstance(state, dict) or any(key not in state for key in required):
+    if not isinstance(state, dict) or any(key not in state for key in required if key != "incident_hold"):
         raise CollectorError("budget_state_invalid", "blocked")
-    if state.get("version") != 1 or state.get("ticket") != TICKET:
+    migrated = "incident_hold" not in state
+    if migrated:
+        state["incident_hold"] = required["incident_hold"]
+    if state.get("version") != 1 or state.get("ticket") != TICKET or type(state.get("limit_breach")) is not bool:
         raise CollectorError("budget_state_invalid", "blocked")
     for field in ("successful_requests", "attempts", "spent_micro_usd", "reserved_micro_usd", "reserved_success_slots"):
         if type(state.get(field)) is not int or state[field] < 0:
             raise CollectorError("budget_state_invalid", "blocked")
     if state["successful_requests"] + state["reserved_success_slots"] > MAX_SUCCESSFUL_REQUESTS:
         raise CollectorError("budget_state_exceeds_limit", "blocked")
-    if state["spent_micro_usd"] + state["reserved_micro_usd"] > MAX_SPEND_MICRO_USD:
+    if state["spent_micro_usd"] + state["reserved_micro_usd"] > MAX_SPEND_MICRO_USD and state.get("limit_breach") is not True:
         raise CollectorError("budget_state_exceeds_limit", "blocked")
+    incident = state.get("incident_hold")
+    if (
+        not isinstance(incident, dict)
+        or incident.get("reference") != INCIDENT_REF
+        or incident.get("status") not in {"unresolved", "reconciled"}
+    ):
+        raise CollectorError("budget_state_incident_hold_invalid", "blocked")
+    if incident["status"] == "unresolved" and (
+        incident.get("outcome") != "unknown" or incident.get("charge_micro_usd") is not None
+    ):
+        raise CollectorError("budget_state_incident_hold_invalid", "blocked")
     if not isinstance(state.get("reconciliations"), list):
         raise CollectorError("budget_state_invalid", "blocked")
     pending = state.get("pending")
     if pending is not None:
         if not isinstance(pending, dict):
             raise CollectorError("budget_state_invalid", "blocked")
-        pending_reserved = 0 if pending.get("charge_known") else pending.get("reserved_micro_usd")
+        pending_reserved = 0 if pending.get("charge_known") and state["reserved_micro_usd"] == 0 else pending.get("reserved_micro_usd")
         if (
             pending.get("route") not in ROUTES
             or type(pending.get("reserved_micro_usd")) is not int
@@ -459,11 +555,11 @@ def load_state(path):
             or state["reserved_success_slots"] not in (0, 1)
         ):
             raise CollectorError("budget_state_invalid", "blocked")
-    return state
+    return state, migrated
 
 
 @contextlib.contextmanager
-def locked_state(directory):
+def locked_state(directory, now=None):
     private_directory(directory)
     lock_path = directory / "state.lock"
     flags = os.O_CREAT | os.O_RDWR
@@ -473,12 +569,39 @@ def locked_state(directory):
     os.fchmod(descriptor, 0o600)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
+        expire_pending_files(directory)
         state_path = directory / "state.json"
-        state = load_state(state_path)
+        state, migrated = load_state(state_path)
+        changed = expire_pending_parameters(state, now or utc_now())
+        if migrated or changed:
+            atomic_json(state_path, state)
         yield state_path, state
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
+
+
+def require_incident_reconciled(state):
+    incident = state.get("incident_hold")
+    try:
+        parse_datetime(incident.get("reconciled_at"))
+    except (AttributeError, TypeError, ValueError):
+        raise CollectorError("historical_unknown_outcome_hold", "blocked") from None
+    if (
+        not isinstance(incident, dict)
+        or incident.get("reference") != INCIDENT_REF
+        or incident.get("status") != "reconciled"
+        or incident.get("outcome") not in {"success", "failed"}
+        or type(incident.get("charge_micro_usd")) is not int
+        or incident["charge_micro_usd"] < 0
+        or not evidence_present(incident.get("evidence_ref"))
+    ):
+        raise CollectorError("historical_unknown_outcome_hold", "blocked")
+    if (
+        state["spent_micro_usd"] < incident["charge_micro_usd"]
+        or (incident["outcome"] == "success" and state["successful_requests"] == 0)
+    ):
+        raise CollectorError("historical_incident_not_in_budget_ledger", "blocked")
 
 
 def cost_text(micro_usd):
@@ -559,17 +682,35 @@ def acquisition_succeeded(route_name, status, payload):
     return True
 
 
-def post_url(post, secrets):
+def post_url(post, secrets, subreddit):
     for key in ("url", "permalink", "link", "post_url"):
         value = post.get(key)
         if isinstance(value, str) and value:
-            url = safe_url(value, secrets)
             try:
-                parsed = urllib.parse.urlsplit(url)
+                parsed = urllib.parse.urlsplit(value)
+                port = parsed.port
             except ValueError:
                 continue
-            if parsed.scheme == "https" and parsed.hostname in {"reddit.com", "www.reddit.com", "old.reddit.com"}:
-                return urllib.parse.urlunsplit(("https", "www.reddit.com", parsed.path, "", ""))
+            permalink = re.fullmatch(r"/r/([^/]+)/comments/([^/]+)(?:/[^/]*)?/?", parsed.path, re.IGNORECASE)
+            if (
+                parsed.scheme.lower() == "https"
+                and parsed.hostname in {"reddit.com", "www.reddit.com", "old.reddit.com"}
+                and parsed.username is None
+                and parsed.password is None
+                and port in (None, 443)
+                and permalink
+                and permalink.group(1).casefold() == subreddit.casefold()
+            ):
+                sanitized = urllib.parse.urlsplit(safe_url(value, secrets))
+                safe_permalink = re.fullmatch(
+                    r"/r/([^/]+)/comments/([^/]+)(?:/[^/]*)?/?", sanitized.path, re.IGNORECASE
+                )
+                if (
+                    sanitized.path == parsed.path
+                    and safe_permalink
+                    and safe_permalink.group(1).casefold() == subreddit.casefold()
+                ):
+                    return urllib.parse.urlunsplit(("https", "www.reddit.com", sanitized.path, "", ""))
     return None
 
 
@@ -577,7 +718,12 @@ def post_time(post):
     for key in ("createdAt", "created_at_iso", "created_utc", "timestamp"):
         value = post.get(key)
         if isinstance(value, (int, float)):
-            return dt.datetime.fromtimestamp(value, dt.timezone.utc)
+            try:
+                if not math.isfinite(value):
+                    raise ValueError
+                return dt.datetime.fromtimestamp(value, dt.timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                raise ValueError("post_timestamp_invalid") from None
         if isinstance(value, str):
             try:
                 return parse_datetime(value)
@@ -634,6 +780,8 @@ def recording_file(recordings_dir, record):
 
 
 def record_timestamp(record):
+    if not isinstance(record, dict):
+        return None
     try:
         return parse_datetime(record.get("recorded_at"))
     except (TypeError, ValueError):
@@ -641,6 +789,8 @@ def record_timestamp(record):
 
 
 def record_expiry(record):
+    if not isinstance(record, dict):
+        return None
     try:
         recorded = parse_datetime(record.get("recorded_at"))
         expires = parse_datetime(record.get("expires_at"))
@@ -649,9 +799,35 @@ def record_expiry(record):
     retention_days = record.get("retention_days")
     if type(retention_days) is not int or not 1 <= retention_days <= RETENTION_DAYS:
         return None
-    if expires != recorded + dt.timedelta(days=retention_days):
+    if record.get("source_expires_at") is not None:
+        try:
+            source_expires = parse_datetime(record["source_expires_at"])
+        except (TypeError, ValueError):
+            return None
+        if expires != source_expires or expires > recorded + dt.timedelta(days=retention_days):
+            return None
+    elif expires != recorded + dt.timedelta(days=retention_days):
         return None
     return expires
+
+
+def expire_pending_files(directory):
+    removed = 0
+    directory_fd = os.open(directory, os.O_RDONLY)
+    try:
+        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        for path in directory.glob(".pending-*"):
+            info = path.lstat()
+            if path.is_symlink() or not stat.S_ISREG(info.st_mode):
+                raise CollectorError("recording_temporary_file_type_rejected", "blocked")
+            if info.st_mode & 0o077 or info.st_uid != os.getuid():
+                raise CollectorError("private_recording_permissions_required", "blocked")
+            path.unlink()
+            removed += 1
+    finally:
+        fcntl.flock(directory_fd, fcntl.LOCK_UN)
+        os.close(directory_fd)
+    return removed
 
 
 def expire_recordings(recordings_dir, now):
@@ -678,7 +854,7 @@ def expire_recordings(recordings_dir, now):
         if expires is None or expires <= now:
             path.unlink()
             removed += 1
-    return removed
+    return removed + expire_pending_files(recordings_dir)
 
 
 class Collector:
@@ -698,6 +874,7 @@ class Collector:
         self.run_id = uuid.uuid4().hex
         self.trace_id = uuid.uuid4().hex
         self.previous_record = None
+        self.earliest_source_expiry = None
         self.recordings_dir = pathlib.Path(args.recordings_dir or pathlib.Path(args.state_dir) / "recordings")
         self.counts = {
             "feed_requests": 0,
@@ -785,13 +962,19 @@ class Collector:
         artifact_name = "run-" + self.run_id + ".json"
         report["artifact"] = artifact_name
         now = self.clock()
+        expires = min(
+            now + dt.timedelta(days=self.retention_days),
+            self.earliest_source_expiry or now + dt.timedelta(days=self.retention_days),
+        )
         persisted = {
             **report,
             "stage": "reddit_acquisition_output",
             "recorded_at": timestamp(now),
-            "expires_at": timestamp(now + dt.timedelta(days=self.retention_days)),
+            "expires_at": timestamp(expires),
             "retention_days": self.retention_days,
         }
+        if self.earliest_source_expiry is not None:
+            persisted["source_expires_at"] = timestamp(self.earliest_source_expiry)
         try:
             atomic_json(self.recordings_dir / artifact_name, persisted)
         except (OSError, CollectorError):
@@ -801,6 +984,8 @@ class Collector:
     def save_record(self, route_name, params, response=None, error=None, reservation=None, api_counts=None, request_headers=None):
         route = ROUTES[route_name]
         now = self.clock()
+        expires = now + dt.timedelta(days=self.retention_days)
+        self.earliest_source_expiry = min(self.earliest_source_expiry or expires, expires)
         body = sanitize_body(response.body, [self.credentials.token]) if response is not None else None
         headers = response_headers(response.headers, [self.credentials.token]) if response is not None else {}
         call_id = header(response.headers, "X-Treg-Call-Id") if response is not None else None
@@ -817,7 +1002,7 @@ class Collector:
             "provider": route["provider"],
             "endpoint": route["id"],
             "recorded_at": timestamp(now),
-            "expires_at": timestamp(now + dt.timedelta(days=self.retention_days)),
+            "expires_at": timestamp(expires),
             "retention_days": self.retention_days,
             "configuration": {
                 "subreddits": self.args.subreddit,
@@ -867,9 +1052,9 @@ class Collector:
             },
             "counts": sanitize(api_counts or {}),
             "error": error,
-            "request_parameters_sha256": hashlib.sha256(
-                json.dumps(sanitize(params, [self.credentials.token]), sort_keys=True).encode("utf-8")
-            ).hexdigest(),
+        "request_parameters_sha256": hashlib.sha256(
+            json.dumps(sanitize(params, [self.credentials.token]), sort_keys=True).encode("utf-8")
+        ).hexdigest(),
         }
         record_id = recording_file(self.recordings_dir, record)
         self.counts["record_ids"].append(record_id)
@@ -897,6 +1082,7 @@ class Collector:
             "reserved_micro_usd": reservation,
             "success_slot_reserved": True,
             "started_at": timestamp(self.clock()),
+            "request_parameters_expires_at": timestamp(self.clock() + dt.timedelta(days=self.retention_days)),
             "request_parameters": sanitize(params, [self.credentials.token]),
             "request_parameters_sha256": hashlib.sha256(
                 json.dumps(sanitize(params, [self.credentials.token]), sort_keys=True).encode("utf-8")
@@ -927,10 +1113,17 @@ class Collector:
             atomic_json(state_path, state)
             raise CollectorError("billing_amount_unknown_reconciliation_required", "blocked")
         state["spent_micro_usd"] += cost
-        state["reserved_micro_usd"] -= reservation
-        if cost > reservation or state["spent_micro_usd"] + state["reserved_micro_usd"] > MAX_SPEND_MICRO_USD:
+        if cost > reservation or state["spent_micro_usd"] + state["reserved_micro_usd"] - reservation > MAX_SPEND_MICRO_USD:
             state["limit_breach"] = True
-            state["pending"] = None
+            pending.update({
+                "charge_known": True,
+                "known_charge_micro_usd": cost,
+                "call_id": safe_string(call_id, [self.credentials.token]) if call_id else None,
+                "http_status": status,
+                "http_success": successful,
+                "success_slot_reserved": False,
+                "reconciliation_evidence_required": True,
+            })
             atomic_json(state_path, state)
             raise CollectorError("provider_cost_ceiling_breach", "failed")
         if not call_id:
@@ -944,6 +1137,7 @@ class Collector:
             })
             atomic_json(state_path, state)
             raise CollectorError("billing_call_id_missing_reconciliation_required", "blocked")
+        state["reserved_micro_usd"] -= reservation
         state["pending"] = None
         atomic_json(state_path, state)
         return cost, successful, call_id
@@ -1048,7 +1242,12 @@ class Collector:
                 if not posts:
                     self.coverage_reasons.append("empty feed page does not establish source completeness")
                 for post in posts:
-                    observed = post_time(post)
+                    try:
+                        observed = post_time(post)
+                    except ValueError:
+                        self.counts["errors"].append("feed_response_payload_invalid")
+                        self.coverage_reasons.append("feed post contains an invalid numeric timestamp")
+                        raise CollectorError("feed_response_payload_invalid", "failed") from None
                     if observed is None:
                         self.counts["posts_missing_timestamp"] += 1
                         self.coverage_reasons.append("some feed posts have no verified timestamp field")
@@ -1058,7 +1257,7 @@ class Collector:
                     if not start <= observed < end:
                         continue
                     self.counts["posts_in_window"] += 1
-                    url = post_url(post, [self.credentials.token])
+                    url = post_url(post, [self.credentials.token], subreddit)
                     if not url:
                         self.coverage_reasons.append("some in-window posts lack a safe Reddit URL")
                         continue
@@ -1290,32 +1489,47 @@ def run_collect(args, transport, credentials_loader, clock, sleeper, synthetic):
         })
         return 2
     if synthetic and credentials_loader is None:
-        raise CollectorError("synthetic_transport_requires_test_credentials", "blocked")
-    account = approval["provider_account"]
-    try:
-        credentials = credentials_loader(account["token_type"])
-    except CollectorError as error:
-        print_json({"ticket": TICKET, "source": "reddit", "status": error.status, "errors": [error.code], "network_requests": 0})
+        print_json({"ticket": TICKET, "source": "reddit", "status": "blocked", "errors": ["synthetic_transport_requires_test_credentials"], "network_requests": 0})
         return 2
-    if not isinstance(credentials, Credentials) or not credentials.token:
-        print_json({"ticket": TICKET, "source": "reddit", "status": "blocked", "errors": ["runtime_credentials_invalid"], "network_requests": 0})
-        return 2
-    collector = Collector(args, approval, transport, credentials, clock, sleeper, synthetic)
+    collector = None
     try:
-        with locked_state(state_dir) as (state_path, state):
+        with locked_state(state_dir, clock()) as (state_path, state):
+            if not synthetic:
+                require_incident_reconciled(state)
+                if state.get("pending") is not None:
+                    raise CollectorError("unreconciled_request_pauses_acquisition", "blocked")
+                if state.get("limit_breach"):
+                    raise CollectorError("persistent_budget_limit_breach", "blocked")
+                if state["successful_requests"] + state["reserved_success_slots"] >= MAX_SUCCESSFUL_REQUESTS:
+                    raise CollectorError("successful_request_limit_reached", "blocked")
+                if state["spent_micro_usd"] + state["reserved_micro_usd"] >= MAX_SPEND_MICRO_USD:
+                    raise CollectorError("spend_limit_reached", "blocked")
+            account = approval["provider_account"]
+            credentials_loaded = False
+            credentials = credentials_loader(account["token_type"])
+            credentials_loaded = True
+            if not isinstance(credentials, Credentials) or not credentials.token:
+                raise CollectorError("runtime_credentials_invalid", "blocked")
+            collector = Collector(args, approval, transport, credentials, clock, sleeper, synthetic)
             report = collector.run(state_path, state)
     except CollectorError as error:
         report = {
             "ticket": TICKET,
             "source": "reddit",
             "status": error.status,
-            "evidence_kind": "synthetic_offline" if synthetic else "live_provider_response",
-            "run_id": collector.run_id,
-            "trace_id": collector.trace_id,
+            "evidence_kind": "offline_preflight" if collector is None else "synthetic_offline" if synthetic else "live_provider_response",
             "errors": [error.code],
-            "network_requests": 0 if synthetic else collector.request_attempts,
-            "acquisition_attempts": collector.request_attempts,
+            "network_requests": 0 if collector is None or synthetic else collector.request_attempts,
+            "credentials_loaded": locals().get("credentials_loaded", False),
         }
+        if collector is not None:
+            report.update({
+                "run_id": collector.run_id,
+                "trace_id": collector.trace_id,
+                "acquisition_attempts": collector.request_attempts,
+            })
+        if error.code in {"historical_unknown_outcome_hold", "historical_incident_not_in_budget_ledger"}:
+            report["incident"] = default_state()["incident_hold"]
     print_json(report)
     return 0 if report["status"] in {"supported", "partial"} else 2
 
@@ -1351,6 +1565,9 @@ def run_replay(args, clock):
         comment_records = 0
         for record in records:
             response = record.get("response") or {}
+            if not isinstance(response, dict):
+                replay_counts["validation_failures"] += 1
+                continue
             status_code = response.get("http_status")
             body = response.get("body")
             if not isinstance(status_code, int) or not 200 <= status_code < 300 or body is None:
@@ -1376,10 +1593,13 @@ def run_replay(args, clock):
         comment_status = "supported" if replay_counts["comment_pages"] else "failed" if comment_records else "partial"
         live = sum(record.get("evidence_kind") == "live_provider_response" for record in records)
         synthetic = sum(record.get("evidence_kind") == "synthetic_offline" for record in records)
+        status = "failed" if not replay_counts["feed_pages"] + replay_counts["comment_pages"] and (
+            replay_counts["validation_failures"] or replay_counts["request_failures"]
+        ) else "partial"
         report = {
             "ticket": TICKET,
             "source": "reddit",
-            "status": "partial",
+            "status": status,
             "evidence_kind": "offline_replay",
             "network_requests": 0,
             "recordings_replayed": len(records),
@@ -1392,7 +1612,7 @@ def run_replay(args, clock):
                 "comment_schema": comment_status,
             },
             "capabilities": {
-                "replay": {"status": "supported", "evidence": "read only from unexpired private recordings; no acquisition transport"},
+                "replay": {"status": "failed" if status == "failed" else "supported", "evidence": "no valid recorded pages" if status == "failed" else "read only from unexpired private recordings; no acquisition transport"},
                 "feed_schema": {"status": feed_status, "evidence": "replayed stored feed bodies" if replay_counts["feed_pages"] else "no valid recorded feed body"},
                 "comment_schema": {"status": comment_status, "evidence": "replayed stored comment bodies" if replay_counts["comment_pages"] else "no valid recorded comment body"},
                 "source_coverage": {"status": "partial", "evidence": "recorded responses alone do not establish source completeness"},
@@ -1402,15 +1622,18 @@ def run_replay(args, clock):
         report_path = recordings_dir / ("replay-" + uuid.uuid4().hex + ".json")
         now = clock()
         replay_retention_days = min(record["retention_days"] for record in records)
+        source_expires = min(record_expiry(record) for record in records)
         atomic_json(report_path, {
             **report,
+            "stage": "reddit_replay_output",
             "recorded_at": timestamp(now),
-            "expires_at": timestamp(now + dt.timedelta(days=replay_retention_days)),
+            "expires_at": timestamp(source_expires),
+            "source_expires_at": timestamp(source_expires),
             "retention_days": replay_retention_days,
         })
         report["artifact"] = report_path.name
         print_json(report)
-        return 0
+        return 2 if status == "failed" else 0
     except CollectorError as error:
         print_json({
             "ticket": TICKET,
@@ -1428,20 +1651,18 @@ def run_replay(args, clock):
 
 
 def run_reconcile(args, clock):
-    if not args.call_id.strip() or not evidence_present(args.evidence) or not 0 <= args.charge_micro <= MAX_SPEND_MICRO_USD:
+    if not args.call_id.strip() or not evidence_present(args.evidence) or args.charge_micro < 0:
         print_json({"ticket": TICKET, "source": "reddit", "status": "blocked", "errors": ["reconciliation_input_invalid"]})
         return 2
     if repository_path(args.state_dir):
         print_json({"ticket": TICKET, "source": "reddit", "status": "blocked", "network_requests": 0, "errors": ["private_artifacts_must_be_outside_repository"]})
         return 2
     try:
-        with locked_state(pathlib.Path(args.state_dir)) as (state_path, state):
+        with locked_state(pathlib.Path(args.state_dir), clock()) as (state_path, state):
             pending = state.get("pending")
             if not isinstance(pending, dict):
                 raise CollectorError("no_pending_request_to_reconcile", "blocked")
             reserved = pending["reserved_micro_usd"]
-            if args.charge_micro > reserved:
-                raise CollectorError("reconciled_charge_exceeds_reservation", "failed")
             if pending.get("call_id") and pending["call_id"] != args.call_id:
                 raise CollectorError("reconciled_call_id_does_not_match_response", "failed")
             if isinstance(pending.get("http_success"), bool):
@@ -1451,9 +1672,13 @@ def run_reconcile(args, clock):
             if pending.get("charge_known"):
                 if pending.get("known_charge_micro_usd") != args.charge_micro:
                     raise CollectorError("reconciled_charge_does_not_match_response", "failed")
+                if state["reserved_micro_usd"]:
+                    state["reserved_micro_usd"] -= reserved
             else:
                 state["spent_micro_usd"] += args.charge_micro
                 state["reserved_micro_usd"] -= reserved
+            if args.charge_micro > reserved or state["spent_micro_usd"] + state["reserved_micro_usd"] > MAX_SPEND_MICRO_USD:
+                state["limit_breach"] = True
             if pending.get("success_slot_reserved"):
                 state["reserved_success_slots"] -= 1
                 if args.request_outcome == "success":
@@ -1470,14 +1695,15 @@ def run_reconcile(args, clock):
             print_json({
                 "ticket": TICKET,
                 "source": "reddit",
-                "status": "supported",
+                "status": "blocked" if state["limit_breach"] else "supported",
                 "evidence_kind": "operator_reconciliation",
                 "network_requests": 0,
                 "successful_requests": state["successful_requests"],
                 "spent_micro_usd": state["spent_micro_usd"],
                 "reserved_micro_usd": state["reserved_micro_usd"],
+                "limit_breach": state["limit_breach"],
             })
-            return 0
+            return 2 if state["limit_breach"] else 0
     except CollectorError as error:
         print_json({"ticket": TICKET, "source": "reddit", "status": error.status, "errors": [error.code], "network_requests": 0})
         return 2
@@ -1490,7 +1716,18 @@ def main(argv=None, transport=None, credentials=None, clock=utc_now, sleeper=tim
     if args.command == "reconcile":
         return run_reconcile(args, clock)
     synthetic = bool(getattr(transport, "synthetic", False))
-    if credentials_loader is None:
+    if synthetic and credentials_loader is None and credentials is None:
+        print_json({
+            "ticket": TICKET,
+            "source": "reddit",
+            "status": "blocked",
+            "network_requests": 0,
+            "errors": ["synthetic_transport_requires_test_credentials"],
+        })
+        return 2
+    if credentials_loader is None and synthetic:
+        credentials_loader = lambda token_type: credentials
+    elif credentials_loader is None:
         credentials_loader = (lambda token_type: credentials) if credentials is not None else load_credentials
     return run_collect(
         args,
