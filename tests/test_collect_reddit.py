@@ -473,6 +473,25 @@ print(safe_string({payload!r}))
         ):
             self.assertNotIn(secret, persisted)
 
+    def test_quoted_password_redacts_url_userinfo_before_context_is_split(self):
+        persisted = self.collect_text_recording(
+            'password: "quoted https://fixture-user:"first '
+            'fixture-password-suffix"@example.org/path suffix"\n'
+            'Cookie: redirect=https://fixture-user:"first '
+            'fixture-cookie-userinfo-suffix"@example.org/path; '
+            'session=fixture-cookie-session; refresh=fixture-cookie-refresh\n'
+            'ordinary https://ordinary.example/path'
+        )
+
+        for secret in (
+            "fixture-password-suffix",
+            "fixture-cookie-userinfo-suffix",
+            "fixture-cookie-session",
+            "fixture-cookie-refresh",
+        ):
+            self.assertNotIn(secret, persisted)
+        self.assertIn("https://ordinary.example/path", persisted)
+
     def test_redacts_backslash_escaped_and_encoded_assignments_in_prose(self):
         text = r'embedded {\"pass\u0077ord\":\"fixture-escaped-json-secret\"} safe-tail'
         for _ in range(2):
@@ -2213,6 +2232,72 @@ print(safe_string({payload!r}))
         report = json.loads(stdout)
         self.assertIn("without a usable cursor", report["capabilities"]["source_coverage"]["evidence"])
         self.assertEqual(report["acquisition_attempts"], 2)
+
+    def test_empty_comment_cursors_are_incomplete_at_all_levels(self):
+        bodies = (
+            ("empty_cursor", {"success": True, "comments": [], "more": {"has_more": True, "cursor": ""}}),
+            ("empty_next_cursor", {"success": True, "comments": [], "more": {"has_more": True, "next_cursor": ""}}),
+            ("nested", {
+                "success": True,
+                "comments": [{
+                    "id": "synthetic-comment",
+                    "body": "Synthetic comment",
+                    "replies": {
+                        "items": [],
+                        "more": {"has_more": True, "next_cursor": ""},
+                    },
+                }],
+                "more": {"has_more": False, "cursor": None},
+            }),
+        )
+        for label, body in bodies:
+            with self.subTest(level=label):
+                self.state_dir = self.root / f"state-empty-cursor-{label}"
+                self.recordings_dir = self.root / f"recordings-empty-cursor-{label}"
+                transport = FixtureTransport([
+                    response(200, fixture_body("feed-page-2.json")),
+                    response(200, body),
+                ])
+
+                code, stdout, stderr = self.run_cli(
+                    self.args("--max-feed-pages", "1", "--max-comment-pages", "2", "--max-posts", "1"),
+                    transport,
+                    FakeCredentials(),
+                )
+
+                self.assertEqual(code, 0, stderr)
+                report = json.loads(stdout)
+                incomplete = "without a usable cursor"
+                self.assertIn(incomplete, report["capabilities"]["source_coverage"]["evidence"])
+                self.assertEqual(report["counts"]["pending_cursors"], [])
+                self.assertEqual(len(transport.requests), 2)
+                saved_report = json.loads((self.recordings_dir / report["artifact"]).read_text())
+                self.assertIn(incomplete, saved_report["capabilities"]["source_coverage"]["evidence"])
+                self.assertEqual(saved_report["counts"]["pending_cursors"], [])
+
+    def test_empty_comment_cursor_uses_nonempty_alternate(self):
+        first = {
+            "success": True,
+            "comments": [],
+            "more": {"has_more": True, "cursor": "", "next_cursor": "usable-cursor"},
+        }
+        final = {"success": True, "comments": [], "more": {"has_more": False, "cursor": None}}
+        transport = FixtureTransport([
+            response(200, fixture_body("feed-page-2.json")),
+            response(200, first),
+            response(200, final),
+        ])
+
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-comment-pages", "2", "--max-posts", "1"),
+            transport,
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(len(transport.requests), 3)
+        comment_params = parse_qs(urlsplit(transport.requests[2][0]).query)
+        self.assertEqual(comment_params["cursor"], ["usable-cursor"])
 
     def test_malformed_comment_entries_and_nested_replies_fail_collection_and_replay(self):
         malformed_bodies = (

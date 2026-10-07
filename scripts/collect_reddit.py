@@ -291,6 +291,7 @@ def redact_assignments(value):
     value = decode_escaped_ascii(value)
     if value is None:
         return "[REDACTED]"
+    value = redact_quoted_url_userinfo(value, whole_url=True)
     parts = []
     offset = 0
     search_offset = 0
@@ -365,7 +366,7 @@ def redact_assignments(value):
     return "".join(parts)
 
 
-def redact_quoted_url_userinfo(value):
+def redact_quoted_url_userinfo(value, whole_url=False):
     parts = []
     offset = 0
     search_offset = 0
@@ -400,8 +401,15 @@ def redact_quoted_url_userinfo(value):
             if at is None:
                 parts.extend((value[offset:start], "[REDACTED]"))
                 return "".join(parts)
-            parts.extend((value[offset:start], value[start:scheme_end], "[REDACTED]@"))
-            offset = at + 1
+            if whole_url:
+                end = at + 1
+                while end < len(value) and not value[end].isspace() and value[end] not in '<>"\'':
+                    end += 1
+                parts.extend((value[offset:start], "[REDACTED_URL]"))
+                offset = end
+            else:
+                parts.extend((value[offset:start], value[start:scheme_end], "[REDACTED]@"))
+                offset = at + 1
             search_offset = offset
         else:
             if index >= len(value):
@@ -1093,13 +1101,21 @@ def post_time(post):
     return None
 
 
+def comment_cursor(more):
+    for key in ("cursor", "next_cursor"):
+        cursor = more.get(key)
+        if isinstance(cursor, str) and cursor:
+            return cursor
+    return None
+
+
 def cursors_in_comments(value):
     result = []
     if isinstance(value, dict):
         more = value.get("more")
         if isinstance(more, dict) and more.get("has_more") is True:
-            cursor = more.get("cursor") or more.get("next_cursor")
-            if isinstance(cursor, str) and cursor:
+            cursor = comment_cursor(more)
+            if cursor is not None:
                 result.append(cursor)
         for key, child in value.items():
             if key != "more":
@@ -1125,7 +1141,7 @@ def comment_pagination_incomplete(value):
     if isinstance(value, dict):
         more = value.get("more")
         if isinstance(more, dict) and more.get("has_more") is True:
-            if not isinstance(more.get("cursor") or more.get("next_cursor"), str):
+            if comment_cursor(more) is None:
                 return True
         return any(
             comment_pagination_incomplete(child)
