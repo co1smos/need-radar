@@ -341,6 +341,43 @@ if os.environ.get("NEED_RADAR_OFFLINE_TESTS") == "1":
         self.assertEqual(len(redacted_keys), 2)
         self.assertEqual(len(set(sanitized)), len(sanitized))
 
+    def test_mixed_encoded_text_and_authorization_are_redacted_before_persistence(self):
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        encoded_token = quote(quote("fixture-runtime-token", safe=""), safe="")
+        encoded_query_key = "https://fixture-user:fixture-password@example.com/?X-Amz-Credential=fixture-query-credential"
+        for _ in range(12):
+            encoded_query_key = quote(encoded_query_key, safe="")
+        post["text"] = (
+            "See https://ordinary.example/item and encoded=" + encoded_token
+            + "; Authorization: Bearer fixture-third-party-bearer"
+            + '; authorization = "Basic fixture-third-party-basic"'
+            + "\nPROXY-AUTHORIZATION:\tBasic fixture-proxy-bearer"
+            + "\nQuery-key https://outer.example/?" + encoded_query_key + "=value"
+        )
+        transport = FixtureTransport([response(200, page)])
+
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials("fixture-runtime-token"),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        persisted = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        for _ in range(collect_reddit.MAX_URL_DECODE_ROUNDS + 4):
+            persisted = unquote(persisted)
+        for secret in (
+            "fixture-runtime-token",
+            "fixture-third-party-bearer",
+            "fixture-third-party-basic",
+            "fixture-proxy-bearer",
+            "fixture-user",
+            "fixture-password",
+            "fixture-query-credential",
+        ):
+            self.assertNotIn(secret, persisted)
+
     def test_malformed_url_is_redacted_in_persisted_record(self):
         for value in (
             "https://fixture-user:fixture-password@example.com:bad/path?X-Amz-Credential=fixture-credential",
@@ -1167,6 +1204,74 @@ if os.environ.get("NEED_RADAR_OFFLINE_TESTS") == "1":
         self.assertEqual(code, 2)
         self.assertEqual(len(long_wait.requests), 1)
         self.assertIn("retry_after_exceeds_local_bound", stdout)
+
+    def test_overlong_retry_after_is_a_structured_failure(self):
+        self.assertEqual(collect_reddit.retry_delay("0" * 5000, 1, NOW), 0)
+        transport = FixtureTransport([
+            response(
+                503,
+                {"error": "synthetic busy"},
+                extra_headers={"Retry-After": "9" * 5000},
+            ),
+        ])
+
+        code, stdout, _ = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 2)
+        report = json.loads(stdout)
+        self.assertIn("retry_after_exceeds_local_bound", report["errors"])
+        records = [json.loads(path.read_text()) for path in self.recordings_dir.glob("record-*.json")]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["error"], "retry_after_exceeds_local_bound")
+
+    def test_oversized_json_integer_response_is_recorded_as_validation_failure(self):
+        body = json.dumps(fixture_body("feed-page-2.json")).encode("utf-8")
+        body = body[:-1] + b',"token":"fixture-response-token","oversized":' + b"9" * 5000 + b"}"
+        transport = FixtureTransport([response(200, body)])
+
+        code, stdout, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 2, stderr)
+        report = json.loads(stdout)
+        self.assertIn("feed_response_schema_invalid", report["errors"])
+        record = json.loads(next(self.recordings_dir.glob("record-*.json")).read_text())
+        self.assertIn("feed_response_schema_invalid", record["validation_errors"])
+        self.assertNotIn("fixture-response-token", json.dumps(record))
+        self.assertNotIn("9" * 5000, json.dumps(record))
+        state = json.loads((self.state_dir / "state.json").read_text())
+        self.assertIsNone(state["pending"])
+        self.assertEqual(state["successful_requests"], 1)
+        replay_code, replay_stdout, _ = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+        self.assertEqual(replay_code, 2)
+        replay = json.loads(replay_stdout)
+        self.assertIn("feed_response_schema_invalid", replay["errors"])
+
+    def test_oversized_json_integer_record_is_removed_without_aborting_cleanup(self):
+        directory = self.recordings_dir
+        directory.mkdir(mode=0o700)
+        malformed = directory / "record-malformed.json"
+        malformed.write_text('{"recorded_at":"2026-10-07T12:00:00Z","expires_at":"2026-10-14T12:00:00Z","retention_days":7,"oversized":' + "9" * 5000 + "}")
+        malformed.chmod(0o600)
+
+        code, stdout, _ = self.run_cli([
+            "replay", "--recordings-dir", str(directory),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(code, 2)
+        self.assertIn("no_unexpired_recordings_available", json.loads(stdout)["errors"])
+        self.assertFalse(malformed.exists())
 
     def test_success_ceiling_counts_successes_not_failed_attempts_across_runs(self):
         page = fixture_body("feed-page-1.json")

@@ -96,7 +96,10 @@ SENSITIVE_QUERY_KEYS = {
 }
 SENSITIVE_ASSIGNMENT = re.compile(
     r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]+|"
-    r"\b((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|key|secret|auth|client[_-]?secret|password|passwd|cookie|authorization|signature|sig)\b\s*[:=]\s*)[^\s,;&]+"
+    r"\b((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|key|secret|auth|client[_-]?secret|password|passwd|cookie|signature|sig)\b\s*[:=]\s*)[^\s,;&]+"
+)
+AUTHORIZATION_ASSIGNMENT = re.compile(
+    r'''(?i)(\b(?:proxy-)?authorization["']?\s*[:=]\s*["']?)[^"'\r\n,;&]+'''
 )
 EMBEDDED_URL = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
@@ -268,39 +271,50 @@ def atomic_json(path, value):
         os.close(directory_fd)
 
 
+def redact_assignments(value):
+    value = AUTHORIZATION_ASSIGNMENT.sub(lambda match: match.group(1) + "[REDACTED]", value)
+    return SENSITIVE_ASSIGNMENT.sub(
+        lambda match: (match.group(1) or match.group(2)) + "[REDACTED]", value
+    )
+
+
 def safe_string(value, secrets=(), _depth=0):
     if value is None:
         return None
+    if _depth > MAX_NESTED_URLS:
+        return "[REDACTED]"
     text = str(value)
     for secret in secrets:
         if secret:
             text = text.replace(secret, "[REDACTED]")
-    if not EMBEDDED_URL.search(text):
-        decoded = decode_url_component(text)
-        if decoded is None:
-            return "[REDACTED]"
-        if decoded != text:
-            decoded_safe = safe_text(decoded, secrets)
-            if decoded_safe != decoded or EMBEDDED_URL.search(decoded):
-                text = decoded_safe
-    text = SENSITIVE_ASSIGNMENT.sub(
-        lambda match: (match.group(1) or match.group(2)) + "[REDACTED]", text
-    )
-    return EMBEDDED_URL.sub(
-        lambda match: safe_url(match.group(0), secrets, _depth + 1), text
-    )
+    parts = []
+    offset = 0
+    for match in EMBEDDED_URL.finditer(text):
+        parts.append(safe_text(text[offset:match.start()], secrets, _depth + 1))
+        parts.append(safe_url(match.group(0), secrets, _depth + 1))
+        offset = match.end()
+    parts.append(safe_text(text[offset:], secrets, _depth + 1))
+    return "".join(part or "" for part in parts)
 
 
-def safe_text(value, secrets=()):
+def safe_text(value, secrets=(), _depth=0):
     if value is None:
         return None
+    if _depth > MAX_NESTED_URLS:
+        return "[REDACTED]"
     text = str(value)
     for secret in secrets:
         if secret:
             text = text.replace(secret, "[REDACTED]")
-    return SENSITIVE_ASSIGNMENT.sub(
-        lambda match: (match.group(1) or match.group(2)) + "[REDACTED]", text
-    )
+    decoded = decode_url_component(text)
+    if decoded is None:
+        return "[REDACTED]"
+    for secret in secrets:
+        if secret:
+            decoded = decoded.replace(secret, "[REDACTED]")
+    if EMBEDDED_URL.search(decoded):
+        return safe_string(decoded, secrets, _depth + 1)
+    return redact_assignments(decoded)
 
 
 def decode_url_component(value):
@@ -405,6 +419,8 @@ def sanitize(value, secrets=(), key=""):
             nested = json.loads(value)
         except json.JSONDecodeError:
             nested = None
+        except ValueError:
+            return "[REDACTED_INVALID_JSON]"
         if isinstance(nested, (dict, list)):
             return json.dumps(
                 sanitize(nested, secrets),
@@ -419,10 +435,19 @@ def sanitize(value, secrets=(), key=""):
 
 
 def sanitize_body(body, secrets=()):
+    text = body.decode("utf-8", errors="replace")
     try:
-        value = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return safe_string(body.decode("utf-8", errors="replace"), secrets)
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        return safe_string(text, secrets)
+    except ValueError:
+        try:
+            value = json.loads(text, parse_int=str)
+        except (json.JSONDecodeError, ValueError):
+            return "[REDACTED_INVALID_JSON]"
+        return json.dumps(
+            sanitize(value, secrets), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
     return sanitize(value, secrets)
 
 
@@ -540,7 +565,7 @@ def load_approval(path):
     try:
         with path.open(encoding="utf-8") as source:
             return json.load(source)
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except (OSError, UnicodeError, ValueError):
         raise CollectorError("approval_manifest_unreadable", "blocked") from None
 
 
@@ -611,7 +636,7 @@ def load_state(path):
     try:
         with path.open(encoding="utf-8") as source:
             state = json.load(source)
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except (OSError, UnicodeError, ValueError):
         raise CollectorError("budget_state_unreadable", "blocked") from None
     required = default_state()
     if not isinstance(state, dict) or any(key not in state for key in required if key != "incident_hold"):
@@ -713,7 +738,13 @@ def retry_delay(value, fallback, now):
         return fallback
     text = str(value).strip()
     if re.fullmatch(r"[0-9]+", text):
-        delay = int(text)
+        normalized = text.lstrip("0") or "0"
+        maximum = str(MAX_RETRY_DELAY_SECONDS)
+        if len(normalized) > len(maximum) or (
+            len(normalized) == len(maximum) and normalized > maximum
+        ):
+            raise CollectorError("retry_after_exceeds_local_bound", "failed")
+        delay = int(normalized)
     else:
         try:
             retry_at = email.utils.parsedate_to_datetime(text)
@@ -1043,7 +1074,7 @@ def expire_recordings(recordings_dir, now):
         try:
             with path.open(encoding="utf-8") as source:
                 record = json.load(source)
-        except (OSError, UnicodeError, json.JSONDecodeError):
+        except (OSError, UnicodeError, ValueError):
             record = {}
         expires = record_expiry(record)
         if expires is None or expires <= now:
@@ -1263,7 +1294,7 @@ class Collector:
         try:
             with path.open(encoding="utf-8") as source:
                 record = json.load(source)
-        except (OSError, UnicodeError, json.JSONDecodeError):
+        except (OSError, UnicodeError, ValueError):
             raise CollectorError("record_validation_persistence_failed", "blocked") from None
         errors = record.setdefault("validation_errors", [])
         if not isinstance(errors, list):
@@ -1288,7 +1319,7 @@ class Collector:
                 record["billing"]["charge_status"] = "unknown"
                 record["response"]["headers"].pop("x-treg-cost-micro", None)
             atomic_json(path, record)
-        except (OSError, UnicodeError, json.JSONDecodeError, CollectorError):
+        except (OSError, UnicodeError, ValueError, CollectorError):
             raise CollectorError("record_error_persistence_failed", "blocked") from None
 
     def fail_record(self, code, status="failed"):
