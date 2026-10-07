@@ -451,6 +451,45 @@ if os.environ.get("NEED_RADAR_OFFLINE_TESTS") == "1":
         ):
             self.assertNotIn(secret, persisted)
 
+    def test_redacts_escaped_multiline_and_quoted_url_credentials_before_persistence(self):
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["text"] = "\n".join((
+            'quoted JSON {"password": "fixture-escaped-secret\\" fixture-escaped-suffix"}',
+            'password="first line\nfixture-multiline-password"',
+            'See https://example.org/?X-Amz-Credential="fixture-url-secret"',
+            'Malformed https://fixture-malformed-user:fixture-malformed-password@example.org:bad/path?X-Amz-Credential="fixture-malformed-url-secret"',
+        ))
+        transport = FixtureTransport([response(200, page)])
+
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        persisted = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        for _ in range(collect_reddit.MAX_URL_DECODE_ROUNDS + 2):
+            persisted = unquote(persisted)
+        leaked = [secret for secret in (
+            "fixture-escaped-secret",
+            "fixture-escaped-suffix",
+            "fixture-multiline-password",
+            "fixture-url-secret",
+            "fixture-malformed-user",
+            "fixture-malformed-password",
+            "fixture-malformed-url-secret",
+        ) if secret in persisted]
+        self.assertEqual(leaked, [])
+
+        replay_code, replay_stdout, replay_stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+        self.assertEqual(replay_code, 0, replay_stderr)
+        self.assertNotIn("fixture-", replay_stdout)
+
     def test_malformed_url_is_redacted_in_persisted_record(self):
         for value in (
             "https://fixture-user:fixture-password@example.com:bad/path?X-Amz-Credential=fixture-credential",

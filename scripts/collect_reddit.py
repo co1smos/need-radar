@@ -98,14 +98,20 @@ SENSITIVE_QUERY_KEYS = {
 }
 SENSITIVE_ASSIGNMENT = re.compile(
     r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]+|"
-    r"\b((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|key|secret|auth|client[_-]?secret|password|passwd|cookie|signature|sig)\b\s*[:=]\s*)[^\s,;&]+"
+    r"\b((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|key|secret|auth|client[_-]?secret|password|passwd|cookie|credential|signature|sig)\b\s*[:=]\s*)[^\s,;&]+"
 )
 AUTHORIZATION_ASSIGNMENT = re.compile(
     r'''(?im)(\b(?:proxy-)?authorization["']?\s*[:=]\s*)[^\r\n]*'''
 )
 COOKIE_ASSIGNMENT = re.compile(r'''(?im)(\bcookie["']?\s*[:=]\s*)[^\r\n]*''')
 QUOTED_SENSITIVE_ASSIGNMENT = re.compile(
-    r'''(?i)(["']?\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|key|secret|auth|client[_-]?secret|password|passwd|cookie|signature|sig)\b["']?\s*[:=]\s*)(["'])(.*?)\2'''
+    r'''(?P<prefix>["']?\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|key|secret|auth|client[_-]?secret|password|passwd|cookie|credential|signature|sig)\b["']?\s*[:=]\s*)
+    (?:
+        (?P<quote>["'])(?:\\.|(?! (?P=quote))[\s\S])*?(?P=quote)
+        |
+        (?P<unclosed_quote>["'])(?:\\.|(?! (?P=unclosed_quote))[\s\S])*\Z
+    )''',
+    re.IGNORECASE | re.DOTALL | re.VERBOSE,
 )
 EMBEDDED_URL = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
@@ -280,10 +286,12 @@ def atomic_json(path, value):
 def redact_assignments(value):
     value = AUTHORIZATION_ASSIGNMENT.sub(lambda match: match.group(1) + "[REDACTED]", value)
     value = COOKIE_ASSIGNMENT.sub(lambda match: match.group(1) + "[REDACTED]", value)
-    value = QUOTED_SENSITIVE_ASSIGNMENT.sub(
-        lambda match: match.group(1) + match.group(2) + "[REDACTED]" + match.group(2),
-        value,
-    )
+
+    def redact_quoted(match):
+        quote = match.group("quote") or match.group("unclosed_quote")
+        return match.group("prefix") + quote + "[REDACTED]" + (quote if match.group("quote") else "")
+
+    value = QUOTED_SENSITIVE_ASSIGNMENT.sub(redact_quoted, value)
     return SENSITIVE_ASSIGNMENT.sub(
         lambda match: (match.group(1) or match.group(2)) + "[REDACTED]", value
     )
