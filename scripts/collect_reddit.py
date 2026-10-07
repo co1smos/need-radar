@@ -107,10 +107,11 @@ SENSITIVE_ASSIGNMENT_PREFIX = re.compile(
         x-amz-(?:credential|security-token|signature)|
         x-goog-(?:credential|signature)|x-treg-token
     )
-    ["']?\s*[:=]\s*
+    (?:\\?["'])?\s*(?:\\?[:=])\s*
     '''
 )
 EMBEDDED_URL = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
+URL_SCHEME = re.compile(r"https?://", re.IGNORECASE)
 
 
 class CollectorError(Exception):
@@ -293,14 +294,28 @@ def redact_assignments(value):
         parts.append(value[offset:match.end()])
         label = (match.group("label") or "").lower()
         start = match.end()
-        if start < len(value) and value[start] in "\"'":
-            quote = value[start]
+        unterminated_quote = False
+        quote_start = start + 1 if value.startswith((r'\"', r"\'"), start) else start
+        if quote_start < len(value) and value[quote_start] in "\"'":
+            quote = value[quote_start]
+            escaped_quote = quote_start != start
             line_end = value.find("\n", start + 1)
             limit = len(value) if line_end < 0 else line_end
-            end = start + 1
+            end = quote_start + 1
             while end < limit:
                 if value[end] == "\\":
-                    end += 2
+                    escape_start = end
+                    while end < limit and value[end] == "\\":
+                        end += 1
+                    slash_count = end - escape_start
+                    if end < limit and value[end] == quote:
+                        if (
+                            escaped_quote and slash_count == 1
+                            or not escaped_quote and slash_count % 2 == 0
+                        ):
+                            end += 1
+                            break
+                        end += 1
                 elif value[end] == quote:
                     end += 1
                     break
@@ -308,9 +323,7 @@ def redact_assignments(value):
                     end += 1
             else:
                 end = len(value)
-            if label in {"authorization", "proxy-authorization", "cookie"} and end < len(value):
-                line_end = value.find("\n", end)
-                end = len(value) if line_end < 0 else line_end
+                unterminated_quote = True
         elif label in {"authorization", "proxy-authorization", "cookie"}:
             line_end = value.find("\n", start)
             end = len(value) if line_end < 0 else line_end
@@ -318,8 +331,65 @@ def redact_assignments(value):
             end = start
             while end < len(value) and value[end] not in "\r\n ,;&<>":
                 end += 1
+        if label in {"authorization", "proxy-authorization", "cookie"} and not unterminated_quote:
+            line_end = value.find("\n", start)
+            end = len(value) if line_end < 0 else line_end
+            while end < len(value):
+                next_line = end + 1
+                if next_line >= len(value) or value[next_line] not in " \t":
+                    break
+                line_end = value.find("\n", next_line)
+                end = len(value) if line_end < 0 else line_end
         parts.append("[REDACTED]")
         offset = end
+    parts.append(value[offset:])
+    return "".join(parts)
+
+
+def redact_quoted_url_userinfo(value):
+    parts = []
+    offset = 0
+    search_offset = 0
+    while match := URL_SCHEME.search(value, search_offset):
+        start = match.start()
+        scheme_end = match.end()
+        quote = None
+        escaped = False
+        quoted_space = False
+        at = None
+        index = scheme_end
+        while index < len(value):
+            character = value[index]
+            if quote:
+                if character.isspace():
+                    quoted_space = True
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+            elif character in "\"'":
+                quote = character
+            elif character == "@":
+                at = index
+                break
+            elif character in "/?#\r\n\t <>" or character.isspace():
+                break
+            index += 1
+        if quoted_space:
+            if at is None:
+                parts.extend((value[offset:start], "[REDACTED]"))
+                return "".join(parts)
+            parts.extend((value[offset:start], value[start:scheme_end], "[REDACTED]@"))
+            offset = at + 1
+            search_offset = offset
+        else:
+            if index >= len(value):
+                break
+            search_offset = index + 1
+    if not parts:
+        return value
     parts.append(value[offset:])
     return "".join(parts)
 
@@ -350,6 +420,7 @@ def safe_string(value, secrets=(), _depth=0):
         if secret:
             text = text.replace(secret, "[REDACTED]")
     text = redact_assignments(text)
+    text = redact_quoted_url_userinfo(text)
     parts = []
     offset = 0
     for match in EMBEDDED_URL.finditer(text):
@@ -1090,9 +1161,12 @@ def valid_recording_envelope(record, filename):
         and record["request"].get("method") == "GET"
         and evidence_present(record["request"].get("url"))
         and isinstance(record["request"].get("parameters"), dict)
+        and type(record["request"].get("request_max_cost_micro_usd")) is int
+        and 0 < record["request"]["request_max_cost_micro_usd"] <= route["max_charge_micro_usd"]
         and isinstance(record.get("response"), dict)
         and type(record["response"].get("truncated")) is bool
         and isinstance(record["response"].get("headers"), dict)
+        and type(record.get("processing_complete")) is bool
         and isinstance(record.get("billing"), dict)
         and isinstance(record.get("counts"), dict)
         and (
@@ -1378,6 +1452,7 @@ class Collector:
                 "body": body,
                 "truncated": response.truncated if response else False,
             },
+            "processing_complete": error is not None,
             "billing": {
                 "call_id": safe_string(call_id, [self.credentials.token]) if call_id else None,
                 "charged_micro_usd": str(charged_micro_usd) if charged_micro_usd is not None else None,
@@ -1410,6 +1485,7 @@ class Collector:
             raise CollectorError("record_validation_persistence_failed", "blocked")
         if code not in errors:
             errors.append(code)
+        record["processing_complete"] = True
         try:
             atomic_json(path, record)
         except (OSError, CollectorError):
@@ -1423,6 +1499,7 @@ class Collector:
             with path.open(encoding="utf-8") as source:
                 record = json.load(source)
             record["error"] = code
+            record["processing_complete"] = True
             if code == "billing_amount_unknown_reconciliation_required":
                 record["billing"]["charged_micro_usd"] = None
                 record["billing"]["charge_status"] = "unknown"
@@ -1430,6 +1507,18 @@ class Collector:
             atomic_json(path, record)
         except (OSError, UnicodeError, ValueError, CollectorError):
             raise CollectorError("record_error_persistence_failed", "blocked") from None
+
+    def mark_record_processing_complete(self):
+        if not self.counts["record_ids"]:
+            return
+        path = self.recordings_dir / self.counts["record_ids"][-1]
+        try:
+            with path.open(encoding="utf-8") as source:
+                record = json.load(source)
+            record["processing_complete"] = True
+            atomic_json(path, record)
+        except (OSError, UnicodeError, ValueError, CollectorError):
+            raise CollectorError("record_processing_persistence_failed", "blocked") from None
 
     def fail_record(self, code, status="failed"):
         self.annotate_record_error(code)
@@ -1622,6 +1711,7 @@ class Collector:
                     self.coverage_reasons.append("feed post contains an invalid numeric timestamp")
                     self.annotate_record_validation("feed_response_payload_invalid")
                     raise CollectorError("feed_response_payload_invalid", "failed") from None
+                self.mark_record_processing_complete()
                 self.feed_ok = True
                 self.counts["feed_pages"] += 1
                 self.counts["posts_seen"] += len(posts)
@@ -1698,6 +1788,7 @@ class Collector:
                     self.counts["errors"].append("comment_response_schema_invalid")
                     self.annotate_record_validation("comment_response_schema_invalid")
                     raise CollectorError("comment_response_schema_invalid", "failed") from None
+                self.mark_record_processing_complete()
                 self.counts["comment_pages"] += 1
                 self.counts["comments_seen"] += len(comments)
                 comment_cursors = (
@@ -1964,6 +2055,7 @@ def run_replay(args, clock):
         feed_validation_failures = 0
         comment_validation_failures = 0
         billing_unknown_record_ids = []
+        billing_ceiling_breach_record_ids = []
         for record in records:
             endpoint = record["endpoint"]
             if endpoint == FEED_ID:
@@ -1979,15 +2071,26 @@ def run_replay(args, clock):
                 else:
                     comment_validation_failures += len(recorded_errors)
             recorded_error = record.get("error")
+            processing_incomplete = record["processing_complete"] is not True
+            if processing_incomplete:
+                replay_counts["validation_failures"] += 1
+                if endpoint == FEED_ID:
+                    feed_validation_failures += 1
+                else:
+                    comment_validation_failures += 1
+                replay_errors.append("acquisition_processing_incomplete")
             response = record["response"]
             truncated = response["truncated"]
             billing = record["billing"]
             charged = billing.get("charged_micro_usd")
-            charge_known = isinstance(charged, str) and re.fullmatch(r"[0-9]+", charged.strip())
+            charged_amount = billing_cost(charged)
+            charge_known = charged_amount is not None
+            charge_exceeds_ceiling = charge_known and charged_amount > record["request"]["request_max_cost_micro_usd"]
             billing_reference_known = evidence_present(billing.get("call_id"))
             billing_unknown = (
                 not charge_known
                 or not billing_reference_known
+                or processing_incomplete
                 or recorded_error in {
                     "billing_amount_unknown_reconciliation_required",
                     "billing_call_id_missing_reconciliation_required",
@@ -2009,8 +2112,21 @@ def run_replay(args, clock):
                     "billing_call_id_missing_reconciliation_required",
                 }:
                     replay_errors.append("billing_evidence_incomplete_reconciliation_required")
+            if charge_exceeds_ceiling:
+                replay_counts["validation_failures"] += 1
+                replay_counts["request_failures"] += 1
+                if endpoint == FEED_ID:
+                    feed_validation_failures += 1
+                else:
+                    comment_validation_failures += 1
+                billing_ceiling_breach_record_ids.append(record["record_id"])
+                replay_errors.append("recorded_charge_exceeds_request_ceiling")
             if recorded_error is not None:
-                if recorded_error != "response_exceeded_recording_size_limit" and not billing_unknown:
+                if (
+                    recorded_error != "response_exceeded_recording_size_limit"
+                    and not billing_unknown
+                    and not charge_exceeds_ceiling
+                ):
                     replay_counts["request_failures"] += 1
                 if recorded_error == "billing_amount_unknown_reconciliation_required":
                     if not billing_unknown:
@@ -2019,7 +2135,14 @@ def run_replay(args, clock):
                     replay_errors.append(recorded_error)
                 else:
                     replay_errors.append("recorded_request_failed")
-            if recorded_errors or truncated or billing_unknown or recorded_error is not None:
+            if (
+                recorded_errors
+                or truncated
+                or billing_unknown
+                or charge_exceeds_ceiling
+                or processing_incomplete
+                or recorded_error is not None
+            ):
                 continue
             status_code = response.get("http_status")
             body = response.get("body")
@@ -2097,11 +2220,12 @@ def run_replay(args, clock):
                 "replay": {"status": "failed" if status == "failed" else "supported", "evidence": "no valid recorded pages" if status == "failed" else "read only from unexpired private recordings; no acquisition transport"},
                 "feed_schema": {"status": feed_status, "evidence": "replayed stored feed bodies" if replay_counts["feed_pages"] else "no valid recorded feed body"},
                 "comment_schema": {"status": comment_status, "evidence": "replayed stored comment bodies" if replay_counts["comment_pages"] else "no valid recorded comment body"},
-                "billing_evidence": {"status": "blocked" if replay_counts["billing_unknown_requests"] else "partial", "evidence": "one or more recordings lack a verified charge or call reference" if replay_counts["billing_unknown_requests"] else "provider-reported charge evidence only; no independent billing reconciliation"},
+                "billing_evidence": {"status": "blocked" if replay_counts["billing_unknown_requests"] or billing_ceiling_breach_record_ids else "partial", "evidence": "one or more recordings exceed their reserved request ceiling" if billing_ceiling_breach_record_ids else "one or more recordings lack completed accounting, a verified charge, or a call reference" if replay_counts["billing_unknown_requests"] else "provider-reported charge evidence only; no independent billing reconciliation"},
                 "source_coverage": {"status": "partial", "evidence": "recorded responses alone do not establish source completeness"},
             },
             "record_ids": [record["record_id"] for record in records],
             "billing_unknown_record_ids": billing_unknown_record_ids,
+            "billing_ceiling_breach_record_ids": billing_ceiling_breach_record_ids,
         }
         report_path = recordings_dir / ("replay-" + uuid.uuid4().hex + ".json")
         now = clock()

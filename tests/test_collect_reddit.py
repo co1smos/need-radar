@@ -237,6 +237,27 @@ class CollectRedditCliTests(unittest.TestCase):
             )
         return result, stdout.getvalue(), stderr.getvalue()
 
+    def collect_text_recording(self, text):
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["text"] = text
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            FixtureTransport([response(200, page)]),
+            FakeCredentials(),
+        )
+        self.assertEqual(code, 0, stderr)
+        records = [
+            json.loads(path.read_text())
+            for path in self.recordings_dir.glob("record-*.json")
+        ]
+        self.assertTrue(records)
+        self.assertTrue(all(record["processing_complete"] for record in records))
+        persisted = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        for _ in range(collect_reddit.MAX_URL_DECODE_ROUNDS + 4):
+            persisted = unquote(persisted)
+        return persisted
+
     def test_public_cli_displays_help(self):
         scratch = pathlib.Path(os.environ.get("TMPDIR", tempfile.gettempdir()))
         sitecustomize = f"""import os, pathlib, sys
@@ -450,6 +471,109 @@ print(safe_string({payload!r}))
             "fixture-encoded-cookie-after-url",
         ):
             self.assertNotIn(secret, persisted)
+
+    def test_redacts_backslash_escaped_and_encoded_assignments_in_prose(self):
+        text = r'embedded {\"pass\u0077ord\":\"fixture-escaped-json-secret\"} safe-tail'
+        for _ in range(2):
+            text = quote(text, safe="")
+
+        persisted = self.collect_text_recording(text)
+
+        self.assertNotIn("fixture-escaped-json-secret", persisted)
+        self.assertIn("safe-tail", persisted)
+
+    def test_redacts_folded_authorization_header_continuations(self):
+        persisted = self.collect_text_recording(
+            "Authorization: Bearer fixture-header-first-secret\r\n"
+            "\tfixture-header-folded-secret\r\n"
+            "Cookie: session=fixture-cookie-first-secret\r\n"
+            "\tfixture-cookie-folded-secret\r\npublic-header-tail"
+        )
+
+        self.assertNotIn("fixture-header-first-secret", persisted)
+        self.assertNotIn("fixture-header-folded-secret", persisted)
+        self.assertNotIn("fixture-cookie-first-secret", persisted)
+        self.assertNotIn("fixture-cookie-folded-secret", persisted)
+        self.assertIn("public-header-tail", persisted)
+
+    def test_redacts_whitespace_containing_quoted_url_userinfo(self):
+        persisted = "\n".join((
+            self.collect_text_recording(
+                'Source https://fixture-user:"first fixture-userinfo-suffix"'
+                '@example.org/path?X-Amz-Credential=fixture-url-query-secret'
+            ),
+            self.collect_text_recording(
+                'Malformed https://fixture-user:"first fixture-unclosed-userinfo-secret'
+                '@example.org/path'
+            ),
+            self.collect_text_recording(
+                r'Escaped https://fixture-user:\"first fixture-escaped-userinfo-secret\"'
+                '@example.org/path'
+            ),
+        ))
+
+        for secret in (
+            "fixture-user",
+            "first",
+            "fixture-userinfo-suffix",
+            "fixture-url-query-secret",
+            "fixture-unclosed-userinfo-secret",
+            "fixture-escaped-userinfo-secret",
+        ):
+            self.assertNotIn(secret, persisted)
+
+    def test_replay_rejects_recording_interrupted_before_settlement(self):
+        transport = FixtureTransport([
+            response(200, fixture_body("feed-page-2.json"), cost=1500)
+        ])
+        with patch.object(collect_reddit.Collector, "settle", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_cli(
+                    self.args("--max-feed-pages", "1", "--max-posts", "0"),
+                    transport,
+                    FakeCredentials(),
+                )
+
+        source = next(self.recordings_dir.glob("record-*.json"))
+        self.assertFalse(json.loads(source.read_text())["processing_complete"])
+
+        code, stdout, _ = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir), "--state-dir", str(self.state_dir)
+        ])
+
+        self.assertEqual(code, 2)
+        report = json.loads(stdout)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["counts"]["feed_pages"], 0)
+        self.assertIn("acquisition_processing_incomplete", report["errors"])
+        self.assertIn("recorded_charge_exceeds_request_ceiling", report["errors"])
+        self.assertEqual(report["capabilities"]["billing_evidence"]["status"], "blocked")
+
+    def test_replay_rejects_recorded_charge_above_request_ceiling(self):
+        transport = FixtureTransport([
+            response(200, fixture_body("feed-page-2.json"), cost=1500)
+        ])
+        code, _, _ = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials(),
+        )
+        self.assertEqual(code, 2)
+        source = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(source.read_text())
+        record["error"] = None
+        source.write_text(json.dumps(record))
+        source.chmod(0o600)
+
+        code, stdout, _ = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir), "--state-dir", str(self.state_dir)
+        ])
+
+        self.assertEqual(code, 2)
+        report = json.loads(stdout)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["counts"]["feed_pages"], 0)
+        self.assertIn("recorded_charge_exceeds_request_ceiling", report["errors"])
 
     def test_redacts_quoted_cookie_and_encoded_secrets_from_persisted_text(self):
         page = fixture_body("feed-page-1.json")
