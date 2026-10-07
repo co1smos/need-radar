@@ -286,6 +286,100 @@ class OfflineServeDemoTests(unittest.TestCase):
                     self.assertNotIn(b"SYNTHETIC_QUOTED_BEARER_SECRET_98765", content, artifact.name)
                     self.assertNotIn(b"SYNTHETIC_QUOTED_SECRET_98765", content, artifact.name)
 
+    def test_redacts_cookie_headers_and_credentials_in_embedded_json(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture = json.loads((ROOT / "fixtures" / "synthetic_demo.json").read_text())
+            fixture["items"][0]["text"] += (
+                '\nCookie: session=SYNTHETIC_COOKIE_98765; theme=dark'
+                '\nEmbedded JSON: {"password": "SYNTHETIC_JSON_PASSWORD_98765", '
+                '"cookie": "SYNTHETIC_JSON_COOKIE_98765", '
+                '"authorization": "Bearer SYNTHETIC_JSON_AUTH_98765"}'
+            )
+            result, output = self.invoke_fixture(temporary_directory, fixture)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for artifact in output.iterdir():
+                if artifact.is_file():
+                    content = artifact.read_bytes()
+                    self.assertNotIn(b"SYNTHETIC_COOKIE_98765", content, artifact.name)
+                    self.assertNotIn(b"SYNTHETIC_JSON_PASSWORD_98765", content, artifact.name)
+                    self.assertNotIn(b"SYNTHETIC_JSON_COOKIE_98765", content, artifact.name)
+                    self.assertNotIn(b"SYNTHETIC_JSON_AUTH_98765", content, artifact.name)
+
+    def test_distinct_redacted_secret_values_cannot_validate_a_citation(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture = json.loads((ROOT / "fixtures" / "synthetic_demo.json").read_text())
+            fixture["items"][0]["text"] = "password=ACTUAL_SYNTHETIC_SECRET"
+            fixture["model"] = {
+                "status": "synthetic_response",
+                "response": [{
+                    "title": "Synthetic unsupported finding",
+                    "friction": "Synthetic unsupported friction",
+                    "evidence": [{
+                        "item_id": fixture["items"][0]["id"],
+                        "excerpt": "password=INVENTED_SYNTHETIC_SECRET",
+                    }],
+                }],
+            }
+            result, output = self.invoke_fixture(temporary_directory, fixture)
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("status=invalid_output", result.stdout)
+            candidates = json.loads((output / "candidates.json").read_text())
+            self.assertEqual(candidates["status"], "invalid_output")
+            self.assertEqual(candidates["candidates"], [])
+            for artifact in output.iterdir():
+                if artifact.is_file():
+                    content = artifact.read_bytes()
+                    self.assertNotIn(b"ACTUAL_SYNTHETIC_SECRET", content, artifact.name)
+                    self.assertNotIn(b"INVENTED_SYNTHETIC_SECRET", content, artifact.name)
+
+    def test_malformed_json_persists_sanitized_failure_lineage(self):
+        invalid_inputs = (
+            b'{"password":"SYNTHETIC_MALFORMED_SECRET_98765","items":',
+            b'{"password":"SYNTHETIC_DECODE_SECRET_98765",\xff',
+        )
+        for invalid_input in invalid_inputs:
+            with self.subTest(invalid_input=invalid_input), tempfile.TemporaryDirectory() as temporary_directory:
+                fixture_path = Path(temporary_directory) / "fixture.json"
+                output = Path(temporary_directory) / "run"
+                fixture_path.write_bytes(invalid_input)
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "need_radar",
+                        "--fixture",
+                        str(fixture_path),
+                        "--output",
+                        str(output),
+                    ],
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("status=invalid_input", result.stdout)
+                validation_path = output / "validation.json"
+                validation_bytes = validation_path.read_bytes()
+                validation = json.loads(validation_bytes)
+                self.assertEqual(validation["status"], "invalid_input")
+                self.assertTrue(validation["errors"])
+                self.assertNotIn(b"SYNTHETIC_MALFORMED_SECRET_98765", validation_bytes)
+                self.assertNotIn(b"SYNTHETIC_DECODE_SECRET_98765", validation_bytes)
+                for artifact in output.iterdir():
+                    if artifact.is_file():
+                        content = artifact.read_bytes()
+                        self.assertNotIn(b"SYNTHETIC_MALFORMED_SECRET_98765", content, artifact.name)
+                        self.assertNotIn(b"SYNTHETIC_DECODE_SECRET_98765", content, artifact.name)
+                with sqlite3.connect(output / "lineage.sqlite3") as database:
+                    stage = database.execute(
+                        "SELECT stage, status, artifact_path, output_sha256 FROM stages"
+                    ).fetchone()
+                self.assertEqual(stage[:3], ("fixture_validation", "invalid_input", "validation.json"))
+                self.assertEqual(hashlib.sha256(validation_bytes).hexdigest(), stage[3])
+
     def test_prompt_evidence_matches_the_redacted_frozen_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             output = Path(temporary_directory) / "run"

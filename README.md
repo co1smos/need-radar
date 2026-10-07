@@ -65,6 +65,8 @@ CLI 输出 `status=success`，并在目录中保存有序 `snapshot.json`、解�
 
 `report.md` 是规范报告，并明确标注合成/离线状态与验证边界：引用校验只确认摘录是保留文本的精确子串，不判断语义支持。Fixture 在任何产物写入前先做秘密值脱敏；不合规输入会退出失败，只写 `validation.json` 和对应 lineage，不会生成成功 snapshot。
 
+脱敏覆盖敏感字段名、常见 token 形式以及 `Authorization`、`Cookie` 等凭证文本，是尽力而为而非通用秘密检测；未知格式仍可能漏过，因此不要提供真实凭证。无法解析的 JSON 也会保存不含原始输入的 `invalid_input` 记录及 lineage。
+
 已运行的离线检查命令：
 
 ```sh

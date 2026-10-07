@@ -13,8 +13,9 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_FIXTURE = ROOT / "fixtures" / "synthetic_demo.json"
 SECRET_PATTERNS = (
     re.compile(r"\b(?:sk-[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b"),
-    re.compile(r'''(?i)\b(api[_-]?key|token|secret|password)(\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;"'}]+)'''),
-    re.compile(r'''(?i)\b(authorization\s*[:=]\s*(?:bearer|basic)\s+|bearer\s+)(?:"[^"]*"|'[^']*'|[^\s,;"']+)'''),
+    re.compile(r"(?im)\b(cookie|set-cookie)\s*:\s*[^\r\n]*"),
+    re.compile(r'''(?i)(?P<prefix>\bauthorization\s*[:=]\s*(?:bearer|basic)\s+|\bbearer\s+)(?:(?P<quote>["'])(?P<quoted>(?:\\.|(?!(?P=quote)).)*)(?P=quote)|(?P<bare>[^\s,;"'}]+))'''),
+    re.compile(r'''(?i)(?<![\w])(?P<prefix>["']?(?:api[_-]?key|access[_-]?token|private[_-]?key|token|secret|password|passwd|credential|authorization|auth|cookie|set[_-]?cookie)["']?\s*[:=]\s*)(?:(?P<quote>["'])(?P<quoted>(?:\\.|(?!(?P=quote)).)*)(?P=quote)|(?P<bare>[^\s,;}\]"']+))'''),
 )
 SECRET_FIELD = re.compile(r"(?i)(?:^|[_-])(?:api[_-]?key|access[_-]?token|private[_-]?key|key|token|secret|password|passwd|authorization|auth|cookie|credential)(?:$|[_-])")
 
@@ -22,8 +23,16 @@ SECRET_FIELD = re.compile(r"(?i)(?:^|[_-])(?:api[_-]?key|access[_-]?token|privat
 def redact(value):
     if isinstance(value, str):
         value = SECRET_PATTERNS[0].sub("[REDACTED]", value)
-        value = SECRET_PATTERNS[1].sub(r"\1\2[REDACTED]", value)
-        return SECRET_PATTERNS[2].sub(r"\1[REDACTED]", value)
+        value = SECRET_PATTERNS[1].sub(lambda match: f"{match.group(1)}: [REDACTED]", value)
+        for pattern in SECRET_PATTERNS[2:]:
+            value = pattern.sub(
+                lambda match: match.group("prefix")
+                + (match.group("quote") or "")
+                + "[REDACTED]"
+                + (match.group("quote") or ""),
+                value,
+            )
+        return value
     if isinstance(value, list):
         return [redact(item) for item in value]
     if isinstance(value, dict):
@@ -214,13 +223,29 @@ def fixture_errors(fixture):
 def run(fixture_path, output):
     if output.exists() and any(output.iterdir()):
         raise ValueError(f"output directory is not empty: {output}")
-    fixture = redact(json.loads(fixture_path.read_text(encoding="utf-8")))
     output.mkdir(parents=True, exist_ok=True)
     run_id = uuid.uuid4().hex
     with sqlite3.connect(output / "lineage.sqlite3") as database:
         database.execute(
             "CREATE TABLE stages (sequence INTEGER, run_id TEXT, stage TEXT, status TEXT, input_stage TEXT, input_sha256 TEXT, artifact_path TEXT, output_sha256 TEXT, details TEXT, PRIMARY KEY (run_id, stage))"
         )
+        try:
+            raw_fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            message = "fixture is not valid UTF-8 JSON"
+            write_stage(
+                output,
+                database,
+                run_id,
+                1,
+                "fixture_validation",
+                "invalid_input",
+                Path("validation.json"),
+                {"status": "invalid_input", "errors": [message]},
+                details={"error_count": 1},
+            )
+            return "invalid_input"
+        fixture = redact(raw_fixture)
         errors = fixture_errors(fixture)
         if errors:
             write_stage(
@@ -260,6 +285,7 @@ def run(fixture_path, output):
             prompt["config"],
         )
 
+        raw_model = raw_fixture["model"]
         model = fixture["model"]
         reported_model_status = model.get("status")
         model_status = "success" if reported_model_status == "synthetic_response" else "failure"
@@ -291,7 +317,8 @@ def run(fixture_path, output):
         if model_status == "failure":
             status, candidates, errors = "extraction_failure", [], [model_error]
         else:
-            status, candidates, errors = validate_response(model.get("response"), fixture["items"])
+            status, candidates, errors = validate_response(raw_model.get("response"), fixture["items"])
+        candidates, errors = redact(candidates), redact(errors)
         validation = {"status": status, "candidates": candidates, "errors": errors}
         previous_hash = write_stage(
             output,
