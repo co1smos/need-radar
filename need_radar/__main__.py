@@ -15,7 +15,7 @@ SECRET_PATTERNS = (
     re.compile(r"\b(?:sk-[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b"),
     re.compile(r"(?im)\b(cookie|set-cookie)\s*:\s*[^\r\n]*"),
     re.compile(r'''(?i)(?P<prefix>\bauthorization\s*[:=]\s*(?:bearer|basic)\s+|\bbearer\s+)(?:(?P<quote>["'])(?P<quoted>(?:\\.|(?!(?P=quote)).)*)(?P=quote)|(?P<bare>[^\s,;"'}]+))'''),
-    re.compile(r'''(?i)(?<![\w])(?P<prefix>["']?(?:api[_-]?key|access[_-]?token|private[_-]?key|token|secret|password|passwd|credential|authorization|auth|cookie|set[_-]?cookie)["']?\s*[:=]\s*)(?:(?P<quote>["'])(?P<quoted>(?:\\.|(?!(?P=quote)).)*)(?P=quote)|(?P<bare>[^\s,;}\]"']+))'''),
+    re.compile(r'''(?i)(?<![\w])(?P<prefix>["']?(?:api[_-]?key|access[_-]?token|private[_-]?key|token|secret|password|passwd|credential|authorization|auth|cookie|set[_-]?cookie)["']?\s*[:=]\s*)(?:(?P<quote>["'])(?P<quoted>(?:\\.|(?!(?P=quote)).)*)(?P=quote)|(?P<redacted>\[REDACTED\])|(?P<bare>[^\s,;}\]"']+))'''),
 )
 SECRET_FIELD = re.compile(r"(?i)(?:^|[_-])(?:api[_-]?key|access[_-]?token|private[_-]?key|key|token|secret|password|passwd|authorization|auth|cookie|credential)(?:$|[_-])")
 
@@ -28,7 +28,7 @@ def redact(value):
             value = pattern.sub(
                 lambda match: match.group("prefix")
                 + (match.group("quote") or "")
-                + "[REDACTED]"
+                + (match.groupdict().get("redacted") or "[REDACTED]")
                 + (match.group("quote") or ""),
                 value,
             )
@@ -36,10 +36,13 @@ def redact(value):
     if isinstance(value, list):
         return [redact(item) for item in value]
     if isinstance(value, dict):
-        return {
-            key: "[REDACTED]" if isinstance(key, str) and is_secret_field(key) else redact(item)
-            for key, item in value.items()
-        }
+        redacted = {}
+        for key, item in value.items():
+            redacted_key = redact(key)
+            if redacted_key in redacted:
+                raise ValueError("dictionary keys collide after redaction")
+            redacted[redacted_key] = "[REDACTED]" if isinstance(key, str) and is_secret_field(key) else redact(item)
+        return redacted
     return value
 
 
