@@ -1,0 +1,12 @@
+{
+  "output": {
+    "found": false,
+    "data": {"items": [], "nextCursor": null},
+    "reason": "synthetic_no_matches"
+  },
+  "provider": "AnyAPI",
+  "costUsd": 0.00065,
+  "items": 0,
+  "replayed": false,
+  "source": {"id": "synthetic-x", "name": "Synthetic X provider", "kind": "synthetic"}
+}
