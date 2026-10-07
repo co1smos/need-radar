@@ -248,9 +248,19 @@ def run(fixture_path, output):
                 details={"error_count": 1},
             )
             return "invalid_input"
-        fixture = redact(raw_fixture)
-        errors = fixture_errors(fixture)
+        redaction_failed = False
+        try:
+            fixture = redact(raw_fixture)
+        except ValueError:
+            redaction_failed = True
+            fixture = None
+            errors = ["fixture cannot be safely redacted"]
+        else:
+            errors = fixture_errors(fixture)
         if errors:
+            validation = {"status": "invalid_input", "errors": errors}
+            if not redaction_failed:
+                validation["input"] = fixture
             write_stage(
                 output,
                 database,
@@ -259,7 +269,7 @@ def run(fixture_path, output):
                 "fixture_validation",
                 "invalid_input",
                 Path("validation.json"),
-                {"status": "invalid_input", "errors": errors, "input": fixture},
+                validation,
                 details={"error_count": len(errors)},
             )
             return "invalid_input"
@@ -322,6 +332,17 @@ def run(fixture_path, output):
         else:
             status, candidates, errors = validate_response(raw_model.get("response"), fixture["items"])
         candidates, errors = redact(candidates), redact(errors)
+        if status == "success":
+            by_id = {item["id"]: item for item in fixture["items"]}
+            for candidate_index, candidate in enumerate(candidates):
+                for citation_index, citation in enumerate(candidate["evidence"]):
+                    item = by_id.get(citation["item_id"])
+                    if item is None or citation["excerpt"] not in item["text"]:
+                        errors.append(
+                            f"candidate[{candidate_index}].evidence[{citation_index}] does not resolve to retained evidence"
+                        )
+            if errors:
+                status, candidates = "invalid_output", []
         validation = {"status": status, "candidates": candidates, "errors": errors}
         previous_hash = write_stage(
             output,

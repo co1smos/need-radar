@@ -303,20 +303,43 @@ class OfflineServeDemoTests(unittest.TestCase):
                     self.assertNotIn(b"sk-SYNTHETICKEYLEAK1234567890", artifact.read_bytes(), artifact.name)
 
     def test_rejects_dictionary_keys_that_collide_after_redaction(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            fixture = json.loads((ROOT / "fixtures" / "synthetic_demo.json").read_text())
-            fixture["items"][0]["metadata"] = {
-                "sk-SYNTHETICKEYLEAK1234567890": "synthetic metadata",
-                "[REDACTED]": "existing metadata",
-            }
-            result, output = self.invoke_fixture(temporary_directory, fixture)
+        key_orders = (
+            (
+                ("sk-SYNTHETICKEYLEAK1234567890", "synthetic metadata"),
+                ("[REDACTED]", "existing metadata"),
+            ),
+            (
+                ("[REDACTED]", "existing metadata"),
+                ("sk-SYNTHETICKEYLEAK1234567890", "synthetic metadata"),
+            ),
+        )
+        for key_order in key_orders:
+            with self.subTest(key_order=key_order), tempfile.TemporaryDirectory() as temporary_directory:
+                fixture = json.loads((ROOT / "fixtures" / "synthetic_demo.json").read_text())
+                fixture["items"][0]["metadata"] = dict(key_order)
+                result, output = self.invoke_fixture(temporary_directory, fixture)
 
-            self.assertEqual(result.returncode, 1)
-            self.assertIn("keys collide after redaction", result.stderr)
-            self.assertFalse((output / "snapshot.json").exists())
-            for artifact in output.iterdir():
-                if artifact.is_file():
-                    self.assertNotIn(b"sk-SYNTHETICKEYLEAK1234567890", artifact.read_bytes(), artifact.name)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("status=invalid_input", result.stdout)
+                self.assertEqual(result.stderr, "")
+                self.assertFalse((output / "snapshot.json").exists())
+                validation = json.loads((output / "validation.json").read_text())
+                self.assertEqual(validation["status"], "invalid_input")
+                self.assertTrue(validation["errors"])
+                self.assertNotIn("input", validation)
+                with sqlite3.connect(output / "lineage.sqlite3") as database:
+                    stage = database.execute(
+                        "SELECT stage, status, artifact_path, output_sha256 FROM stages"
+                    ).fetchone()
+                self.assertEqual(stage[:3], ("fixture_validation", "invalid_input", "validation.json"))
+                validation_bytes = (output / stage[2]).read_bytes()
+                self.assertEqual(hashlib.sha256(validation_bytes).hexdigest(), stage[3])
+                for artifact in output.iterdir():
+                    if artifact.is_file():
+                        contents = artifact.read_bytes()
+                        self.assertNotIn(b"sk-SYNTHETICKEYLEAK1234567890", contents, artifact.name)
+                        self.assertNotIn(b"existing metadata", contents, artifact.name)
+                        self.assertNotIn(b"synthetic metadata", contents, artifact.name)
 
     def test_persisted_citation_still_resolves_after_redaction(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -347,6 +370,34 @@ class OfflineServeDemoTests(unittest.TestCase):
             self.assertIn(citation["excerpt"], retained_text)
             self.assertEqual(citation["excerpt"], "password=[REDACTED]")
             self.assertIn(r"password=\[REDACTED\]", (output / "report.md").read_text())
+
+    def test_redacted_citation_must_still_resolve_to_frozen_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture = json.loads((ROOT / "fixtures" / "synthetic_demo.json").read_text())
+            fixture["items"][0]["text"] = "The refresh_token=SYNTHETIC_CONTEXT_VALUE is unavailable."
+            fixture["model"] = {
+                "status": "synthetic_response",
+                "response": [{
+                    "title": "Synthetic finding",
+                    "friction": "Synthetic friction",
+                    "evidence": [{
+                        "item_id": fixture["items"][0]["id"],
+                        "excerpt": "token=SYNTHETIC_CONTEXT_VALUE",
+                    }],
+                }],
+            }
+            result, output = self.invoke_fixture(temporary_directory, fixture)
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("status=invalid_output", result.stdout)
+            snapshot = json.loads((output / "snapshot.json").read_text())
+            candidates = json.loads((output / "candidates.json").read_text())
+            self.assertEqual(candidates["status"], "invalid_output")
+            self.assertEqual(candidates["candidates"], [])
+            self.assertTrue(candidates["errors"])
+            self.assertNotIn("token=[REDACTED]", snapshot["items"][0]["text"])
+            self.assertNotIn(r"token=\[REDACTED\]", (output / "report.md").read_text())
+            self.assertIn("refresh_token=SYNTHETIC_CONTEXT_VALUE", snapshot["items"][0]["text"])
 
     def test_redacts_cookie_headers_and_credentials_in_embedded_json(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
