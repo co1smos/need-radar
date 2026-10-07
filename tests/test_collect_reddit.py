@@ -378,6 +378,46 @@ if os.environ.get("NEED_RADAR_OFFLINE_TESTS") == "1":
         ):
             self.assertNotIn(secret, persisted)
 
+    def test_redacts_quoted_cookie_and_encoded_secrets_from_persisted_text(self):
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        encoded_secret = "fixture-encoded-secret"
+        for _ in range(7):
+            encoded_secret = quote(encoded_secret, safe="")
+        post["text"] = "\n".join((
+            'Authorization: Bearer "fixture-bearer-secret"',
+            'Authorization = \'Basic fixture-basic-secret\'',
+            'Cookie: session=fixture-session-secret; refresh=fixture-refresh-secret',
+            'api_key: "fixture-json-key"',
+            "password = 'fixture-password'",
+            'source says {"password": "fixture-prose-password", "api_key": "fixture-prose-key"}',
+            f"ordinary https://example.org/path encoded={encoded_secret}",
+        ))
+        transport = FixtureTransport([response(200, page)])
+
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials("fixture-encoded-secret"),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        persisted = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        for _ in range(collect_reddit.MAX_URL_DECODE_ROUNDS + 2):
+            persisted = unquote(persisted)
+        for secret in (
+            "fixture-bearer-secret",
+            "fixture-basic-secret",
+            "fixture-session-secret",
+            "fixture-refresh-secret",
+            "fixture-json-key",
+            "fixture-password",
+            "fixture-prose-password",
+            "fixture-prose-key",
+            "fixture-encoded-secret",
+        ):
+            self.assertNotIn(secret, persisted)
+
     def test_malformed_url_is_redacted_in_persisted_record(self):
         for value in (
             "https://fixture-user:fixture-password@example.com:bad/path?X-Amz-Credential=fixture-credential",
@@ -1266,6 +1306,59 @@ if os.environ.get("NEED_RADAR_OFFLINE_TESTS") == "1":
 
         code, stdout, _ = self.run_cli([
             "replay", "--recordings-dir", str(directory),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(code, 2)
+        self.assertIn("no_unexpired_recordings_available", json.loads(stdout)["errors"])
+        self.assertFalse(malformed.exists())
+
+    def test_deeply_nested_response_records_failure_and_settles_request(self):
+        body = b'{"code":200,"deep":' + b"[" * 1100 + b"0" + b"]" * 1100 + b"}"
+        transport = FixtureTransport([response(200, body)])
+
+        code, stdout, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 2, stderr)
+        report = json.loads(stdout)
+        self.assertIn("feed_response_schema_invalid", report["errors"])
+        state = json.loads((self.state_dir / "state.json").read_text())
+        self.assertIsNone(state["pending"])
+        record = json.loads(next(self.recordings_dir.glob("record-*.json")).read_text())
+        self.assertIn("feed_response_schema_invalid", record["validation_errors"])
+
+    def test_surrogate_response_is_sanitized_before_persistence(self):
+        page = fixture_body("feed-page-1.json")
+        page["data"]["subredditV3"]["elements"]["edges"][0]["node"]["text"] = "\ud800"
+        transport = FixtureTransport([response(200, page)])
+
+        code, stdout, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn('"status": "partial"', stdout)
+        persisted = "\n".join(path.read_text(encoding="utf-8") for path in self.recordings_dir.glob("*.json"))
+        self.assertNotIn("\ud800", persisted)
+
+    def test_deeply_nested_recording_is_removed_without_aborting_cleanup(self):
+        self.recordings_dir.mkdir(mode=0o700)
+        malformed = self.recordings_dir / "record-deep.json"
+        malformed.write_text(
+            '{"recorded_at":"2026-10-07T12:00:00Z",'
+            '"expires_at":"2026-10-14T12:00:00Z","retention_days":7,"body":'
+            + "[" * 1100 + "0" + "]" * 1100 + "}"
+        )
+        malformed.chmod(0o600)
+
+        code, stdout, _ = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
             "--state-dir", str(self.state_dir),
         ])
 

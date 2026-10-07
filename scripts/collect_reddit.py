@@ -38,6 +38,7 @@ REQUEST_TIMEOUT_SECONDS = 30
 RETENTION_DAYS = 7
 MAX_URL_DECODE_ROUNDS = 16
 MAX_NESTED_URLS = 8
+MAX_SANITIZE_DEPTH = 32
 MAX_BILLING_HEADER_DIGITS = 18
 FEED_ID = "tikhub.x.reddit-app-fetch-subreddit-feed"
 COMMENTS_ID = "scrapecreators.x.v1-reddit-post-comments"
@@ -99,7 +100,11 @@ SENSITIVE_ASSIGNMENT = re.compile(
     r"\b((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|key|secret|auth|client[_-]?secret|password|passwd|cookie|signature|sig)\b\s*[:=]\s*)[^\s,;&]+"
 )
 AUTHORIZATION_ASSIGNMENT = re.compile(
-    r'''(?i)(\b(?:proxy-)?authorization["']?\s*[:=]\s*["']?)[^"'\r\n,;&]+'''
+    r'''(?im)(\b(?:proxy-)?authorization["']?\s*[:=]\s*)[^\r\n]*'''
+)
+COOKIE_ASSIGNMENT = re.compile(r'''(?im)(\bcookie["']?\s*[:=]\s*)[^\r\n]*''')
+QUOTED_SENSITIVE_ASSIGNMENT = re.compile(
+    r'''(?i)(["']?\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|key|secret|auth|client[_-]?secret|password|passwd|cookie|signature|sig)\b["']?\s*[:=]\s*)(["'])(.*?)\2'''
 )
 EMBEDDED_URL = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
@@ -273,6 +278,11 @@ def atomic_json(path, value):
 
 def redact_assignments(value):
     value = AUTHORIZATION_ASSIGNMENT.sub(lambda match: match.group(1) + "[REDACTED]", value)
+    value = COOKIE_ASSIGNMENT.sub(lambda match: match.group(1) + "[REDACTED]", value)
+    value = QUOTED_SENSITIVE_ASSIGNMENT.sub(
+        lambda match: match.group(1) + match.group(2) + "[REDACTED]" + match.group(2),
+        value,
+    )
     return SENSITIVE_ASSIGNMENT.sub(
         lambda match: (match.group(1) or match.group(2)) + "[REDACTED]", value
     )
@@ -283,7 +293,7 @@ def safe_string(value, secrets=(), _depth=0):
         return None
     if _depth > MAX_NESTED_URLS:
         return "[REDACTED]"
-    text = str(value)
+    text = str(value).encode("utf-8", errors="replace").decode("utf-8")
     for secret in secrets:
         if secret:
             text = text.replace(secret, "[REDACTED]")
@@ -386,7 +396,9 @@ def safe_url(value, secrets=(), _depth=0):
     ))
 
 
-def sanitize(value, secrets=(), key=""):
+def sanitize(value, secrets=(), key="", _depth=0):
+    if _depth > MAX_SANITIZE_DEPTH:
+        raise ValueError("sanitization_depth_exceeded")
     if SENSITIVE_KEYS.search(key):
         return "[REDACTED]"
     if isinstance(value, dict):
@@ -409,11 +421,11 @@ def sanitize(value, secrets=(), key=""):
                 unique = f"{cleaned}#{index}"
                 index += 1
             result[unique] = "[REDACTED]" if invalid_encoding or sensitive_name else sanitize(
-                item, secrets, decoded_name
+                item, secrets, decoded_name, _depth + 1
             )
         return result
     if isinstance(value, list):
-        return [sanitize(item, secrets) for item in value]
+        return [sanitize(item, secrets, _depth=_depth + 1) for item in value]
     if isinstance(value, str):
         try:
             nested = json.loads(value)
@@ -423,8 +435,8 @@ def sanitize(value, secrets=(), key=""):
             return "[REDACTED_INVALID_JSON]"
         if isinstance(nested, (dict, list)):
             return json.dumps(
-                sanitize(nested, secrets),
-                ensure_ascii=False,
+                sanitize(nested, secrets, _depth=_depth + 1),
+                ensure_ascii=True,
                 sort_keys=True,
                 separators=(",", ":"),
             )
@@ -440,15 +452,23 @@ def sanitize_body(body, secrets=()):
         value = json.loads(text)
     except json.JSONDecodeError:
         return safe_string(text, secrets)
+    except RecursionError:
+        return "[REDACTED_INVALID_JSON]"
     except ValueError:
         try:
             value = json.loads(text, parse_int=str)
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, RecursionError):
             return "[REDACTED_INVALID_JSON]"
-        return json.dumps(
-            sanitize(value, secrets), ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        )
-    return sanitize(value, secrets)
+        try:
+            return json.dumps(
+                sanitize(value, secrets), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            )
+        except (RecursionError, ValueError):
+            return "[REDACTED_INVALID_JSON]"
+    try:
+        return sanitize(value, secrets)
+    except (RecursionError, ValueError):
+        return "[REDACTED_INVALID_JSON]"
 
 
 def response_headers(headers, secrets=()):
@@ -1074,7 +1094,7 @@ def expire_recordings(recordings_dir, now):
         try:
             with path.open(encoding="utf-8") as source:
                 record = json.load(source)
-        except (OSError, UnicodeError, ValueError):
+        except (OSError, UnicodeError, ValueError, RecursionError):
             record = {}
         expires = record_expiry(record)
         if expires is None or expires <= now:
