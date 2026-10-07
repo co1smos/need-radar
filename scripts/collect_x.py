@@ -760,14 +760,23 @@ def _replay_validation(record):
     billing = record.get("billing", {})
     status = response.get("http_status") if isinstance(response, dict) else None
     if isinstance(response, dict) and response.get("failure") == "unknown_transport_outcome":
+        if response.get("body") is not None:
+            raise CollectorError("recorded validation does not match retained response evidence")
         return {"errors": ["unknown_transport_outcome"]}
     replayed_validation = None
-    if (
+    provider_overflow = (
+        isinstance(billing, dict)
+        and isinstance(billing.get("served_via"), str)
+        and billing["served_via"].startswith("overflow:")
+    )
+    can_reconstruct_output = (
         isinstance(status, int)
         and 200 <= status < 300
         and response.get("body_format") == "json"
         and not response.get("failure")
-    ):
+        and not provider_overflow
+    )
+    if can_reconstruct_output:
         approval = record.get("approval")
         if not isinstance(approval, dict):
             raise CollectorError("recording lacks approved policy evidence")
@@ -789,11 +798,13 @@ def _replay_validation(record):
                 raise CollectorError("recorded validation does not match retained response evidence") from None
             if reconstructed != retained:
                 raise CollectorError("recorded validation does not match retained response evidence")
+    elif response.get("body") is not None:
+        raise CollectorError("recorded validation does not match retained response evidence")
     if isinstance(billing, dict) and billing.get("charged_micro_usd") is None:
         return {"errors": ["billing_header_missing_or_invalid"]}
     if isinstance(response, dict) and response.get("failure"):
         return {"errors": [response["failure"]], "evidence_completeness": "bounded_partial"}
-    if isinstance(billing, dict) and str(billing.get("served_via", "")).startswith("overflow:"):
+    if provider_overflow:
         return {"errors": ["provider_overflow"]}
     if isinstance(status, int) and 200 <= status < 300:
         if response.get("body_format") != "json":

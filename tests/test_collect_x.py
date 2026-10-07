@@ -883,6 +883,88 @@ class CollectionTests(unittest.TestCase):
             replay = collect_x.replay_recording(recording_path)
             self.assertEqual(replay["replay_validation"], recording["validation"])
 
+    def test_overflow_replays_suppressed_output_with_and_without_billing(self):
+        for billing_present in (True, False):
+            with self.subTest(billing_present=billing_present):
+                headers = {"X-Treg-Served-Via": "overflow:synthetic-relay"}
+                if billing_present:
+                    headers["X-Treg-Cost-Micro"] = "750"
+                provider = LocalProvider([{"body": response_body("page-1.json"), "headers": headers}])
+                try:
+                    with tempfile.TemporaryDirectory() as temporary:
+                        self.collect(provider, temporary)
+                        recording_path = next((Path(temporary) / "recordings").glob("*.json"))
+                        recording = json.loads(recording_path.read_text())
+                        self.assertIsNone(recording["response"].get("body"))
+                        expected_error = (
+                            "provider_overflow"
+                            if billing_present
+                            else "billing_header_missing_or_invalid"
+                        )
+                        self.assertEqual(recording["validation"]["errors"], [expected_error])
+                        replay = collect_x.replay_recording(recording_path)
+                        self.assertEqual(replay["replay_validation"], recording["validation"])
+
+                        recording["response"]["body"] = {"items": [{"id": "fabricated"}]}
+                        recording_path.write_text(json.dumps(recording))
+                        with self.assertRaisesRegex(
+                            collect_x.CollectorError,
+                            "does not match retained response evidence",
+                        ):
+                            collect_x.replay_recording(recording_path)
+                finally:
+                    provider.close()
+
+    def test_replay_rejects_normalized_output_on_non_extractable_responses(self):
+        def fail_request(*_args):
+            raise TimeoutError("synthetic transport timeout")
+
+        cases = (
+            ("transport", fail_request),
+            (
+                "http_error",
+                LocalProvider([{
+                    "status": 400,
+                    "body": response_body("transient-error.json"),
+                    "headers": {"X-Treg-Cost-Micro": "750"},
+                }]),
+            ),
+            (
+                "invalid_json",
+                LocalProvider([{
+                    "body": b"not json",
+                    "headers": {"X-Treg-Cost-Micro": "750"},
+                }]),
+            ),
+            (
+                "response_read_failure",
+                LocalProvider([{
+                    "body": b"{}" + b" " * (collect_x.MAX_RESPONSE_BYTES + 1),
+                    "headers": {"X-Treg-Cost-Micro": "750"},
+                }]),
+            ),
+        )
+        for name, provider in cases:
+            with self.subTest(response=name):
+                try:
+                    with tempfile.TemporaryDirectory() as temporary:
+                        self.collect(provider, temporary)
+                        recording_path = next((Path(temporary) / "recordings").glob("*.json"))
+                        recording = json.loads(recording_path.read_text())
+                        self.assertIsNone(recording["response"].get("body"))
+                        collect_x.replay_recording(recording_path)
+
+                        recording["response"]["body"] = {"items": [{"id": "fabricated"}]}
+                        recording_path.write_text(json.dumps(recording))
+                        with self.assertRaisesRegex(
+                            collect_x.CollectorError,
+                            "does not match retained response evidence",
+                        ):
+                            collect_x.replay_recording(recording_path)
+                finally:
+                    if hasattr(provider, "close"):
+                        provider.close()
+
     def test_missing_billing_failure_replays_recorded_validation(self):
         provider = LocalProvider([{"body": response_body("empty.json"), "headers": {}}])
         try:
