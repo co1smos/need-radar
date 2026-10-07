@@ -71,7 +71,7 @@ ALLOWED_RESPONSE_HEADERS = {
     "x-treg-served-by",
 }
 SENSITIVE_KEYS = re.compile(
-    r"(?:^|[_-])(?:access[_-]?token|refresh[_-]?token|token|api[_-]?key|api[_-]?token|key|private[_-]?key|secret[_-]?key|secret|password|passwd|cookie|auth|authorization|credential|signature)(?:$|[_-])",
+    r"(?:^|[_-])(?:access[_-]?token|refresh[_-]?token|token|api[_-]?key|api[_-]?token|key|private[_-]?key|client[_-]?secret|secret[_-]?key|secret|password|passwd|cookie|auth|authorization|credential|signature)(?:$|[_-])",
     re.IGNORECASE,
 )
 SENSITIVE_QUERY_KEYS = {
@@ -584,7 +584,7 @@ def sanitize(value, secrets=(), key="", _depth=0):
                 r"%(?![0-9a-f]{2})|\\u[0-9a-f]{4}", decoded_name, re.IGNORECASE
             ):
                 raise SanitizationError("response_sanitization_failed")
-            sensitive_name = SENSITIVE_KEYS.search(decoded_name)
+            sensitive_name = SENSITIVE_KEYS.search(decoded_name.replace("\\", ""))
             cleaned = "[REDACTED_KEY]" if sensitive_name else safe_string(decoded_name, secrets)
             unique = cleaned
             index = 2

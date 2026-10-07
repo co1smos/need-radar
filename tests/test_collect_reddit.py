@@ -363,6 +363,54 @@ if os.environ.get("NEED_RADAR_OFFLINE_TESTS") == "1":
         self.assertEqual(len(redacted_keys), 2)
         self.assertEqual(len(set(sanitized)), len(sanitized))
 
+    def test_structured_client_secret_variants_are_redacted_in_collection_and_replay(self):
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        secret_values = {
+            "clientSecret": "fixture-client-secret-camel",
+            "ClientSecret": "fixture-client-secret-title",
+            "CLIENTSECRET": "fixture-client-secret-upper",
+            "client_secret": "fixture-client-secret-underscore",
+            "client-secret": "fixture-client-secret-hyphen",
+            r"client\u0053ecret": "fixture-client-secret-escaped",
+            r"pass\u0077ord": "fixture-password-unicode-key",
+            ("pass" + "\\" * 2 + "u0077ord"): "fixture-password-double-escaped-key",
+        }
+        post.update(secret_values)
+
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            FixtureTransport([response(200, page)]),
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        record_path = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(record_path.read_text())
+        persisted = json.dumps(record)
+        for _ in range(collect_reddit.MAX_URL_DECODE_ROUNDS + 2):
+            persisted = unquote(collect_reddit.decode_escaped_ascii(persisted))
+        for secret in secret_values.values():
+            self.assertNotIn(secret, persisted)
+
+        recorded_post = record["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        recorded_post.update(secret_values)
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        record_path.chmod(0o600)
+        replay_code, replay_stdout, replay_stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(replay_code, 0, replay_stderr)
+        replayed_record = json.loads(record_path.read_text())
+        replayed = json.dumps(replayed_record)
+        for _ in range(collect_reddit.MAX_URL_DECODE_ROUNDS + 2):
+            replayed = unquote(collect_reddit.decode_escaped_ascii(replayed))
+        for secret in secret_values.values():
+            self.assertNotIn(secret, replayed)
+            self.assertNotIn(secret, replay_stdout)
+
     def test_malformed_quoted_redaction_is_bounded_in_subprocess(self):
         scratch = pathlib.Path(os.environ.get("TMPDIR", tempfile.gettempdir()))
         payload = 'password="' + "\\" * 30 + "unterminated fixture-regression-secret"
