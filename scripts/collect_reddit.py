@@ -283,25 +283,32 @@ def atomic_json(path, value):
 
 
 def redact_assignments(value):
-    value = re.sub(
-        r"\\u([0-9a-f]{4})",
-        lambda match: chr(int(match.group(1), 16)) if int(match.group(1), 16) < 128 else match.group(0),
-        value,
-        flags=re.IGNORECASE,
-    )
+    value = decode_escaped_ascii(value)
     parts = []
     offset = 0
     while match := SENSITIVE_ASSIGNMENT_PREFIX.search(value, offset):
         parts.append(value[offset:match.end()])
         label = (match.group("label") or "").lower()
         start = match.end()
+        private_key = re.sub(r"[_-]", "", label) == "privatekey"
+        begin = re.compile(
+            r"\s*-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----",
+            re.IGNORECASE,
+        ).match(value, start)
+        if private_key and begin:
+            end_marker = "-----END " + begin.group(1) + "-----"
+            marker_end = value.find(end_marker, begin.end())
+            offset = len(value) if marker_end < 0 else marker_end + len(end_marker)
+            parts.append("[REDACTED]")
+            continue
         unterminated_quote = False
+        quoted_value = False
         quote_start = start + 1 if value.startswith((r'\"', r"\'"), start) else start
-        if quote_start < len(value) and value[quote_start] in "\"'":
+        if quote_start < len(value) and value[quote_start] in "\"'`":
+            quoted_value = True
             quote = value[quote_start]
             escaped_quote = quote_start != start
-            line_end = value.find("\n", start + 1)
-            limit = len(value) if line_end < 0 else line_end
+            limit = len(value)
             end = quote_start + 1
             while end < limit:
                 if value[end] == "\\":
@@ -333,7 +340,7 @@ def redact_assignments(value):
             while end < len(value) and value[end] not in "\r\n ,;&<>":
                 end += 1
         if label in {"authorization", "proxy-authorization", "cookie"} and not unterminated_quote:
-            line_end = value.find("\n", start)
+            line_end = value.find("\n", end if quoted_value else start)
             end = len(value) if line_end < 0 else line_end
             while end < len(value):
                 next_line = end + 1
@@ -463,6 +470,15 @@ def decode_url_component(value):
     return value
 
 
+def decode_escaped_ascii(value):
+    return re.sub(
+        r"\\u([0-9a-f]{4})",
+        lambda match: chr(int(match.group(1), 16)) if int(match.group(1), 16) < 128 else match.group(0),
+        value,
+        flags=re.IGNORECASE,
+    )
+
+
 def safe_url(value, secrets=(), _depth=0):
     if not isinstance(value, str):
         return value
@@ -531,8 +547,14 @@ def sanitize(value, secrets=(), key="", _depth=0):
         for name, item in value.items():
             original = str(name)
             decoded_name = decode_url_component(original)
+            if decoded_name is not None:
+                for _ in range(MAX_URL_DECODE_ROUNDS):
+                    escaped_name = decode_escaped_ascii(decoded_name)
+                    if escaped_name == decoded_name:
+                        break
+                    decoded_name = decode_url_component(escaped_name)
             invalid_encoding = decoded_name is None or re.search(
-                r"%(?![0-9a-f]{2})", decoded_name, re.IGNORECASE
+                r"%(?![0-9a-f]{2})|\\u[0-9a-f]{4}", decoded_name, re.IGNORECASE
             )
             sensitive_name = not invalid_encoding and SENSITIVE_KEYS.search(decoded_name)
             cleaned = (
@@ -1521,6 +1543,19 @@ class Collector:
         except (OSError, UnicodeError, ValueError, CollectorError):
             raise CollectorError("record_processing_persistence_failed", "blocked") from None
 
+    def validate_cursors(self, cursors):
+        for cursor in cursors:
+            if not isinstance(cursor, str):
+                self.coverage_reasons.append("response pagination cursor is not valid text")
+                self.annotate_record_validation("response_cursor_not_utf8")
+                raise CollectorError("response_cursor_not_utf8", "failed")
+            try:
+                cursor.encode("utf-8")
+            except UnicodeEncodeError:
+                self.coverage_reasons.append("response pagination cursor is not valid UTF-8")
+                self.annotate_record_validation("response_cursor_not_utf8")
+                raise CollectorError("response_cursor_not_utf8", "failed") from None
+
     def fail_record(self, code, status="failed"):
         self.annotate_record_error(code)
         raise CollectorError(code, status)
@@ -1606,6 +1641,9 @@ class Collector:
 
     def dispatch(self, state_path, state, route_name, params):
         route = ROUTES[route_name]
+        cursor = params.get("after", params.get("cursor"))
+        if cursor is not None:
+            self.validate_cursors([cursor])
         local_retries = 0
         while True:
             reservation = self.reserve(state_path, state, route_name, params)
@@ -1706,6 +1744,10 @@ class Collector:
                     raise CollectorError("feed_response_schema_invalid", "failed") from None
                 if isinstance(original_cursor, str):
                     next_cursor = original_cursor
+                if isinstance(next_cursor, str):
+                    self.validate_cursors([next_cursor])
+                elif has_next is True and next_cursor is not None:
+                    self.validate_cursors([next_cursor])
                 try:
                     post_times = feed_post_times(posts)
                 except ValueError:
@@ -1790,14 +1832,15 @@ class Collector:
                     self.counts["errors"].append("comment_response_schema_invalid")
                     self.annotate_record_validation("comment_response_schema_invalid")
                     raise CollectorError("comment_response_schema_invalid", "failed") from None
-                self.mark_record_processing_complete()
-                self.counts["comment_pages"] += 1
-                self.counts["comments_seen"] += len(comments)
                 comment_cursors = (
                     original_comment_cursors
                     if isinstance(original_comment_cursors, list)
                     else cursors_in_comments(body)
                 )
+                self.validate_cursors(comment_cursors)
+                self.mark_record_processing_complete()
+                self.counts["comment_pages"] += 1
+                self.counts["comments_seen"] += len(comments)
                 for next_cursor in comment_cursors:
                     if next_cursor not in seen_cursors and next_cursor not in cursors:
                         cursors.append(next_cursor)

@@ -498,6 +498,46 @@ print(safe_string({payload!r}))
         ):
             self.assertNotIn(secret, persisted)
 
+    def test_redacts_multiline_private_key_backtick_and_unicode_escaped_key(self):
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["text"] = "\n".join((
+            "private_key: -----BEGIN PRIVATE KEY-----",
+            "fixture-private-block-secret",
+            "-----END PRIVATE KEY-----",
+            "password=`fixture backtick password secret`",
+            'Cookie: session=fixture-cookie-before-url https://ordinary.example/path',
+            'Authorization: Bearer fixture-auth-first-line\n  fixture-auth-folded-secret',
+            'password: \"fixture-quoted-first-line\nfixture-quoted-second-line-secret\" safe-tail',
+        ))
+        post[r"pass\u0077ord"] = "fixture-unicode-key-secret"
+        post["pass%255Cu0077ord"] = "fixture-multiply-encoded-key-secret"
+        transport = FixtureTransport([response(200, page)])
+
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        persisted = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        for _ in range(collect_reddit.MAX_URL_DECODE_ROUNDS + 4):
+            persisted = unquote(persisted)
+        for secret in (
+            "fixture-private-block-secret",
+            "fixture backtick password secret",
+            "fixture-cookie-before-url",
+            "fixture-auth-first-line",
+            "fixture-auth-folded-secret",
+            "fixture-quoted-first-line",
+            "fixture-quoted-second-line-secret",
+            "fixture-unicode-key-secret",
+            "fixture-multiply-encoded-key-secret",
+        ):
+            self.assertNotIn(secret, persisted)
+        self.assertIn("safe-tail", persisted)
+
     def test_redacts_folded_authorization_header_continuations(self):
         persisted = self.collect_text_recording(
             "Authorization: Bearer fixture-header-first-secret\r\n"
@@ -2217,6 +2257,79 @@ print(safe_string({payload!r}))
         self.assertNotIn("opaque%2Ffeed", feed_record["response"]["body"]["data"])
         self.assertEqual(feed_request_record["request"]["parameters"]["after"], "opaque/feed")
         self.assertEqual(comment_record["request"]["parameters"]["cursor"], "opaque/comment")
+
+    def test_unencodable_feed_cursor_fails_before_reserving_next_page(self):
+        page = fixture_body("feed-page-1.json")
+        page["data"]["subredditV3"]["elements"]["pageInfo"].update(
+            {"hasNextPage": True, "endCursor": "bad\ud800cursor"}
+        )
+        transport = FixtureTransport([response(200, page)])
+
+        code, stdout, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            transport,
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 2, stderr)
+        report = json.loads(stdout)
+        self.assertIn("response_cursor_not_utf8", report["errors"])
+        self.assertEqual(len(transport.requests), 1)
+        state = json.loads((self.state_dir / "state.json").read_text())
+        self.assertEqual(state["attempts"], 1)
+        self.assertIsNone(state["pending"])
+        record = json.loads(next(self.recordings_dir.glob("record-*.json")).read_text())
+        self.assertIn("response_cursor_not_utf8", record["validation_errors"])
+        replay_code, replay_stdout, _ = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir), "--state-dir", str(self.state_dir)
+        ])
+        self.assertEqual(replay_code, 2)
+        self.assertIn("response_cursor_not_utf8", json.loads(replay_stdout)["errors"])
+
+    def test_unencodable_comment_cursor_fails_before_reserving_next_page(self):
+        comments = {
+            "success": True,
+            "comments": [{
+                "id": "synthetic-comment",
+                "body": "Synthetic comment",
+                "replies": {
+                    "items": [],
+                    "more": {"has_more": True, "cursor": "bad\ud800cursor"},
+                },
+            }],
+            "more": {"has_more": True, "cursor": "opaque%2Fcomment"},
+        }
+        transport = FixtureTransport([
+            response(200, fixture_body("feed-page-1.json")),
+            response(200, comments),
+        ])
+
+        code, stdout, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-comment-pages", "1", "--max-posts", "1"),
+            transport,
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 2, stderr)
+        report = json.loads(stdout)
+        self.assertIn("response_cursor_not_utf8", report["errors"])
+        self.assertEqual(len(transport.requests), 2)
+        state = json.loads((self.state_dir / "state.json").read_text())
+        self.assertEqual(state["attempts"], 2)
+        self.assertIsNone(state["pending"])
+        comment_record = next(
+            json.loads(path.read_text())
+            for path in self.recordings_dir.glob("record-*.json")
+            if json.loads(path.read_text())["endpoint"] == collect_reddit.COMMENTS_ID
+        )
+        self.assertIn("response_cursor_not_utf8", comment_record["validation_errors"])
+        replay_code, replay_stdout, _ = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir), "--state-dir", str(self.state_dir)
+        ])
+        self.assertEqual(replay_code, 0)
+        replay = json.loads(replay_stdout)
+        self.assertIn("response_cursor_not_utf8", replay["errors"])
+        self.assertGreater(replay["counts"]["validation_failures"], 0)
 
     def test_pending_opaque_cursors_are_sanitized_in_reports(self):
         first_feed = fixture_body("feed-page-1.json")
