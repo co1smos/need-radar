@@ -526,7 +526,12 @@ def _safe_response_item(item, secrets, start_epoch, end_epoch):
     item_id = item.get("id")
     text = item.get("text")
     created = item.get("createdUtc")
-    if not isinstance(item_id, (str, int)) or isinstance(item_id, bool) or not isinstance(text, str):
+    if (
+        not isinstance(item_id, (str, int))
+        or isinstance(item_id, bool)
+        or not str(item_id).strip()
+        or not isinstance(text, str)
+    ):
         return None, "missing_id_or_text"
     if isinstance(created, bool) or not isinstance(created, (int, float)):
         return None, "missing_timestamp"
@@ -756,6 +761,34 @@ def _replay_validation(record):
     status = response.get("http_status") if isinstance(response, dict) else None
     if isinstance(response, dict) and response.get("failure") == "unknown_transport_outcome":
         return {"errors": ["unknown_transport_outcome"]}
+    replayed_validation = None
+    if (
+        isinstance(status, int)
+        and 200 <= status < 300
+        and response.get("body_format") == "json"
+        and not response.get("failure")
+    ):
+        approval = record.get("approval")
+        if not isinstance(approval, dict):
+            raise CollectorError("recording lacks approved policy evidence")
+        context = record.get("validation_context", {})
+        _replayed, replayed_validation = _extract_response(
+            response["evidence_body"], approval, (), record.get("request", {}).get("limit", 1),
+            context.get("expected_source_id") if isinstance(context, dict) else None,
+        )
+        transformations = context.get("sanitized_transformations", []) if isinstance(context, dict) else []
+        if isinstance(transformations, list) and "next_cursor_redacted" in transformations:
+            if response.get("body") is not None:
+                raise CollectorError("recorded validation does not match retained response evidence")
+            replayed_validation = {"errors": ["next_cursor_redacted"]}
+        else:
+            try:
+                reconstructed = json.dumps(_replayed, sort_keys=True, allow_nan=False)
+                retained = json.dumps(response.get("body"), sort_keys=True, allow_nan=False)
+            except (TypeError, ValueError):
+                raise CollectorError("recorded validation does not match retained response evidence") from None
+            if reconstructed != retained:
+                raise CollectorError("recorded validation does not match retained response evidence")
     if isinstance(billing, dict) and billing.get("charged_micro_usd") is None:
         return {"errors": ["billing_header_missing_or_invalid"]}
     if isinstance(response, dict) and response.get("failure"):
@@ -765,27 +798,7 @@ def _replay_validation(record):
     if isinstance(status, int) and 200 <= status < 300:
         if response.get("body_format") != "json":
             return {"errors": ["invalid_json"], "evidence_completeness": "invalid_response"}
-        approval = record.get("approval")
-        if not isinstance(approval, dict):
-            raise CollectorError("recording lacks approved policy evidence")
-        context = record.get("validation_context", {})
-        _replayed, validation = _extract_response(
-            response["evidence_body"], approval, (), record.get("request", {}).get("limit", 1),
-            context.get("expected_source_id") if isinstance(context, dict) else None,
-        )
-        transformations = context.get("sanitized_transformations", []) if isinstance(context, dict) else []
-        if isinstance(transformations, list) and "next_cursor_redacted" in transformations:
-            if response.get("body") is not None:
-                raise CollectorError("recorded validation does not match retained response evidence")
-            return {"errors": ["next_cursor_redacted"]}
-        try:
-            reconstructed = json.dumps(_replayed, sort_keys=True, allow_nan=False)
-            retained = json.dumps(response.get("body"), sort_keys=True, allow_nan=False)
-        except (TypeError, ValueError):
-            raise CollectorError("recorded validation does not match retained response evidence") from None
-        if reconstructed != retained:
-            raise CollectorError("recorded validation does not match retained response evidence")
-        return validation
+        return replayed_validation
     if isinstance(status, int):
         return {"errors": ["http_error"], "evidence_completeness": "not_validated"}
     return {"errors": ["unknown_transport_outcome"]}

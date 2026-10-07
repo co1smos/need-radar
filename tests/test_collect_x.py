@@ -636,6 +636,30 @@ class CollectionTests(unittest.TestCase):
         finally:
             provider.close()
 
+    def test_empty_and_whitespace_post_ids_are_excluded(self):
+        for item_id in ("", " \t "):
+            with self.subTest(item_id=repr(item_id)):
+                body = response_body("page-1.json")
+                body["output"]["data"].pop("nextCursor")
+                body["output"]["data"]["items"][0]["id"] = item_id
+                provider = LocalProvider([{"body": body, "headers": {"X-Treg-Cost-Micro": "750"}}])
+                try:
+                    with tempfile.TemporaryDirectory() as temporary:
+                        result, state_dir, recording_dir = self.collect(provider, temporary)
+                        record_path = next(recording_dir.glob("*.json"))
+                        record = json.loads(record_path.read_text())
+                        state = collect_x.load_state(state_dir)
+                        self.assertEqual(record["validation"]["errors"], ["missing_id_or_text"])
+                        self.assertEqual(result["stop_reason"], "response_validation_failure")
+                        self.assertEqual(state["successful_requests"], 1)
+                        self.assertEqual(record["validation"]["invalid_item_count"], 1)
+                        self.assertEqual(record["response"]["body"]["items"], [])
+                        self.assertEqual(record["validation"]["excluded_items"][0]["item"]["id"], item_id)
+                        replay = collect_x.replay_recording(record_path)
+                        self.assertEqual(replay["replay_validation"], record["validation"])
+                finally:
+                    provider.close()
+
     def test_secret_redaction_precedes_private_persistence(self):
         body = response_body("page-1.json")
         body["TREG_TOKEN"] = "field-token-secret"
@@ -872,6 +896,32 @@ class CollectionTests(unittest.TestCase):
                 self.assertEqual(replay["replay_validation"], recording["validation"])
         finally:
             provider.close()
+
+    def test_replay_checks_normalized_output_even_when_billing_is_unknown(self):
+        for mutation in ("text", "items"):
+            with self.subTest(mutation=mutation):
+                provider = LocalProvider([{"body": response_body("page-1.json"), "headers": {}}])
+                try:
+                    with tempfile.TemporaryDirectory() as temporary:
+                        self.collect(provider, temporary)
+                        recording_path = next((Path(temporary) / "recordings").glob("*.json"))
+                        recording = json.loads(recording_path.read_text())
+                        self.assertEqual(
+                            recording["validation"]["errors"],
+                            ["billing_header_missing_or_invalid"],
+                        )
+                        if mutation == "text":
+                            recording["response"]["body"]["items"][0]["text"] = "tampered output"
+                        else:
+                            recording["response"]["body"]["items"] = []
+                        recording_path.write_text(json.dumps(recording))
+                        with self.assertRaisesRegex(
+                            collect_x.CollectorError,
+                            "does not match retained response evidence",
+                        ):
+                            collect_x.replay_recording(recording_path)
+                finally:
+                    provider.close()
 
     def test_redacted_cursor_failure_replays_from_sanitized_diagnostic(self):
         body = response_body("page-1.json")
