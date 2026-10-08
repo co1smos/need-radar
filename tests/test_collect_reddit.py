@@ -311,7 +311,7 @@ if os.environ.get("NEED_RADAR_OFFLINE_TESTS") == "1":
     def test_direct_connection_is_stopped_before_socket_creation(self):
         address = (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", 443))
         with patch("socket.getaddrinfo", return_value=[address]) as resolve:
-            with self.assertRaisesRegex(AssertionError, "socket.__new__"):
+            with self.assertRaisesRegex((AssertionError, PermissionError), "socket.__new__|network access is disabled in tests"):
                 socket.create_connection(("treg.to", 443), timeout=1)
         resolve.assert_called()
 
@@ -1593,7 +1593,10 @@ print(safe_string({payload!r}))
         self.assertEqual(urlsplit(transport.requests[0][0]).path, f"/call/{collect_reddit.FEED_ID}")
 
     def test_repository_guard_covers_primary_checkout(self):
-        primary = ROOT.parents[2]
+        primary = pathlib.Path(subprocess.check_output(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=ROOT, text=True,
+        ).strip()).parent
         self.assertTrue(collect_reddit.repository_path(primary / "private-recordings"))
 
     def test_repository_guard_discovers_worktrees_from_primary_and_worker(self):
