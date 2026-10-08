@@ -617,6 +617,55 @@ print(safe_string({payload!r}))
         self.assertNotIn("fixture-tab-whitespace-secret", persisted)
         self.assertIn("safe-tail", persisted)
 
+    def test_redacts_raw_string_and_yaml_block_credentials_in_collection_and_replay(self):
+        source_text = (
+            'password = r"first fixture-raw-string-secret"\n'
+            "api_token = R'fixture-uppercase-raw-string-secret'\n"
+            'client_secret = br"""fixture-bytes-raw-secret"""\n'
+            'private_key = RF"""fixture-prefixed-raw-secret\ncontinued secret"""\n'
+            "password: >- # folded scalar\n"
+            "  fixture-yaml-folded-secret\n"
+            "  fixture-yaml-folded-continuation\n"
+            "api_key: |2+\n"
+            "    fixture-yaml-literal-secret\n"
+            "public: safe-tail\n"
+            "auth_token: >2\n"
+            "     fixture-yaml-invalid-indent-secret"
+        )
+        persisted = self.collect_text_recording(source_text)
+        secrets = (
+            "fixture-raw-string-secret",
+            "fixture-uppercase-raw-string-secret",
+            "fixture-bytes-raw-secret",
+            "fixture-prefixed-raw-secret",
+            "continued secret",
+            "fixture-yaml-folded-secret",
+            "fixture-yaml-folded-continuation",
+            "fixture-yaml-literal-secret",
+            "fixture-yaml-invalid-indent-secret",
+        )
+        for secret in secrets:
+            self.assertNotIn(secret, persisted)
+        self.assertIn("safe-tail", persisted)
+
+        source = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(source.read_text())
+        post = record["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["text"] = source_text
+        source.write_text(json.dumps(record))
+
+        replay_code, replay_stdout, replay_stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(replay_code, 0, replay_stderr)
+        persisted = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        for secret in secrets:
+            self.assertNotIn(secret, persisted)
+            self.assertNotIn(secret, replay_stdout)
+        self.assertIn("safe-tail", persisted)
+
     def test_redacts_multiply_encoded_assignments_in_collection_and_replay(self):
         encoded_values = {}
         secrets = (

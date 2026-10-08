@@ -329,6 +329,9 @@ def redact_assignments(value):
         while quote_start < len(value) and value[quote_start] == "\\":
             quote_start += 1
         opening_slashes = quote_start - start
+        string_prefix = re.match(r"(?i:br|rb|fr|rf|[rubf])(?=[\"'`])", value[quote_start:])
+        if string_prefix:
+            quote_start += string_prefix.end()
         if quote_start < len(value) and value[quote_start] in "\"'`":
             quoted_value = True
             quote = value[quote_start]
@@ -359,6 +362,50 @@ def redact_assignments(value):
             else:
                 end = len(value)
                 unterminated_quote = True
+        elif value[start:start + 1] in {">", "|"}:
+            header_end = value.find("\n", start)
+            header_end = len(value) if header_end < 0 else header_end
+            header = value[start:header_end].removesuffix("\r")
+            block_header = re.fullmatch(
+                r"[>|](?:[+-](?P<indent_after>[1-9])?|(?P<indent>[1-9])[+-]?)?"
+                r"(?:[ \t]*\#[^\r\n]*)?[ \t]*",
+                header,
+            )
+            if block_header:
+                line_start = value.rfind("\n", 0, match.start()) + 1
+                assignment_indent = len(value[line_start:match.start()]) - len(
+                    value[line_start:match.start()].lstrip(" \t")
+                )
+                explicit_indent = block_header.group("indent") or block_header.group("indent_after")
+                content_indent = assignment_indent + int(explicit_indent) if explicit_indent else None
+                end = header_end
+                line_start = header_end + 1
+                while line_start < len(value):
+                    line_end = value.find("\n", line_start)
+                    line_end = len(value) if line_end < 0 else line_end
+                    line = value[line_start:line_end].removesuffix("\r")
+                    indentation = len(line) - len(line.lstrip(" \t"))
+                    if line.strip():
+                        if content_indent is None:
+                            if indentation <= assignment_indent:
+                                if explicit_indent:
+                                    end = len(value)
+                                    break
+                                end = line_start - 1
+                                break
+                            content_indent = indentation
+                        elif indentation < content_indent:
+                            if explicit_indent:
+                                end = len(value)
+                                break
+                            end = line_start - 1
+                            break
+                    end = line_end
+                    if line_end == len(value):
+                        break
+                    line_start = line_end + 1
+            else:
+                end = len(value)
         elif label in {"authorization", "proxy-authorization", "cookie"}:
             line_end = value.find("\n", start)
             end = len(value) if line_end < 0 else line_end
