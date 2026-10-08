@@ -1,22 +1,34 @@
 import hashlib
 import json
+import os
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
+
+import need_radar.__main__ as tracer_cli
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class OfflineServeDemoTests(unittest.TestCase):
+    def run_subprocess(self, command, **options):
+        environment = os.environ.copy()
+        guarded_paths = [str(ROOT / "tests"), str(ROOT)]
+        if environment.get("PYTHONPATH"):
+            guarded_paths.append(environment["PYTHONPATH"])
+        environment["PYTHONPATH"] = os.pathsep.join(guarded_paths)
+        return subprocess.run(command, env=environment, **options)
+
     def invoke_fixture(self, temporary_directory, fixture):
         fixture_path = Path(temporary_directory) / "fixture.json"
         output = Path(temporary_directory) / "run"
         fixture_path.write_text(json.dumps(fixture))
-        result = subprocess.run(
+        result = self.run_subprocess(
             [
                 sys.executable,
                 "-m",
@@ -37,10 +49,14 @@ class OfflineServeDemoTests(unittest.TestCase):
         fixture["model"] = model
         return self.invoke_fixture(temporary_directory, fixture)
 
+    def test_redaction_is_idempotent_after_markdown_escaping(self):
+        safe_value = tracer_cli.markdown_literal("password=[REDACTED]")
+        self.assertEqual(tracer_cli.redact(safe_value), safe_value)
+
     def test_demo_persists_snapshot_prompt_candidates_report_and_lineage(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             output = Path(temporary_directory) / "run"
-            result = subprocess.run(
+            result = self.run_subprocess(
                 [sys.executable, "-m", "need_radar", "--output", str(output)],
                 cwd=ROOT,
                 capture_output=True,
@@ -77,25 +93,180 @@ class OfflineServeDemoTests(unittest.TestCase):
 
             with sqlite3.connect(output / "lineage.sqlite3") as database:
                 stages = database.execute(
-                    "SELECT stage, status, input_stage, input_sha256, artifact_path, output_sha256 "
+                    "SELECT stage, status, input_stage, input_sha256, artifact_path, output_sha256, "
+                    "trace_id, span_id, artifact_id, input_artifact_id, call_id "
                     "FROM stages ORDER BY sequence"
                 ).fetchall()
             self.assertEqual(
                 [stage[:3] for stage in stages],
                 [
                     ("snapshot", "success", None),
-                    ("prompt", "success", "snapshot"),
-                    ("model", "success", "prompt"),
-                    ("validation", "success", "model"),
+                    ("selection", "success", "snapshot"),
+                    ("context_assembly", "success", "selection"),
+                    ("truncation", "success", "context_assembly"),
+                    ("prompt_render", "success", "truncation"),
+                    ("model_call", "success", "prompt_render"),
+                    ("validation", "success", "model_call"),
                     ("report", "success", "validation"),
                 ],
             )
+            trace_events = [json.loads(line) for line in (output / "trace.jsonl").read_text().splitlines()]
+            observations = json.loads((output / "observability.json").read_text())
+            run_span = next(event for event in trace_events if event["name"] == "run")
+            self.assertIsNone(run_span["parent_span_id"])
+            self.assertTrue({stage[7] for stage in stages} <= {event["id"] for event in trace_events})
+            self.assertEqual({event["trace_id"] for event in trace_events}, {observations["ids"]["trace_id"]})
+            self.assertTrue(all(event["parent_span_id"] == run_span["id"] for event in trace_events if event is not run_span))
+            self.assertEqual(observations["remote_export"]["status"], "unverified")
+            self.assertFalse(observations["remote_export"]["enabled"])
+            self.assertFalse(observations["coverage"]["redaction"]["complete"])
+            self.assertEqual(observations["ids"]["snapshot_id"], stages[0][8])
+            self.assertEqual(observations["ids"]["report_id"], stages[-1][8])
+            self.assertEqual(observations["ids"]["call_id"], stages[5][10])
             for index, stage in enumerate(stages):
                 with self.subTest(stage=stage[0]):
                     artifact = (output / stage[4]).read_bytes()
                     self.assertEqual(hashlib.sha256(artifact).hexdigest(), stage[5])
+                    self.assertEqual(stage[6], observations["ids"]["trace_id"])
+                    self.assertTrue(stage[7])
+                    self.assertTrue(stage[8])
                     if index:
                         self.assertEqual(stage[3], stages[index - 1][5])
+                        self.assertEqual(stage[9], stages[index - 1][8])
+
+    def test_successful_fake_model_call_exposes_upstream_context_truncation(self):
+        def faulty_truncation(context):
+            items = [dict(item) for item in context["items"]]
+            items[0]["text"] = "synthetic test truncation removed the source excerpt"
+            return {
+                **context,
+                "items": items,
+                "truncated": True,
+                "reason": "injected upstream context bug",
+            }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "run"
+            with mock.patch.object(tracer_cli, "truncate_context", side_effect=faulty_truncation):
+                status = tracer_cli.run(tracer_cli.DEFAULT_FIXTURE, output)
+
+            self.assertEqual(status, "invalid_output")
+            truncation = json.loads((output / "truncation.json").read_text())
+            self.assertTrue(truncation["truncated"])
+            self.assertEqual(truncation["reason"], "injected upstream context bug")
+            prompt = json.loads((output / "prompt.json").read_text())
+            self.assertNotIn("I manually copy the same project context", prompt["messages"][1]["content"])
+            model = json.loads((output / "model-response.json").read_text())
+            self.assertEqual(model["status"], "success")
+            validation = json.loads((output / "candidates.json").read_text())
+            self.assertEqual(validation["status"], "invalid_output")
+            self.assertIn("does not resolve to prompt context", validation["errors"][0])
+            trace_events = [json.loads(line) for line in (output / "trace.jsonl").read_text().splitlines()]
+            model_span = next(event for event in trace_events if event["name"] == "model_call")
+            truncation_span = next(event for event in trace_events if event["name"] == "truncation")
+            self.assertEqual(model_span["metadata"]["result_status"], "success")
+            self.assertEqual(truncation_span["output"]["value"]["reason"], "injected upstream context bug")
+
+    def test_span_export_failure_does_not_block_serve_and_is_reported(self):
+        class FailingSink:
+            def write(self, record):
+                raise OSError("synthetic local exporter failure")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "run"
+            with mock.patch("need_radar.observability.JsonlSpanSink", return_value=FailingSink()):
+                status = tracer_cli.run(tracer_cli.DEFAULT_FIXTURE, output)
+
+            self.assertEqual(status, "success")
+            self.assertTrue((output / "report.md").is_file())
+            observations = json.loads((output / "observability.json").read_text())
+            self.assertEqual(observations["local_export"]["status"], "failed")
+            self.assertFalse(observations["coverage"]["complete"])
+            self.assertTrue(observations["local_export"]["failures"])
+            self.assertEqual(observations["remote_export"]["status"], "unverified")
+
+    def test_langfuse_boundary_preserves_ordinary_spans_and_context_in_local_sink(self):
+        class LocalSink:
+            def __init__(self):
+                self.records = []
+
+            def write(self, record):
+                self.records.append(record)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "run"
+            sink = LocalSink()
+            with mock.patch("need_radar.observability.JsonlSpanSink", return_value=sink):
+                status = tracer_cli.run(tracer_cli.DEFAULT_FIXTURE, output)
+
+            self.assertEqual(status, "success")
+            names = {record["name"] for record in sink.records}
+            self.assertTrue({"selection", "context_assembly", "truncation", "prompt_render", "model_call", "validation", "report"} <= names)
+            run_record = next(record for record in sink.records if record["name"] == "run")
+            self.assertIsNone(run_record["parent_span_id"])
+            self.assertTrue(all(record["run_id"] == run_record["run_id"] for record in sink.records))
+            self.assertTrue(all(record["trace_id"] == run_record["trace_id"] for record in sink.records))
+            self.assertTrue(all(
+                record["parent_span_id"] == run_record["id"]
+                for record in sink.records
+                if record is not run_record
+            ))
+            self.assertTrue(all(record["remote_status"] == "unverified" for record in sink.records))
+            self.assertTrue(all(record["external_export_enabled"] is False for record in sink.records))
+            model_record = next(record for record in sink.records if record["name"] == "model_call")
+            self.assertIn("UNTRUSTED SOURCE EVIDENCE", model_record["input"]["prompt"]["messages"][1]["content"])
+            self.assertNotIn("SYNTHETICONLY1234567890", json.dumps(sink.records))
+            self.assertTrue((output / "report.md").is_file())
+
+    def test_offline_child_process_denies_network_credentials_and_live_state(self):
+        script = """
+import socket
+
+try:
+    socket.socket()
+except PermissionError:
+    print('network=denied')
+else:
+    raise SystemExit('network=allowed')
+
+for name, path in (
+    ('credentials', '/home/ubuntu/projects/need-radar/credentials.env'),
+    ('live_state', '/home/ubuntu/.local/state/need-radar'),
+):
+    try:
+        open(path, 'rb')
+    except PermissionError:
+        print(name + '=denied')
+    else:
+        raise SystemExit(name + '=allowed')
+"""
+        result = self.run_subprocess(
+            [sys.executable, "-c", script],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("network=denied", result.stdout)
+        self.assertIn("credentials=denied", result.stdout)
+        self.assertIn("live_state=denied", result.stdout)
+
+    def test_synthetic_end_to_end_output_redacts_all_trace_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "run"
+            result = self.run_subprocess(
+                [sys.executable, "-m", "need_radar", "--output", str(output)],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("status=success", result.stdout)
+            for path in output.iterdir():
+                if path.is_file():
+                    self.assertNotIn(b"SYNTHETICONLY1234567890", path.read_bytes(), path.name)
+            observations = json.loads((output / "observability.json").read_text())
+            self.assertEqual(observations["remote_export"]["status"], "unverified")
 
     def test_empty_model_response_is_not_an_extraction_failure(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -239,7 +410,7 @@ class OfflineServeDemoTests(unittest.TestCase):
     def test_untrusted_source_stays_in_user_data_and_secret_is_redacted(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             output = Path(temporary_directory) / "run"
-            result = subprocess.run(
+            result = self.run_subprocess(
                 [sys.executable, "-m", "need_radar", "--output", str(output)],
                 cwd=ROOT,
                 capture_output=True,
@@ -269,7 +440,7 @@ class OfflineServeDemoTests(unittest.TestCase):
             fixture_path = Path(temporary_directory) / "fixture.json"
             output = Path(temporary_directory) / "run"
             fixture_path.write_text(json.dumps(fixture))
-            result = subprocess.run(
+            result = self.run_subprocess(
                 [sys.executable, "-m", "need_radar", "--fixture", str(fixture_path), "--output", str(output)],
                 cwd=ROOT,
                 capture_output=True,
@@ -457,7 +628,7 @@ class OfflineServeDemoTests(unittest.TestCase):
                 fixture_path = Path(temporary_directory) / "fixture.json"
                 output = Path(temporary_directory) / "run"
                 fixture_path.write_bytes(invalid_input)
-                result = subprocess.run(
+                result = self.run_subprocess(
                     [
                         sys.executable,
                         "-m",
@@ -496,7 +667,7 @@ class OfflineServeDemoTests(unittest.TestCase):
     def test_prompt_evidence_matches_the_redacted_frozen_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             output = Path(temporary_directory) / "run"
-            result = subprocess.run(
+            result = self.run_subprocess(
                 [sys.executable, "-m", "need_radar", "--output", str(output)],
                 cwd=ROOT,
                 capture_output=True,
@@ -512,7 +683,7 @@ class OfflineServeDemoTests(unittest.TestCase):
     def test_resolved_system_prompt_contains_target_and_v0_strategy(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             output = Path(temporary_directory) / "run"
-            result = subprocess.run(
+            result = self.run_subprocess(
                 [sys.executable, "-m", "need_radar", "--output", str(output)],
                 cwd=ROOT,
                 capture_output=True,
