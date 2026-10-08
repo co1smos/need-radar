@@ -489,6 +489,62 @@ print(safe_string({payload!r}))
         ):
             self.assertNotIn(secret, persisted)
 
+    def test_mixed_html_and_percent_encoding_is_normalized_before_secret_redaction(self):
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        encoded_tokens = (
+            "&#37;26#115;ynthetic-token",
+            "&#37;2526#115;ynthetic-token",
+            "&amp;#37;26#115;ynthetic-token",
+        )
+        over_limit = "&#115;ynthetic-token"
+        for _ in range(collect_reddit.MAX_URL_DECODE_ROUNDS + 1):
+            over_limit = html.escape(over_limit, quote=True)
+        self.assertIsNone(collect_reddit.decode_url_component(over_limit))
+        post["text"] = (
+            "hidden tokens " + "; ".join(encoded_tokens) + "; "
+            "encoded authority https://fixture-user&#37;26#115;ynthetic-token.example.org/path"
+        )
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            FixtureTransport([response(200, page)]),
+            FakeCredentials("synthetic-token"),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        artifacts = "\n".join(
+            path.read_text(encoding="utf-8") for path in self.recordings_dir.glob("*.json")
+        )
+        for _ in range(collect_reddit.MAX_URL_DECODE_ROUNDS):
+            artifacts = html.unescape(unquote(artifacts))
+        self.assertNotIn("synthetic-token", artifacts)
+
+        record_path = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        recorded_post = (
+            record["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        )
+        recorded_post["text"] = (
+            f"Authorization: Bearer {encoded_tokens[0]}; "
+            "encoded authority https://fixture-user&#37;26#115;ynthetic-token.example.org/path"
+        )
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        record_path.chmod(0o600)
+
+        replay_code, replay_stdout, replay_stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(replay_code, 0, replay_stderr)
+        self.assertEqual(json.loads(replay_stdout)["network_requests"], 0)
+        artifacts = "\n".join(
+            path.read_text(encoding="utf-8") for path in self.recordings_dir.glob("*.json")
+        )
+        for _ in range(collect_reddit.MAX_URL_DECODE_ROUNDS):
+            artifacts = html.unescape(unquote(artifacts))
+        self.assertNotIn("synthetic-token", artifacts)
+
     def test_sensitive_assignment_context_survives_embedded_url_splitting(self):
         page = fixture_body("feed-page-1.json")
         post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]

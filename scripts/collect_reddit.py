@@ -494,13 +494,16 @@ def decode_url_component(value):
     if not isinstance(value, str):
         return None
     for _ in range(MAX_URL_DECODE_ROUNDS):
-        decoded = decode_escaped_ascii(urllib.parse.unquote(value))
+        decoded = decode_escaped_ascii(html.unescape(urllib.parse.unquote(value)))
         if decoded is None:
             return None
         if decoded == value:
             return value
         value = decoded
-    if re.search(r"%[0-9a-f]{2}|\\u[0-9a-f]{4}", value, re.IGNORECASE):
+    if (
+        re.search(r"%[0-9a-f]{2}|\\u[0-9a-f]{4}", value, re.IGNORECASE)
+        or html.unescape(value) != value
+    ):
         return None
     return value
 
