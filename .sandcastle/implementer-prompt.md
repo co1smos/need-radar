@@ -19,9 +19,8 @@ Rules:
 - Work only in the current Sandcastle worktree and only on this issue.
 - The owner has already authorized implementation and criterion-scoped corrections for this offline issue. This is not a design interview; do not wait for routine correction approval. If genuinely blocked, fail honestly rather than returning a completed receipt with unchanged HEAD or invented metadata.
 - Read relevant source and tests before editing.
-- Use strict vertical RED → GREEN → REFACTOR: create a focused failing test, run it and observe the expected failure, implement the smallest correction, then rerun focused tests.
-- Run the repository checks named in the issue and prompt. Do not invent remote acceptance evidence.
-- For scaffolding/configuration work where production-code TDD is not applicable, add the smallest process-level acceptance check required by the issue and verify it before committing.
+- Implement the simplest coherent solution that satisfies the ticket. Prefer existing code and patterns over new abstractions.
+- Add focused regression tests for demonstrated failures, then run relevant checks. Do not invent remote acceptance evidence.
 - Commit all candidate changes. Do not push, merge, close/comment/edit issues, or mutate GitHub state.
 - Do not access or print credentials.
 - Do not launch hidden subagents or another Sandcastle workflow.

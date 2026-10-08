@@ -29,10 +29,10 @@ Review rules:
 
 - Need Radar: this is offline code readiness only; live acquisition and historical incident reconciliation are separate follow-up gates, not reasons to reject an otherwise passing offline criterion. No network, credentials or canonical live-state access. Use synthetic checks with network/protected-path denial in the test process and children under Hermes TMPDIR. Do not weaken safety gates or invent live evidence.
 
-- The original acceptance criteria are the fixed contract. Do not invent, append, or broaden acceptance criteria.
-- Every blocking code finding must map to one of the criteria you were asked to evaluate.
-- Reject speculative dependencies, frameworks, abstractions, and code outside the issue's vertical slice only when they cause a requested criterion to fail or create a material regression during final review.
-- Inspect the diff from {{BASE_SHA}} to {{CANDIDATE_HEAD}} and run only focused checks needed for this review mode.
+- Review the original acceptance criteria within the ticket's supported scope; do not broaden them.
+- Ask whether a reproducible failure is realistic and material enough to block this delivery, considering likelihood and impact. Violations of an explicit security boundary are material even if uncommon. Map every blocking finding to a requested criterion.
+- Record worthwhile non-blocking improvements as `followups`; they must not fail a criterion.
+- Inspect the diff from {{BASE_SHA}} to {{CANDIDATE_HEAD}} and run focused checks as needed.
 - Do not edit, stage, commit, push, merge, or mutate GitHub state.
 - Do not reuse or resume the implementer session. Do not launch hidden subagents.
 - Use `blocked` only for an external prerequisite that prevents a meaningful review.
@@ -57,4 +57,5 @@ Determine `CODEX_THREAD_ID` (by running `echo $CODEX_THREAD_ID` in the shell), c
 - reviewed_head: current candidate HEAD
 - completed_at: UTC timestamp
 - criteria: requested criterion results
+- followups: list of non-blocking findings (empty array when none)
 - blocker: external blocker explanation only when verdict is `blocked`; otherwise empty string

@@ -92,14 +92,14 @@ export function declaredBlockerNumbers(body = "") {
 
 /** @param {any[]} issues @param {any} options */
 export function selectReadyIssues(issues, options = {}) {
-  const { overrideNumber, maxParallel = 4 } = options;
+  const { overrideNumber, maxParallel = 4, excludedNumbers = new Set() } = options;
   if (!Array.isArray(issues)) throw new Error("issue list is invalid");
   const ordered = [...issues].sort((a, b) => a.number - b.number);
   const candidates = overrideNumber === undefined ? ordered : ordered.filter((i) => i.number === overrideNumber);
   if (overrideNumber !== undefined && candidates.length === 0) throw new Error(`override issue #${overrideNumber} was not returned by GitHub`);
   const ready = candidates.filter((issue) => {
     if (String(issue.state).toUpperCase() !== "OPEN") return false;
-    if (!issue.labels?.includes("ready-for-agent")) return false;
+    if (!issue.labels?.includes("ready-for-agent") || excludedNumbers.has(issue.number)) return false;
     return !issue.blockers?.some((b) => String(b.state).toUpperCase() !== "CLOSED");
   });
   if (overrideNumber !== undefined && ready.length === 0) throw new Error(`override issue #${overrideNumber} is not ready`);
@@ -225,6 +225,9 @@ export function validateReviewerReceipt(receipt, expected) {
   expectEqual(receipt.reviewed_head, expected.reviewedHead, "reviewed head");
   validateTimestamp(receipt.completed_at, "reviewer completed_at");
   if (!Array.isArray(receipt.criteria)) throw new Error("reviewer criteria must be an array");
+  if (!Array.isArray(receipt.followups) || receipt.followups.some((note) => typeof note !== "string" || !note.trim())) {
+    throw new Error("reviewer followups must be an array of non-empty strings");
+  }
   if (typeof receipt.blocker !== "string") throw new Error("reviewer blocker must be a string");
 
   const expectedIds = new Set(expected.expectedCriteriaIds);

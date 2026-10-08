@@ -74,6 +74,11 @@ test("selectReadyIssues returns deterministic ready frontier up to max parallel"
   assert.deepEqual(selectReadyIssues(issues, { maxParallel: 5 }).map((x) => x.number), [2, 3, 9]);
 });
 
+test("selectReadyIssues skips triage issues before applying parallelism", () => {
+  const issues = [issue(1), issue(2), issue(3), issue(4)];
+  assert.deepEqual(selectReadyIssues(issues, { maxParallel: 2, excludedNumbers: new Set([1, 2]) }).map((x) => x.number), [3, 4]);
+});
+
 test("selectReadyIssues supports a single issue override", () => {
   assert.deepEqual(selectReadyIssues([issue(2), issue(3)], { overrideNumber: 3 }).map((x) => x.number), [3]);
   assert.throws(() => selectReadyIssues([issue(2), issue(3, { labels: [] })], { overrideNumber: 3 }), /not ready/);
@@ -108,8 +113,21 @@ test("implementer and reviewer receipts enforce core contracts", () => {
   validateReviewerReceipt({
     phase: "reviewer", status: "completed", review_mode: "criteria", verdict: "approved",
     session_id: "session-b", reviewed_head: head, completed_at: new Date().toISOString(),
-    criteria: [{ id: "AC1", status: "passed", finding: "" }], blocker: "",
+    criteria: [{ id: "AC1", status: "passed", finding: "" }], followups: [], blocker: "",
   }, { reviewedHead: head, implementerSessionId: "session-a", reviewMode: "criteria", expectedCriteriaIds: ["AC1"] });
+});
+
+test("reviewer followups are non-blocking but validated", () => {
+  const head = "f".repeat(40);
+  const base = {
+    phase: "reviewer", status: "completed", review_mode: "criteria", verdict: "approved",
+    session_id: "review", reviewed_head: head, completed_at: new Date().toISOString(), blocker: "",
+    criteria: [{ id: "AC1", status: "passed", finding: "" }],
+  };
+  const expected = { reviewedHead: head, implementerSessionId: "implement", reviewMode: "criteria", expectedCriteriaIds: ["AC1"] };
+  assert.equal(validateReviewerReceipt({ ...base, followups: ["Optional rare input support"] }, expected).verdict, "approved");
+  assert.throws(() => validateReviewerReceipt({ ...base, followups: [""] }, expected), /followups/);
+  assert.throws(() => validateReviewerReceipt({ ...base }, expected), /followups/);
 });
 
 test("validateMergerReceipt requires exactly one result per candidate", () => {
@@ -220,7 +238,7 @@ test("criterion state converges one pending item at a time then can be reopened 
 
 test("reviewer validation is scoped to requested criteria and final review must cover all requested criteria", () => {
   const head = "e".repeat(40);
-  const base = { phase: "reviewer", status: "completed", session_id: "review-session", reviewed_head: head, completed_at: new Date().toISOString(), blocker: "" };
+  const base = { phase: "reviewer", status: "completed", session_id: "review-session", reviewed_head: head, completed_at: new Date().toISOString(), followups: [], blocker: "" };
   assert.equal(validateReviewerReceipt({
     ...base, review_mode: "criteria", verdict: "changes_requested",
     criteria: [{ id: "AC2", status: "failed", finding: "broken" }],
