@@ -2,137 +2,172 @@ import { join } from "node:path";
 
 const DEFAULTS = Object.freeze({
   baseSha: "HEAD",
-  focusedTest: "python3 -m unittest discover -s tests -v",
-  finalTest: "python3 -m unittest discover -s tests -v",
+  focusedTest: "npm test",
+  finalTest: "npm test",
+  integrationTest: "npm test",
   timeoutSeconds: 18_000,
+  maxParallel: 4,
 });
 
-const SESSION_ID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 const SHA_RE = /^[0-9a-f]{40}$/;
 const BRANCH_RE = /^(?!.*\.\.)(?!.*\/\/)(?!.*[.~^:?*\[\\])[^\s/][^\s]*[^\s/.]$/;
 const EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
+const HARNESSES = new Set(["codex", "claude-code", "pi"]);
 
 export function parseCliOptions(argv, env = process.env) {
   const values = {
-    issueOverride: optionalPositiveInteger(env.SANDCASTLE_ISSUE, "issue"),
-    baseSha: env.SANDCASTLE_BASE_SHA || DEFAULTS.baseSha,
-    branch: env.SANDCASTLE_BRANCH || undefined,
-    model: env.SANDCASTLE_MODEL || undefined,
-    effort: env.SANDCASTLE_EFFORT || undefined,
-    focusedTest: env.SANDCASTLE_FOCUSED_TEST || DEFAULTS.focusedTest,
-    finalTest: env.SANDCASTLE_FINAL_TEST || DEFAULTS.finalTest,
-    timeoutMs: parseTimeout(env.SANDCASTLE_TIMEOUT_SECONDS || DEFAULTS.timeoutSeconds),
-    dryRun: parseBoolean(env.SANDCASTLE_DRY_RUN || env.SANDCASTLE_PREFLIGHT || "false"),
+    issueOverride: optionalPositiveInteger(env.RALPH_ISSUE, "issue"),
+    baseSha: env.RALPH_BASE_SHA || DEFAULTS.baseSha,
+    branchPrefix: env.RALPH_BRANCH_PREFIX || "ralph/issue-",
+    maxParallel: positiveInteger(env.RALPH_MAX_PARALLEL || DEFAULTS.maxParallel, "max parallel"),
+    focusedTest: env.RALPH_FOCUSED_TEST || DEFAULTS.focusedTest,
+    finalTest: env.RALPH_FINAL_TEST || DEFAULTS.finalTest,
+    integrationTest: env.RALPH_INTEGRATION_TEST || DEFAULTS.integrationTest,
+    timeoutMs: parseTimeout(env.RALPH_TIMEOUT_SECONDS || DEFAULTS.timeoutSeconds),
+    dryRun: parseBoolean(env.RALPH_DRY_RUN || env.RALPH_PREFLIGHT || "false"),
+    implementer: phaseConfig("implementer", env),
+    reviewer: phaseConfig("reviewer", env),
+    merger: phaseConfig("merger", env),
   };
 
   const optionsWithValues = new Map([
-    ["--issue", (value) => { values.issueOverride = positiveInteger(value, "issue"); }],
-    ["--base-sha", (value) => { values.baseSha = required(value, "base SHA"); }],
-    ["--branch", (value) => { values.branch = required(value, "branch"); }],
-    ["--model", (value) => { values.model = required(value, "model"); }],
-    ["--effort", (value) => { values.effort = required(value, "effort"); }],
-    ["--focused-test", (value) => { values.focusedTest = required(value, "focused test"); }],
-    ["--final-test", (value) => { values.finalTest = required(value, "final test"); }],
-    ["--timeout", (value) => { values.timeoutMs = parseTimeout(value); }],
+    ["--issue", (v) => { values.issueOverride = positiveInteger(v, "issue"); }],
+    ["--base-sha", (v) => { values.baseSha = required(v, "base SHA"); }],
+    ["--branch-prefix", (v) => { values.branchPrefix = required(v, "branch prefix"); }],
+    ["--max-parallel", (v) => { values.maxParallel = positiveInteger(v, "max parallel"); }],
+    ["--focused-test", (v) => { values.focusedTest = required(v, "focused test"); }],
+    ["--final-test", (v) => { values.finalTest = required(v, "final test"); }],
+    ["--integration-test", (v) => { values.integrationTest = required(v, "integration test"); }],
+    ["--timeout", (v) => { values.timeoutMs = parseTimeout(v); }],
   ]);
+  for (const phase of ["implementer", "reviewer", "merger"]) {
+    optionsWithValues.set(`--${phase}-harness`, (v) => { values[phase].harness = required(v, `${phase} harness`); });
+    optionsWithValues.set(`--${phase}-model`, (v) => { values[phase].model = required(v, `${phase} model`); });
+    optionsWithValues.set(`--${phase}-effort`, (v) => { values[phase].effort = required(v, `${phase} effort`); });
+  }
 
-  for (let index = 0; index < argv.length; index += 1) {
-    const option = argv[index];
-    if (option === "--dry-run" || option === "--preflight") {
-      values.dryRun = true;
-      continue;
-    }
+  for (let i = 0; i < argv.length; i += 1) {
+    const option = argv[i];
+    if (option === "--dry-run" || option === "--preflight") { values.dryRun = true; continue; }
     const assign = optionsWithValues.get(option);
-    if (!assign) {
-      throw new Error(`unknown option: ${option}`);
-    }
-    index += 1;
-    if (index >= argv.length) {
-      throw new Error(`missing value for ${option}`);
-    }
-    assign(argv[index]);
+    if (!assign) throw new Error(`unknown option: ${option}`);
+    if (++i >= argv.length) throw new Error(`missing value for ${option}`);
+    assign(argv[i]);
   }
 
-  if (!values.model || !values.effort) {
-    throw new Error("model must be explicitly routed before preflight (set SANDCASTLE_MODEL and SANDCASTLE_EFFORT)");
-  }
-  if (!EFFORTS.has(values.effort)) {
-    throw new Error(`unsupported effort: ${values.effort}`);
-  }
-  if (values.branch && !BRANCH_RE.test(values.branch)) {
-    throw new Error(`invalid branch: ${values.branch}`);
-  }
+  for (const phase of ["implementer", "reviewer", "merger"]) validatePhaseConfig(phase, values[phase]);
   required(values.focusedTest, "focused test");
   required(values.finalTest, "final test");
+  required(values.integrationTest, "integration test");
+  if (!BRANCH_RE.test(`${values.branchPrefix}1`)) throw new Error(`invalid branch prefix: ${values.branchPrefix}`);
   return values;
 }
 
-export function parseProviderEnvName(configText) {
-  const providerMatch = configText.match(/^model_provider\s*=\s*["']([^"']+)["']/m);
-  if (!providerMatch) {
-    throw new Error("Codex config is missing model_provider");
+function phaseConfig(phase, env) {
+  const upper = phase.toUpperCase();
+  return {
+    harness: env[`RALPH_${upper}_HARNESS`] || undefined,
+    model: env[`RALPH_${upper}_MODEL`] || undefined,
+    effort: env[`RALPH_${upper}_EFFORT`] || undefined,
+  };
+}
+
+function validatePhaseConfig(phase, config) {
+  if (!config.harness || !config.model || !config.effort) {
+    throw new Error(`${phase} harness, model, and effort must be explicitly routed`);
   }
-  const header = `[model_providers.${providerMatch[1]}]`;
-  const lines = configText.split(/\r?\n/);
-  const start = lines.findIndex((line) => line.trim() === header);
-  const section = start < 0
-    ? undefined
-    : lines.slice(start + 1).findIndex((line) => /^\s*\[/.test(line)) < 0
-      ? lines.slice(start + 1).join("\n")
-      : lines.slice(start + 1, start + 1 + lines.slice(start + 1).findIndex((line) => /^\s*\[/.test(line))).join("\n");
-  const envKey = section?.match(/^env_key\s*=\s*["']([A-Za-z_][A-Za-z0-9_]*)["']/m)?.[1];
-  if (!envKey) {
-    throw new Error(`Codex provider ${providerMatch[1]} is missing env_key`);
-  }
-  return envKey;
+  if (!HARNESSES.has(config.harness)) throw new Error(`unsupported ${phase} harness: ${config.harness}`);
+  if (config.harness !== "codex") throw new Error(`${config.harness} harness is declared but not implemented in v1; use codex`);
+  if (!EFFORTS.has(config.effort)) throw new Error(`unsupported ${phase} effort: ${config.effort}`);
 }
 
 export function declaredBlockerNumbers(body = "") {
   const result = new Set();
   for (const line of body.split(/\r?\n/)) {
     if (!/^\s*(blocked by|depends on)\s*:/i.test(line)) continue;
-    for (const match of line.matchAll(/#(\d+)/g)) {
-      result.add(Number(match[1]));
-    }
+    for (const match of line.matchAll(/#(\d+)/g)) result.add(Number(match[1]));
   }
-  return [...result].sort((left, right) => left - right);
+  return [...result].sort((a, b) => a - b);
 }
 
-export function selectReadyIssue(issues, overrideNumber) {
+/** @param {any[]} issues @param {any} options */
+export function selectReadyIssues(issues, options = {}) {
+  const { overrideNumber, maxParallel = 4 } = options;
   if (!Array.isArray(issues)) throw new Error("issue list is invalid");
-  const ordered = [...issues].sort((left, right) => left.number - right.number);
-  const candidates = overrideNumber === undefined
-    ? ordered
-    : ordered.filter((issue) => issue.number === overrideNumber);
+  const ordered = [...issues].sort((a, b) => a.number - b.number);
+  const candidates = overrideNumber === undefined ? ordered : ordered.filter((i) => i.number === overrideNumber);
+  if (overrideNumber !== undefined && candidates.length === 0) throw new Error(`override issue #${overrideNumber} was not returned by GitHub`);
+  const ready = candidates.filter((issue) => {
+    if (String(issue.state).toUpperCase() !== "OPEN") return false;
+    if (!issue.labels?.includes("ready-for-agent")) return false;
+    return !issue.blockers?.some((b) => String(b.state).toUpperCase() !== "CLOSED");
+  });
+  if (overrideNumber !== undefined && ready.length === 0) throw new Error(`override issue #${overrideNumber} is not ready`);
+  return ready.slice(0, maxParallel);
+}
 
-  if (overrideNumber !== undefined && candidates.length === 0) {
-    throw new Error(`override issue #${overrideNumber} was not returned by GitHub`);
+
+export function extractAcceptanceCriteria(body = "") {
+  const lines = String(body).split(/\r?\n/);
+  const headingIndex = lines.findIndex((line) => /^#{1,6}\s+acceptance criteria\s*$/i.test(line.trim()));
+  let candidates = [];
+
+  if (headingIndex >= 0) {
+    const section = [];
+    for (let i = headingIndex + 1; i < lines.length; i += 1) {
+      if (/^#{1,6}\s+/.test(lines[i].trim())) break;
+      section.push(lines[i]);
+    }
+    candidates = listItems(section);
   }
 
-  for (const issue of candidates) {
-    if (String(issue.state).toUpperCase() !== "OPEN") {
-      if (overrideNumber !== undefined) throw new Error(`override issue #${issue.number} is not open`);
-      continue;
-    }
-    if (!issue.labels?.includes("ready-for-agent")) {
-      if (overrideNumber !== undefined) {
-        throw new Error(`override issue #${issue.number} lacks ready-for-agent`);
-      }
-      continue;
-    }
-    const openBlocker = issue.blockers?.find(
-      (blocker) => String(blocker.state).toUpperCase() !== "CLOSED",
-    );
-    if (openBlocker) {
-      if (overrideNumber !== undefined) {
-        throw new Error(`override issue #${issue.number} has open blocker #${openBlocker.number}`);
-      }
-      continue;
-    }
-    return issue;
+  if (!candidates.length) {
+    candidates = lines
+      .map((line) => line.match(/^\s*[-*+]\s+\[[ xX]\]\s+(.+?)\s*$/)?.[1])
+      .filter(Boolean);
   }
 
-  throw new Error("no unblocked open ready-for-agent issue is available");
+  if (!candidates.length) {
+    candidates = ["Satisfy the complete issue requirements and repository policy."];
+  }
+
+  return candidates.map((text, index) => ({ id: `AC${index + 1}`, text }));
+}
+
+function listItems(lines) {
+  return lines
+    .map((line) => line.match(/^\s*[-*+]\s+(?:\[[ xX]\]\s*)?(.+?)\s*$/)?.[1])
+    .filter(Boolean);
+}
+
+export function formatAcceptanceCriteria(criteria) {
+  return criteria.map((criterion) => `${criterion.id}: ${criterion.text}`).join("\n");
+}
+
+export function failedCriterionFindings(receipt, criteriaById) {
+  return receipt.criteria
+    .filter((criterion) => criterion.status === "failed")
+    .map((criterion) => `${criterion.id} (${criteriaById.get(criterion.id)?.text || criterion.id}): ${criterion.finding}`);
+}
+
+export function updateReviewState(reviewState, receipt) {
+  const results = new Map(receipt.criteria.map((criterion) => [criterion.id, criterion]));
+  return reviewState.map((criterion) => {
+    const result = results.get(criterion.id);
+    if (!result) return criterion;
+    return { ...criterion, status: result.status === "passed" ? "passed" : "pending" };
+  });
+}
+
+export function buildPhaseCommand({ harness, model, effort, worktreePath, schemaPath, receiptPath, promptPath }) {
+  if (harness !== "codex") throw new Error(`${harness} harness is not implemented in v1`);
+  const args = [
+    "unsnooze", "_run", "codex", "--ask-for-approval", "never", "--no-alt-screen", "exec",
+    "--model", model, "--config", `model_reasoning_effort=\"${effort}\"`,
+    "--sandbox", "danger-full-access", "--color", "never", "--cd", worktreePath,
+    "--output-schema", schemaPath, "--output-last-message", receiptPath, "-",
+  ];
+  return `${args.map(shellQuote).join(" ")} < ${shellQuote(promptPath)}`;
 }
 
 export function shellQuote(value) {
@@ -141,77 +176,29 @@ export function shellQuote(value) {
   return `'${text.replaceAll("'", `'"'"'`)}'`;
 }
 
-export function buildCodexPhaseCommand(options) {
-  const args = [
-    "unsnooze",
-    "_run",
-    "codex",
-    "--ask-for-approval",
-    "never",
-    "--no-alt-screen",
-    "exec",
-    "--model",
-    options.model,
-    "--config",
-    `model_reasoning_effort=\"${options.effort}\"`,
-    "--sandbox",
-    "danger-full-access",
-    "--color",
-    "never",
-    "--cd",
-    options.worktreePath,
-    "--output-schema",
-    options.schemaPath,
-    "--output-last-message",
-    options.receiptPath,
-    "-",
-  ];
-  return `${args.map(shellQuote).join(" ")} < ${shellQuote(options.promptPath)}`;
-}
-
-export function roundArtifactPaths(artifactRoot, round) {
+export function roundArtifactPaths(ticketRoot, round) {
   const prefix = `round-${round}`;
-  const controlDir = join(artifactRoot, "control");
+  const controlDir = join(ticketRoot, "control");
   return {
     implementerPromptPath: join(controlDir, `${prefix}-implementer.md`),
     implementerSchemaPath: join(controlDir, `${prefix}-implementer-schema.json`),
-    implementerReceiptPath: join(artifactRoot, `${prefix}-implementer.json`),
-    implementerPanePath: join(artifactRoot, `${prefix}-implementer-pane.txt`),
-    focusedTestPath: join(artifactRoot, `${prefix}-focused-test.txt`),
+    implementerReceiptPath: join(ticketRoot, `${prefix}-implementer.json`),
+    implementerPanePath: join(ticketRoot, `${prefix}-implementer-pane.txt`),
+    focusedTestPath: join(ticketRoot, `${prefix}-focused-test.txt`),
     reviewerPromptPath: join(controlDir, `${prefix}-reviewer.md`),
     reviewerSchemaPath: join(controlDir, `${prefix}-reviewer-schema.json`),
-    reviewerReceiptPath: join(artifactRoot, `${prefix}-reviewer.json`),
-    reviewerPanePath: join(artifactRoot, `${prefix}-reviewer-pane.txt`),
+    reviewerReceiptPath: join(ticketRoot, `${prefix}-reviewer.json`),
+    reviewerPanePath: join(ticketRoot, `${prefix}-reviewer-pane.txt`),
+    finalReviewerPromptPath: join(controlDir, `${prefix}-final-reviewer.md`),
+    finalReviewerSchemaPath: join(controlDir, `${prefix}-final-reviewer-schema.json`),
+    finalReviewerReceiptPath: join(ticketRoot, `${prefix}-final-reviewer.json`),
+    finalReviewerPanePath: join(ticketRoot, `${prefix}-final-reviewer-pane.txt`),
   };
 }
 
-export function buildImplementerRoundContext({
-  round,
-  currentHead,
-  reviewerFindings,
-  focusedTestEvidence,
-}) {
-  if (round === 1) {
-    return "This is the initial implementation round. Create the first candidate commit.";
-  }
-  return `This is correction round ${round}.
-Current candidate HEAD: ${currentHead}
-
-Exact reviewer findings from the previous round:
-${JSON.stringify(reviewerFindings)}
-
-Previous controller-owned focused-test evidence:
-${focusedTestEvidence.trimEnd()}
-
-You must correct these findings and create a new commit on top of the current candidate HEAD.`;
-}
-
-export function validateFreshSessionId(sessionId, usedSessionIds) {
-  validateSessionId(sessionId);
-  if (usedSessionIds.has(sessionId)) {
-    throw new Error(`Codex session_id reuses a prior session in this run: ${sessionId}`);
-  }
-  return sessionId;
+export function buildImplementerRoundContext({ round, currentHead, reviewerFindings, focusedTestEvidence }) {
+  if (round === 1) return "This is the initial implementation round. Create the first candidate commit.";
+  return `This is correction round ${round}.\nCurrent candidate HEAD: ${currentHead}\n\nExact reviewer findings from the previous round:\n${JSON.stringify(reviewerFindings)}\n\nPrevious controller-owned focused-test evidence:\n${focusedTestEvidence.trimEnd()}\n\nCorrect these findings and create a new commit on top of the current candidate HEAD.`;
 }
 
 export function validateImplementerReceipt(receipt, expected) {
@@ -219,7 +206,7 @@ export function validateImplementerReceipt(receipt, expected) {
   expectEqual(receipt.phase, "implementer", "implementer phase");
   expectEqual(receipt.status, "completed", "implementer status");
   expectEqual(receipt.issue_number, expected.issueNumber, "implementer issue number");
-  validateSessionId(receipt.session_id);
+  required(receipt.session_id, "implementer session_id");
   validateSha(receipt.head, "implementer head");
   expectEqual(receipt.head, expected.head, "implementer head");
   validateTimestamp(receipt.completed_at, "implementer completed_at");
@@ -230,163 +217,96 @@ export function validateReviewerReceipt(receipt, expected) {
   assertRecord(receipt, "reviewer receipt");
   expectEqual(receipt.phase, "reviewer", "reviewer phase");
   expectEqual(receipt.status, "completed", "reviewer status");
-  if (!["approved", "changes_requested", "blocked"].includes(receipt.verdict)) {
-    throw new Error(`invalid reviewer verdict: ${receipt.verdict}`);
-  }
-  validateSessionId(receipt.session_id);
-  if (receipt.session_id === expected.implementerSessionId) {
-    throw new Error("reviewer must use a fresh session");
-  }
+  expectEqual(receipt.review_mode, expected.reviewMode, "review mode");
+  if (!["approved", "changes_requested", "blocked"].includes(receipt.verdict)) throw new Error(`invalid reviewer verdict: ${receipt.verdict}`);
+  required(receipt.session_id, "reviewer session_id");
+  if (receipt.session_id === expected.implementerSessionId) throw new Error("reviewer must use a fresh session");
   validateSha(receipt.reviewed_head, "reviewed head");
   expectEqual(receipt.reviewed_head, expected.reviewedHead, "reviewed head");
   validateTimestamp(receipt.completed_at, "reviewer completed_at");
-  if (!Array.isArray(receipt.findings) || receipt.findings.some((finding) => typeof finding !== "string")) {
-    throw new Error("reviewer findings must be an array of strings");
+  if (!Array.isArray(receipt.criteria)) throw new Error("reviewer criteria must be an array");
+  if (typeof receipt.blocker !== "string") throw new Error("reviewer blocker must be a string");
+
+  const expectedIds = new Set(expected.expectedCriteriaIds);
+  const actualIds = new Set();
+  for (const criterion of receipt.criteria) {
+    assertRecord(criterion, "reviewer criterion");
+    if (!expectedIds.has(criterion.id)) throw new Error(`unexpected reviewer criterion ${criterion.id}`);
+    if (actualIds.has(criterion.id)) throw new Error(`duplicate reviewer criterion ${criterion.id}`);
+    actualIds.add(criterion.id);
+    if (!["passed", "failed"].includes(criterion.status)) throw new Error(`invalid reviewer criterion status for ${criterion.id}`);
+    if (typeof criterion.finding !== "string") throw new Error(`reviewer finding for ${criterion.id} must be a string`);
+    if (criterion.status === "passed" && criterion.finding !== "") throw new Error(`passed criterion ${criterion.id} must have an empty finding`);
+    if (criterion.status === "failed" && criterion.finding.trim() === "") throw new Error(`failed criterion ${criterion.id} must have a finding`);
   }
-  if (receipt.verdict === "approved" && receipt.findings.length > 0) {
-    throw new Error("approved reviewer verdict must have no findings");
+
+  if (receipt.verdict === "blocked") {
+    if (!receipt.blocker.trim()) throw new Error("blocked reviewer verdict must explain the blocker");
+    return receipt;
+  }
+
+  if (receipt.blocker !== "") throw new Error("non-blocked reviewer verdict must have an empty blocker");
+  if (actualIds.size !== expectedIds.size) throw new Error("reviewer receipt does not cover every requested criterion");
+  if (receipt.verdict === "approved" && receipt.criteria.some((criterion) => criterion.status !== "passed")) {
+    throw new Error("approved reviewer verdict requires every requested criterion to pass");
+  }
+  if (receipt.verdict === "changes_requested" && !receipt.criteria.some((criterion) => criterion.status === "failed")) {
+    throw new Error("changes_requested reviewer verdict requires at least one failed criterion");
   }
   return receipt;
 }
 
-export function roundDecision(verdict, testExitCode) {
-  if (testExitCode !== 0 || verdict === "changes_requested") return "correct";
-  if (verdict === "blocked") return "blocked";
-  if (verdict === "approved") return "accept";
-  throw new Error("invalid round verdict");
+export function validateMergerReceipt(receipt, expectedIssues) {
+  assertRecord(receipt, "merger receipt");
+  expectEqual(receipt.phase, "merger", "merger phase");
+  expectEqual(receipt.status, "completed", "merger status");
+  required(receipt.session_id, "merger session_id");
+  validateSha(receipt.final_head, "merger final head");
+  validateTimestamp(receipt.completed_at, "merger completed_at");
+  if (!Array.isArray(receipt.results)) throw new Error("merger results must be an array");
+  const expected = new Set(expectedIssues);
+  const actual = new Set();
+  for (const result of receipt.results) {
+    if (!expected.has(result.issue_number)) throw new Error(`unexpected merger issue #${result.issue_number}`);
+    if (actual.has(result.issue_number)) throw new Error(`duplicate merger issue #${result.issue_number}`);
+    actual.add(result.issue_number);
+    if (!["merged", "rejected"].includes(result.status)) throw new Error(`invalid merger result for #${result.issue_number}`);
+    if (typeof result.detail !== "string") throw new Error("merger result detail must be a string");
+  }
+  if (actual.size !== expected.size) throw new Error("merger receipt does not cover every candidate");
+  return receipt;
 }
 
-export function validateSessionEvidence(options) {
-  validateSessionId(options.receiptSessionId);
-  const paneSession = options.paneSession;
-  const liveCodexMatches = paneSession?.agent === "codex"
-    && paneSession.kind === "id"
-    && paneSession.value === options.receiptSessionId;
-  const completedUnsnoozePane = typeof options.paneUnsnoozeOwner === "string"
-    && options.paneUnsnoozeOwner.length > 0
-    && paneSession == null;
-  if (!liveCodexMatches && !completedUnsnoozePane) {
-    throw new Error("pane evidence does not identify the exact receipt session");
-  }
-  const phaseStarted = Date.parse(options.phaseStartedAt);
-  if (!Number.isFinite(phaseStarted)) throw new Error("invalid phase start timestamp");
-  const matchingRollouts = options.rollouts.filter((rollout) =>
-    rollout.sessionId === options.receiptSessionId
-      && rollout.cwd === options.worktreePath
-      && Date.parse(rollout.startedAt) >= phaseStarted,
-  );
-  if (matchingRollouts.length !== 1) {
-    throw new Error("rollout evidence does not identify exactly one matching session");
-  }
-  return { rolloutPath: matchingRollouts[0].path };
+export function summarizeSettled(issues, settled) {
+  return settled.map((outcome, index) => ({ issue: issues[index], outcome }));
 }
 
-export function hasLingeringUnsnoozeState(statusText, sessionId) {
-  return statusText.includes(sessionId) && /\[(RESUMING|STOPPED|HELD)\]/i.test(statusText);
+export function successfulCandidates(summary) {
+  return summary
+    .filter((entry) => entry.outcome.status === "fulfilled")
+    .map((entry) => entry.outcome.value);
 }
 
 function required(value, label) {
-  if (typeof value !== "string" || value.trim() === "") {
-    throw new Error(`${label} must not be empty`);
-  }
+  if (typeof value !== "string" || value.trim() === "") throw new Error(`${label} must not be empty`);
   return value;
 }
-
 function positiveInteger(value, label) {
-  if (!/^\d+$/.test(String(value)) || Number(value) < 1) {
-    throw new Error(`${label} must be a positive integer`);
-  }
+  if (!/^\d+$/.test(String(value)) || Number(value) < 1) throw new Error(`${label} must be a positive integer`);
   return Number(value);
 }
-
-function optionalPositiveInteger(value, label) {
-  return value === undefined || value === "" ? undefined : positiveInteger(value, label);
-}
-
+function optionalPositiveInteger(value, label) { return value === undefined || value === "" ? undefined : positiveInteger(value, label); }
 function parseTimeout(value) {
   const seconds = Number(value);
-  if (!Number.isFinite(seconds) || seconds <= 0) {
-    throw new Error("timeout must be a positive number of seconds");
-  }
+  if (!Number.isFinite(seconds) || seconds <= 0) throw new Error("timeout must be a positive number of seconds");
   return Math.floor(seconds * 1000);
 }
-
 function parseBoolean(value) {
   if (["1", "true", "yes"].includes(String(value).toLowerCase())) return true;
   if (["0", "false", "no", ""].includes(String(value).toLowerCase())) return false;
   throw new Error(`invalid boolean: ${value}`);
 }
-
-function assertRecord(value, label) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`${label} must be an object`);
-  }
-}
-
-function expectEqual(actual, expected, label) {
-  if (actual !== expected) throw new Error(`${label} mismatch`);
-}
-
-function validateSessionId(value) {
-  if (typeof value !== "string" || !new RegExp(`^${SESSION_ID_RE.source}$`, "i").test(value)) {
-    throw new Error("invalid Codex session_id");
-  }
-}
-
-function validateSha(value, label) {
-  if (typeof value !== "string" || !SHA_RE.test(value)) throw new Error(`invalid ${label}`);
-}
-
-function validateTimestamp(value, label) {
-  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
-    throw new Error(`invalid ${label}`);
-  }
-}
-
-// Only the final diagnostic from this attempt is authoritative. A bare 429,
-// retry exhaustion without a status, or an earlier recovered error is not enough.
-export function isQuotaExit(exitCode, output) {
-  if (!Number.isInteger(exitCode) || exitCode === 0) return false;
-  const diagnostics = output.replace(/\x1b\[[0-9;]*m/g, "").split(/\r?\n/)
-    .filter((line) => /^ERROR:/i.test(line));
-  return /^ERROR:\s*(?:stream disconnected before completion:\s*)?(?:exceeded retry limit,\s*last status:|unexpected status|HTTP(?: status)?)[ :]+429\b/i
-    .test(diagnostics.at(-1) || "");
-}
-
-// Each fresh phase attempt also probes availability through the existing
-// Unsnooze/Codex path. No alternate model or separate paid probe is needed.
-export async function runPhaseWithRetry({ timeoutMs, now, sleep, start, inspect, validate, close }) {
-  const deadline = now() + timeoutMs;
-  const checkDeadline = () => {
-    if (now() >= deadline) throw new Error("timed out waiting for phase receipt");
-  };
-  let backoffMs = 1000;
-  for (let attempt = 1; ; attempt += 1) {
-    checkDeadline();
-    const worker = await start(attempt);
-    try {
-      while (true) {
-        checkDeadline();
-        const state = await inspect(worker);
-        checkDeadline();
-        if (state.receipt !== undefined && state.exitCode === 0) {
-          await validate(worker, state.receipt);
-          checkDeadline();
-          return { receipt: state.receipt, attempt };
-        }
-        if (state.exitCode !== undefined) {
-          if (!isQuotaExit(state.exitCode, state.output || "")) {
-            throw new Error(`phase worker exited with code ${state.exitCode} before receipt`);
-          }
-          break;
-        }
-        await sleep(Math.min(500, deadline - now()));
-      }
-    } finally {
-      await close(worker);
-    }
-    checkDeadline();
-    await sleep(Math.min(backoffMs, deadline - now()));
-    backoffMs = Math.min(backoffMs * 2, 15 * 60 * 1000);
-  }
-}
+function assertRecord(value, label) { if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`); }
+function expectEqual(actual, expected, label) { if (actual !== expected) throw new Error(`${label} mismatch`); }
+function validateSha(value, label) { if (typeof value !== "string" || !SHA_RE.test(value)) throw new Error(`invalid ${label}`); }
+function validateTimestamp(value, label) { if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) throw new Error(`invalid ${label}`); }

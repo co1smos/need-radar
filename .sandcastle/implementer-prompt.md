@@ -14,15 +14,13 @@ Round context:
 
 Rules:
 
-- Owner explicitly authorized implementation and commits for this issue; historical documentation-only restrictions are superseded for this work. Keep other activation gates intact.
-- This run is offline code correction only. No live acquisition, provider/account calls, credential or canonical live-state access, installations, telemetry exports, Discord sends, or schedules. Do not clear the historical acquisition incident hold. Tests must deny network and credential access, including subprocesses; use Hermes TMPDIR.
-- Preserve the starting candidate and resolve the cumulative findings. Fix shared invariants and test semantic complements, not only example strings. Keep an acceptance-criterion checklist; do not create a new framework.
-- Code acceptance is not live acceptance. The supervisor owns the remaining live evidence and safety gates.
+- Need Radar: offline code readiness only. No network/provider calls, credential or canonical live-state access, installs, schedules, telemetry exports or Discord sends. Use synthetic fixtures with network/protected-path denial in tests and children. Use Hermes TMPDIR. Keep live/incident holds intact; do not restart the old workflow or spawn another orchestrator.
 
 - Work only in the current Sandcastle worktree and only on this issue.
 - Read relevant source and tests before editing.
 - Use strict vertical RED → GREEN → REFACTOR: create a focused failing test, run it and observe the expected failure, implement the smallest correction, then rerun focused tests.
 - Run the repository checks named in the issue and prompt. Do not invent remote acceptance evidence.
+- For scaffolding/configuration work where production-code TDD is not applicable, add the smallest process-level acceptance check required by the issue and verify it before committing.
 - Commit all candidate changes. Do not push, merge, close/comment/edit issues, or mutate GitHub state.
 - Do not access or print credentials.
 - Do not launch hidden subagents or another Sandcastle workflow.

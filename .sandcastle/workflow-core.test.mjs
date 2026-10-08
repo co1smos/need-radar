@@ -3,481 +3,242 @@ import test from "node:test";
 
 import {
   buildImplementerRoundContext,
-  buildCodexPhaseCommand,
+  buildPhaseCommand,
   declaredBlockerNumbers,
-  hasLingeringUnsnoozeState,
+  extractAcceptanceCriteria,
+  failedCriterionFindings,
+  formatAcceptanceCriteria,
   parseCliOptions,
-  parseProviderEnvName,
   roundArtifactPaths,
-  selectReadyIssue,
-  shellQuote,
-  validateFreshSessionId,
+  selectReadyIssues,
+  summarizeSettled,
+  successfulCandidates,
+  updateReviewState,
   validateImplementerReceipt,
+  validateMergerReceipt,
   validateReviewerReceipt,
-  validateSessionEvidence,
 } from "./workflow-core.mjs";
 
-test("parseCliOptions applies safe defaults and environment overrides", () => {
-  assert.throws(
-    () => parseCliOptions([], {}),
-    /model must be explicitly routed/,
-  );
+const routingEnv = {
+  RALPH_IMPLEMENTER_HARNESS: "codex",
+  RALPH_IMPLEMENTER_MODEL: "gpt-6-luna",
+  RALPH_IMPLEMENTER_EFFORT: "max",
+  RALPH_REVIEWER_HARNESS: "codex",
+  RALPH_REVIEWER_MODEL: "gpt-6-astra",
+  RALPH_REVIEWER_EFFORT: "medium",
+  RALPH_MERGER_HARNESS: "codex",
+  RALPH_MERGER_MODEL: "gpt-6-luna",
+  RALPH_MERGER_EFFORT: "high",
+};
 
-  assert.deepEqual(parseCliOptions([], {
-    SANDCASTLE_MODEL: "gpt-5.6-luna",
-    SANDCASTLE_EFFORT: "medium",
-  }), {
-    issueOverride: undefined,
-    baseSha: "HEAD",
-    branch: undefined,
-    model: "gpt-5.6-luna",
-    effort: "medium",
-    focusedTest: "python3 -m unittest discover -s tests -v",
-    finalTest: "python3 -m unittest discover -s tests -v",
-    timeoutMs: 18_000_000,
-    dryRun: false,
-  });
-
-  assert.deepEqual(
-    parseCliOptions(
-      ["--issue", "42", "--branch", "sandcastle/issue-42", "--preflight"],
-      {
-        SANDCASTLE_BASE_SHA: "abc123",
-        SANDCASTLE_MODEL: "gpt-5.6-sol",
-        SANDCASTLE_EFFORT: "high",
-        SANDCASTLE_FOCUSED_TEST: "python -m pytest -q tests/test_issue_42.py",
-        SANDCASTLE_FINAL_TEST: "python -m pytest -q && python -m compileall -q src",
-        SANDCASTLE_TIMEOUT_SECONDS: "90",
-      },
-    ),
-    {
-      issueOverride: 42,
-      baseSha: "abc123",
-      branch: "sandcastle/issue-42",
-      model: "gpt-5.6-sol",
-      effort: "high",
-      focusedTest: "python -m pytest -q tests/test_issue_42.py",
-      finalTest: "python -m pytest -q && python -m compileall -q src",
-      timeoutMs: 90_000,
-      dryRun: true,
-    },
-  );
+test("parseCliOptions requires explicit routing for all phases", () => {
+  assert.throws(() => parseCliOptions([], {}), /implementer harness, model, and effort/);
+  const options = parseCliOptions([], routingEnv);
+  assert.deepEqual(options.implementer, { harness: "codex", model: "gpt-6-luna", effort: "max" });
+  assert.deepEqual(options.reviewer, { harness: "codex", model: "gpt-6-astra", effort: "medium" });
+  assert.deepEqual(options.merger, { harness: "codex", model: "gpt-6-luna", effort: "high" });
+  assert.equal(options.maxParallel, 4);
 });
 
-test("SANDCASTLE_MAX_MODEL_CALLS is not a supported parsing control", () => {
-  const routed = {
-    SANDCASTLE_MODEL: "gpt-5.6-luna",
-    SANDCASTLE_EFFORT: "medium",
-  };
-  const options = parseCliOptions([], {
-    ...routed,
-    SANDCASTLE_MAX_MODEL_CALLS: "3",
-  });
-
-  assert.equal(Object.hasOwn(options, "maxModelCalls"), false);
-  assert.deepEqual(options, parseCliOptions([], routed));
+test("CLI phase routing overrides env", () => {
+  const options = parseCliOptions([
+    "--implementer-model", "gpt-6-sol", "--reviewer-effort", "high",
+    "--merger-model", "gpt-6-astra", "--max-parallel", "2", "--preflight",
+  ], routingEnv);
+  assert.equal(options.implementer.model, "gpt-6-sol");
+  assert.equal(options.reviewer.effort, "high");
+  assert.equal(options.merger.model, "gpt-6-astra");
+  assert.equal(options.maxParallel, 2);
+  assert.equal(options.dryRun, true);
 });
 
-test("parseCliOptions rejects unsafe or ambiguous values", () => {
-  const routed = { SANDCASTLE_MODEL: "gpt-5.6-luna", SANDCASTLE_EFFORT: "medium" };
-  assert.throws(() => parseCliOptions(["--issue", "0"], routed), /positive integer/);
-  assert.throws(() => parseCliOptions(["--timeout", "nope"], routed), /timeout/);
-  assert.throws(() => parseCliOptions(["--wat"], routed), /unknown option/);
-  assert.throws(
-    () => parseCliOptions(["--branch", "main; rm -rf x"], routed),
-    /branch/,
-  );
+test("v1 rejects declared but unimplemented harnesses cleanly", () => {
+  assert.throws(() => parseCliOptions([], { ...routingEnv, RALPH_REVIEWER_HARNESS: "pi" }), /pi harness is declared but not implemented in v1/);
+  assert.throws(() => parseCliOptions([], { ...routingEnv, RALPH_IMPLEMENTER_HARNESS: "claude-code" }), /claude-code harness is declared but not implemented in v1/);
 });
 
-test("parseProviderEnvName reads the configured Codex provider credential name", () => {
-  const config = `
-model_provider = "headroom"
-
-[model_providers.headroom]
-name = "CLIProxyAPI via Headroom"
-env_key = "HERMES_CUSTOM_127_0_0_1_8317_API_KEY"
-`;
-  assert.equal(
-    parseProviderEnvName(config),
-    "HERMES_CUSTOM_127_0_0_1_8317_API_KEY",
-  );
-  assert.throws(() => parseProviderEnvName("model = \"gpt-5.6-luna\""), /model_provider/);
+test("declaredBlockerNumbers extracts fallback blocker declarations", () => {
+  assert.deepEqual(declaredBlockerNumbers("Blocked by: #3, #7\nDepends on: #9\nfoo #11"), [3, 7, 9]);
 });
 
-test("declaredBlockerNumbers extracts and de-duplicates fallback blocker declarations", () => {
-  assert.deepEqual(
-    declaredBlockerNumbers("Blocked by: #9, #3\nDepends on #9\nUnrelated #44"),
-    [3, 9],
-  );
-});
-
-test("selectReadyIssue uses the lowest-numbered unblocked ready issue", () => {
-  const issues = [
-    {
-      number: 8,
-      state: "OPEN",
-      labels: ["ready-for-agent"],
-      blockers: [],
-    },
-    {
-      number: 3,
-      state: "OPEN",
-      labels: ["ready-for-agent"],
-      blockers: [{ number: 1, state: "OPEN" }],
-    },
-    {
-      number: 5,
-      state: "OPEN",
-      labels: ["ready-for-agent"],
-      blockers: [{ number: 2, state: "CLOSED" }],
-    },
-  ];
-  assert.equal(selectReadyIssue(issues).number, 5);
-  assert.equal(selectReadyIssue(issues, 8).number, 8);
-  assert.throws(() => selectReadyIssue(issues, 3), /open blocker #1/);
-  assert.throws(() => selectReadyIssue(issues, 99), /override issue #99/);
-});
-
-test("shellQuote and buildCodexPhaseCommand produce one direct Unsnooze command", () => {
-  assert.equal(shellQuote("plain-value"), "plain-value");
-  assert.equal(shellQuote("it's spaced"), `'it'"'"'s spaced'`);
-
-  const command = buildCodexPhaseCommand({
-    model: "gpt-5.6-sol",
-    effort: "medium",
-    worktreePath: "/tmp/work tree",
-    schemaPath: "/tmp/run/implementer-schema.json",
-    receiptPath: "/tmp/run/implementer.json",
-    promptPath: "/tmp/run/implementer prompt.md",
-  });
-
-  assert.equal(
-    command,
-    "unsnooze _run codex --ask-for-approval never --no-alt-screen exec --model gpt-5.6-sol --config 'model_reasoning_effort=\"medium\"' --sandbox danger-full-access --color never --cd '/tmp/work tree' --output-schema /tmp/run/implementer-schema.json --output-last-message /tmp/run/implementer.json - < '/tmp/run/implementer prompt.md'",
-  );
-  assert.doesNotMatch(command, /resume|--last/);
-});
-
-test("validateImplementerReceipt requires the expected issue, session, and Git head", () => {
-  const receipt = {
-    phase: "implementer",
-    status: "completed",
-    issue_number: 42,
-    session_id: "01a08d05-d511-7582-bcff-2c26d5ae3c5a",
-    head: "a".repeat(40),
-    completed_at: "2026-09-11T00:00:00.000Z",
-  };
-  assert.deepEqual(
-    validateImplementerReceipt(receipt, {
-      issueNumber: 42,
-      head: "a".repeat(40),
-    }),
-    receipt,
-  );
-  assert.throws(
-    () => validateImplementerReceipt({ ...receipt, head: "b".repeat(40) }, {
-      issueNumber: 42,
-      head: "a".repeat(40),
-    }),
-    /head/,
-  );
-});
-
-test("validateReviewerReceipt enforces a fresh session and verdict contract", () => {
-  const receipt = {
-    phase: "reviewer",
-    status: "completed",
-    verdict: "approved",
-    session_id: "01a08da0-ad62-75d2-b850-b0cbf944a1c9",
-    reviewed_head: "a".repeat(40),
-    completed_at: "2026-09-11T00:02:00.000Z",
-    findings: [],
-  };
-  assert.deepEqual(
-    validateReviewerReceipt(receipt, {
-      reviewedHead: "a".repeat(40),
-      implementerSessionId: "01a08d05-d511-7582-bcff-2c26d5ae3c5a",
-    }),
-    receipt,
-  );
-  assert.throws(
-    () => validateReviewerReceipt({ ...receipt, findings: ["missing test"] }, {
-      reviewedHead: "a".repeat(40),
-      implementerSessionId: "01a08d05-d511-7582-bcff-2c26d5ae3c5a",
-    }),
-    /approved.*findings/,
-  );
-  assert.throws(
-    () => validateReviewerReceipt({ ...receipt, session_id: "01a08d05-d511-7582-bcff-2c26d5ae3c5a" }, {
-      reviewedHead: "a".repeat(40),
-      implementerSessionId: "01a08d05-d511-7582-bcff-2c26d5ae3c5a",
-    }),
-    /fresh session/,
-  );
-});
-
-test("round artifacts are unique across correction rounds", () => {
-  assert.deepEqual(roundArtifactPaths("/tmp/run", 1), {
-    implementerPromptPath: "/tmp/run/control/round-1-implementer.md",
-    implementerSchemaPath: "/tmp/run/control/round-1-implementer-schema.json",
-    implementerReceiptPath: "/tmp/run/round-1-implementer.json",
-    implementerPanePath: "/tmp/run/round-1-implementer-pane.txt",
-    focusedTestPath: "/tmp/run/round-1-focused-test.txt",
-    reviewerPromptPath: "/tmp/run/control/round-1-reviewer.md",
-    reviewerSchemaPath: "/tmp/run/control/round-1-reviewer-schema.json",
-    reviewerReceiptPath: "/tmp/run/round-1-reviewer.json",
-    reviewerPanePath: "/tmp/run/round-1-reviewer-pane.txt",
-  });
-  assert.notDeepEqual(
-    roundArtifactPaths("/tmp/run", 1),
-    roundArtifactPaths("/tmp/run", 2),
-  );
-});
-
-test("correction implementer context includes exact prior review and test evidence", () => {
-  assert.equal(buildImplementerRoundContext({
-    round: 2,
-    currentHead: "a".repeat(40),
-    reviewerFindings: ["Add the missing airport-code assertion.", "Keep the existing fallback."],
-    focusedTestEvidence: "12 passing\n",
-  }), `This is correction round 2.
-Current candidate HEAD: ${"a".repeat(40)}
-
-Exact reviewer findings from the previous round:
-["Add the missing airport-code assertion.","Keep the existing fallback."]
-
-Previous controller-owned focused-test evidence:
-12 passing
-
-You must correct these findings and create a new commit on top of the current candidate HEAD.`);
-});
-
-test("session IDs cannot be reused from any earlier phase in the run", () => {
-  const firstImplementer = "01a08d05-d511-7582-bcff-2c26d5ae3c5a";
-  const firstReviewer = "01a08da0-ad62-75d2-b850-b0cbf944a1c9";
-  const secondImplementer = "01a08e10-468d-7c87-a4ea-a1d405b46554";
-  const used = new Set([firstImplementer, firstReviewer]);
-
-  assert.equal(validateFreshSessionId(secondImplementer, used), secondImplementer);
-  assert.throws(() => validateFreshSessionId(firstImplementer, used), /prior session/);
-  assert.throws(() => validateFreshSessionId(firstReviewer, used), /prior session/);
-});
-
-test("validateSessionEvidence requires exact pane and rollout agreement", () => {
-  const sessionId = "01a08d05-d511-7582-bcff-2c26d5ae3c5a";
-  const evidence = validateSessionEvidence({
-    receiptSessionId: sessionId,
-    paneSession: {
-      agent: "codex",
-      kind: "id",
-      source: "herdr:codex",
-      value: sessionId,
-    },
-    rollouts: [
-      {
-        sessionId,
-        cwd: "/tmp/worktree",
-        startedAt: "2026-09-11T00:00:01.000Z",
-        path: "/home/ubuntu/.codex/sessions/rollout.jsonl",
-      },
-    ],
-    worktreePath: "/tmp/worktree",
-    phaseStartedAt: "2026-09-11T00:00:00.000Z",
-  });
-  assert.equal(evidence.rolloutPath, "/home/ubuntu/.codex/sessions/rollout.jsonl");
-
-  assert.throws(
-    () => validateSessionEvidence({
-      receiptSessionId: sessionId,
-      paneSession: undefined,
-      rollouts: [],
-      worktreePath: "/tmp/worktree",
-      phaseStartedAt: "2026-09-11T00:00:00.000Z",
-    }),
-    /pane evidence/,
-  );
-  assert.throws(
-    () => validateSessionEvidence({
-      receiptSessionId: sessionId,
-      paneSession: {
-        agent: "codex",
-        kind: "id",
-        source: "herdr:codex",
-        value: "01a08da0-ad62-75d2-b850-b0cbf944a1c9",
-      },
-      rollouts: [],
-      worktreePath: "/tmp/worktree",
-      phaseStartedAt: "2026-09-11T00:00:00.000Z",
-    }),
-    /pane evidence/,
-  );
-});
-
-test("validateSessionEvidence accepts an Unsnooze-owned idle shell after Codex exits", () => {
-  const sessionId = "01a0911b-7b0a-70a2-a87d-f58c47d241d1";
-  const evidence = validateSessionEvidence({
-    receiptSessionId: sessionId,
-    paneSession: undefined,
-    paneUnsnoozeOwner: "599fbdfe-911d-4c11-a936-d6e91b603624",
-    rollouts: [
-      {
-        sessionId,
-        cwd: "/tmp/worktree",
-        startedAt: "2026-09-11T15:34:52.434Z",
-        path: "/home/ubuntu/.codex/sessions/rollout.jsonl",
-      },
-    ],
-    worktreePath: "/tmp/worktree",
-    phaseStartedAt: "2026-09-11T15:34:51.000Z",
-  });
-
-  assert.equal(evidence.rolloutPath, "/home/ubuntu/.codex/sessions/rollout.jsonl");
-});
-
-test("validateSessionEvidence still rejects a shell without Unsnooze ownership", () => {
-  const sessionId = "01a0911b-7b0a-70a2-a87d-f58c47d241d1";
-  assert.throws(() => validateSessionEvidence({
-    receiptSessionId: sessionId,
-    paneSession: undefined,
-    paneUnsnoozeOwner: undefined,
-    rollouts: [{
-      sessionId,
-      cwd: "/tmp/worktree",
-      startedAt: "2026-09-11T15:34:52.434Z",
-      path: "/home/ubuntu/.codex/sessions/rollout.jsonl",
-    }],
-    worktreePath: "/tmp/worktree",
-    phaseStartedAt: "2026-09-11T15:34:51.000Z",
-  }), /pane evidence/);
-});
-
-test("validateSessionEvidence accepts Herdr pane identity after long output evicts the session header", () => {
-  const sessionId = "01a08ef7-dc47-7341-9bd0-ba1569b4a2f7";
-  const evidence = validateSessionEvidence({
-    receiptSessionId: sessionId,
-    paneText: "the last 300 lines contain only the end of a very large diff",
-    paneSession: {
-      agent: "codex",
-      kind: "id",
-      source: "herdr:codex",
-      value: sessionId,
-    },
-    rollouts: [
-      {
-        sessionId,
-        cwd: "/tmp/worktree",
-        startedAt: "2026-09-11T05:30:01.000Z",
-        path: "/home/ubuntu/.codex/sessions/rollout.jsonl",
-      },
-    ],
-    worktreePath: "/tmp/worktree",
-    phaseStartedAt: "2026-09-11T05:30:00.000Z",
-  });
-
-  assert.equal(evidence.rolloutPath, "/home/ubuntu/.codex/sessions/rollout.jsonl");
-});
-
-test("lingering Unsnooze resuming state is warning evidence", () => {
-  const sessionId = "01a08d05-d511-7582-bcff-2c26d5ae3c5a";
-  assert.equal(
-    hasLingeringUnsnoozeState(`[RESUMING] codex ${sessionId}`, sessionId),
-    true,
-  );
-  assert.equal(hasLingeringUnsnoozeState("no tracked sessions", sessionId), false);
-});
-
-// Mock the production phase boundary: no provider requests or real panes.
-import { isQuotaExit, runPhaseWithRetry } from "./workflow-core.mjs";
-import { roundDecision } from "./workflow-core.mjs";
-
-test("corrections continue beyond three rounds; approval needs passing final gate", () => {
-  const events = [];
-  for (const verdict of ["changes_requested", "changes_requested", "changes_requested", "changes_requested", "approved"]) {
-    events.push("implement", "verify", "review");
-    if (roundDecision(verdict, 0) === "accept") break;
-    events.push("correct");
-  }
-  assert.equal(events.filter(e => e === "correct").length, 4);
-  assert.equal(events.filter(e => e === "implement").length, 5);
-  assert.equal(roundDecision("approved", 1), "correct");
-  assert.equal(roundDecision("blocked", 0), "blocked");
-  assert.throws(() => roundDecision("looks good", 0), /invalid/);
-});
-
-test("receipt before process exit cannot finish a phase", async () => {
-  const mock = mockPhase([{receipt: {session_id: "early"}}], 750);
-  await assert.rejects(mock.run(), /timed out/);
-  assert.equal(mock.events.some(([kind]) => kind === "validate"), false);
-});
-
-test("quota classification requires a terminal Codex 429 error, not incidental text", () => {
-  assert.equal(isQuotaExit(1, 'ERROR: exceeded retry limit, last status: 429 Too Many Requests'), true);
-  for (const output of [
-    'ERROR: exceeded retry limit, last status: 503 Service Unavailable',
-    'ERROR: authentication failed (401)',
-    'ERROR: could not read fixture for HTTP 429',
-    '429 Too Many Requests',
-    'test fixture: ERROR: exceeded retry limit, last status: 429',
-    'ERROR: exceeded retry limit, last status: 429\nERROR: invalid configuration',
-  ]) assert.equal(isQuotaExit(1, output), false, output);
-  assert.equal(isQuotaExit(0, 'ERROR: HTTP 429 Too Many Requests'), false);
-});
-
-function mockPhase(outputs, timeoutMs = 100_000) {
-  let time = 0;
-  const events = [];
-  const candidate = { head: 'candidate', dirty: 'preserved' };
-  const dependencies = {
-    now: () => time,
-    sleep: async (ms) => { events.push(['sleep', ms]); time += ms; },
-    start: async (attempt) => { events.push(['start', attempt]); return attempt; },
-    inspect: async (attempt) => outputs[attempt - 1],
-    validate: async (attempt, receipt) => { events.push(['validate', attempt, receipt.session_id]); },
-    close: async (attempt) => { events.push(['close', attempt]); },
-  };
-  return { events, candidate, run: () => runPhaseWithRetry({ timeoutMs, ...dependencies }) };
+function issue(number, { state = "OPEN", labels = ["ready-for-agent"], blockers = [] } = {}) {
+  return { number, title: `Issue ${number}`, state, labels, blockers };
 }
 
-test("mock phase: 429 exit retries in a fresh attempt and later receipt succeeds", async () => {
-  const receipt = { session_id: 'fresh-session' };
-  const mock = mockPhase([
-    { exitCode: 1, output: 'ERROR: exceeded retry limit, last status: 429 Too Many Requests' },
-    { receipt, exitCode: 0 },
-  ], 1_000_000);
-  assert.deepEqual(await mock.run(), { receipt, attempt: 2 });
-  assert.deepEqual(mock.events, [
-    ['start', 1], ['close', 1], ['sleep', 1000], ['start', 2],
-    ['validate', 2, 'fresh-session'], ['close', 2],
+test("selectReadyIssues returns deterministic ready frontier up to max parallel", () => {
+  const issues = [
+    issue(9), issue(2), issue(5, { blockers: [{ number: 1, state: "OPEN" }] }),
+    issue(1, { state: "CLOSED" }), issue(7, { labels: [] }), issue(3),
+  ];
+  assert.deepEqual(selectReadyIssues(issues, { maxParallel: 2 }).map((x) => x.number), [2, 3]);
+  assert.deepEqual(selectReadyIssues(issues, { maxParallel: 5 }).map((x) => x.number), [2, 3, 9]);
+});
+
+test("selectReadyIssues supports a single issue override", () => {
+  assert.deepEqual(selectReadyIssues([issue(2), issue(3)], { overrideNumber: 3 }).map((x) => x.number), [3]);
+  assert.throws(() => selectReadyIssues([issue(2), issue(3, { labels: [] })], { overrideNumber: 3 }), /not ready/);
+});
+
+test("buildPhaseCommand builds a visible Codex/Unsnooze noninteractive command", () => {
+  const command = buildPhaseCommand({
+    harness: "codex", model: "gpt-6-luna", effort: "high",
+    worktreePath: "/tmp/w t", schemaPath: "/tmp/schema.json", receiptPath: "/tmp/receipt.json", promptPath: "/tmp/prompt.md",
+  });
+  assert.match(command, /^unsnooze _run codex /);
+  assert.match(command, /--model gpt-6-luna/);
+  assert.match(command, /model_reasoning_effort/);
+  assert.match(command, /--output-last-message/);
+  assert.match(command, /< \/tmp\/prompt\.md$/);
+});
+
+test("round artifacts remain distinct across correction rounds", () => {
+  assert.notDeepEqual(roundArtifactPaths("/tmp/t", 1), roundArtifactPaths("/tmp/t", 2));
+});
+
+test("correction context contains exact review/test evidence", () => {
+  const text = buildImplementerRoundContext({ round: 2, currentHead: "abc", reviewerFindings: ["fix edge"], focusedTestEvidence: "FAIL x" });
+  assert.match(text, /fix edge/);
+  assert.match(text, /FAIL x/);
+  assert.match(text, /abc/);
+});
+
+test("implementer and reviewer receipts enforce core contracts", () => {
+  const head = "a".repeat(40);
+  validateImplementerReceipt({ phase: "implementer", status: "completed", issue_number: 4, session_id: "session-a", head, completed_at: new Date().toISOString() }, { issueNumber: 4, head });
+  validateReviewerReceipt({
+    phase: "reviewer", status: "completed", review_mode: "criteria", verdict: "approved",
+    session_id: "session-b", reviewed_head: head, completed_at: new Date().toISOString(),
+    criteria: [{ id: "AC1", status: "passed", finding: "" }], blocker: "",
+  }, { reviewedHead: head, implementerSessionId: "session-a", reviewMode: "criteria", expectedCriteriaIds: ["AC1"] });
+});
+
+test("validateMergerReceipt requires exactly one result per candidate", () => {
+  const receipt = {
+    phase: "merger", status: "completed", session_id: "merge-session", final_head: "b".repeat(40), completed_at: new Date().toISOString(),
+    results: [{ issue_number: 2, status: "merged", detail: "ok" }, { issue_number: 5, status: "rejected", detail: "conflict" }],
+  };
+  assert.equal(validateMergerReceipt(receipt, [2, 5]), receipt);
+  assert.throws(() => validateMergerReceipt({ ...receipt, results: receipt.results.slice(0, 1) }, [2, 5]), /does not cover every candidate/);
+});
+
+test("summarizeSettled preserves ticket/outcome alignment without sibling cancellation", async () => {
+  const issues = [issue(2), issue(3), issue(9)];
+  const settled = await Promise.allSettled([
+    Promise.resolve({ head: "a" }), Promise.reject(new Error("boom")), Promise.resolve({ head: "c" }),
   ]);
-  assert.deepEqual(mock.candidate, { head: 'candidate', dirty: 'preserved' });
+  const summary = summarizeSettled(issues, settled);
+  assert.deepEqual(summary.map((x) => [x.issue.number, x.outcome.status]), [[2, "fulfilled"], [3, "rejected"], [9, "fulfilled"]]);
 });
 
-test("mock phase: non-429 exit fails immediately and closes the pane", async () => {
-  const mock = mockPhase([{ exitCode: 1, output: 'ERROR: exceeded retry limit, last status: 503' }]);
-  await assert.rejects(mock.run(), /worker exited.*1/);
-  assert.deepEqual(mock.events, [['start', 1], ['close', 1]]);
+
+test("ticket-local failure does not cancel siblings and merger sees only fulfilled candidates", async () => {
+  let siblingFinished = false;
+  const issues = [issue(1), issue(2), issue(3)];
+  const settled = await Promise.allSettled([
+    Promise.resolve({ issue: 1, head: "a".repeat(40) }),
+    Promise.reject(new Error("reviewer crashed")),
+    new Promise((resolve) => setTimeout(() => {
+      siblingFinished = true;
+      resolve({ issue: 3, head: "c".repeat(40) });
+    }, 10)),
+  ]);
+  const summary = summarizeSettled(issues, settled);
+  assert.equal(siblingFinished, true);
+  assert.deepEqual(summary.map((x) => [x.issue.number, x.outcome.status]), [
+    [1, "fulfilled"], [2, "rejected"], [3, "fulfilled"],
+  ]);
+  assert.deepEqual(successfulCandidates(summary).map((x) => x.issue), [1, 3]);
 });
 
-test("quota retries use exponential backoff capped at fifteen minutes", async () => {
-  const mock = mockPhase(Array(13).fill({ exitCode: 1, output: 'ERROR: HTTP 429 Too Many Requests' }), 3_000_000);
-  await assert.rejects(mock.run(), /timed out/);
-  assert.deepEqual(mock.events.filter(([kind]) => kind === 'sleep').map(([, ms]) => ms),
-    [1000, 2000, 4000, 8000, 16000, 32000, 64000, 128000, 256000, 512000, 900000, 900000, 177000]);
-  assert.equal(mock.events.filter(([kind]) => kind === 'start').length, 13);
+test("all tickets failing yields an empty merger candidate set", async () => {
+  const issues = [issue(4), issue(5)];
+  const settled = await Promise.allSettled([
+    Promise.reject(new Error("implementer exited")),
+    Promise.reject(new Error("focused test failed")),
+  ]);
+  assert.deepEqual(successfulCandidates(summarizeSettled(issues, settled)), []);
 });
 
-test("receipt validation errors are terminal even with quota text", async () => {
-  await assert.rejects(runPhaseWithRetry({
-    timeoutMs: 1000, now: () => 0, sleep: async () => {},
-    start: async () => 1,
-    inspect: async () => ({ receipt: {}, exitCode: 0, output: 'ERROR: HTTP 429' }),
-    validate: async () => { throw new Error('wrong session'); },
-    close: async () => {},
-  }), /wrong session/);
+test("merger receipt cannot silently omit or invent failed-ticket outcomes", () => {
+  const base = {
+    phase: "merger", status: "completed", session_id: "merge-session",
+    final_head: "d".repeat(40), completed_at: new Date().toISOString(),
+  };
+  assert.throws(() => validateMergerReceipt({
+    ...base,
+    results: [{ issue_number: 1, status: "merged", detail: "ok" }],
+  }, [1, 3]), /does not cover every candidate/);
+  assert.throws(() => validateMergerReceipt({
+    ...base,
+    results: [
+      { issue_number: 1, status: "merged", detail: "ok" },
+      { issue_number: 2, status: "merged", detail: "should not be here" },
+    ],
+  }, [1, 3]), /unexpected merger issue #2/);
 });
 
-test("a live worker without a receipt polls only to the phase deadline and closes", async () => {
-  const mock = mockPhase([{}], 750);
-  await assert.rejects(mock.run(), /timed out/);
-  assert.deepEqual(mock.events, [['start', 1], ['sleep', 500], ['sleep', 250], ['close', 1]]);
+
+test("extractAcceptanceCriteria prefers the explicit acceptance section", () => {
+  const body = `## What to build\nDo it.\n\n## Acceptance criteria\n- [ ] first behavior\n- [ ] second behavior\n\n## Observability\n- [ ] separate policy checkbox`;
+  assert.deepEqual(extractAcceptanceCriteria(body), [
+    { id: "AC1", text: "first behavior" },
+    { id: "AC2", text: "second behavior" },
+  ]);
+});
+
+test("extractAcceptanceCriteria has bounded fallbacks for older tickets", () => {
+  assert.deepEqual(extractAcceptanceCriteria("- [ ] only checkbox"), [{ id: "AC1", text: "only checkbox" }]);
+  assert.deepEqual(extractAcceptanceCriteria("Just implement the described behavior."), [
+    { id: "AC1", text: "Satisfy the complete issue requirements and repository policy." },
+  ]);
+});
+
+test("criterion state converges one pending item at a time then can be reopened by final review", () => {
+  let state = [
+    { id: "AC1", text: "one", status: "pending" },
+    { id: "AC2", text: "two", status: "pending" },
+    { id: "AC3", text: "three", status: "pending" },
+  ];
+  state = updateReviewState(state, { criteria: [
+    { id: "AC1", status: "passed", finding: "" },
+    { id: "AC2", status: "failed", finding: "two is broken" },
+    { id: "AC3", status: "passed", finding: "" },
+  ] });
+  assert.deepEqual(state.map((x) => [x.id, x.status]), [["AC1", "passed"], ["AC2", "pending"], ["AC3", "passed"]]);
+  assert.deepEqual(state.filter((x) => x.status === "pending").map((x) => x.id), ["AC2"]);
+
+  state = updateReviewState(state, { criteria: [{ id: "AC2", status: "passed", finding: "" }] });
+  assert.equal(state.every((x) => x.status === "passed"), true);
+
+  state = updateReviewState(state, { criteria: [
+    { id: "AC1", status: "failed", finding: "regressed" },
+    { id: "AC2", status: "passed", finding: "" },
+    { id: "AC3", status: "passed", finding: "" },
+  ] });
+  assert.deepEqual(state.filter((x) => x.status === "pending").map((x) => x.id), ["AC1"]);
+});
+
+test("reviewer validation is scoped to requested criteria and final review must cover all requested criteria", () => {
+  const head = "e".repeat(40);
+  const base = { phase: "reviewer", status: "completed", session_id: "review-session", reviewed_head: head, completed_at: new Date().toISOString(), blocker: "" };
+  assert.equal(validateReviewerReceipt({
+    ...base, review_mode: "criteria", verdict: "changes_requested",
+    criteria: [{ id: "AC2", status: "failed", finding: "broken" }],
+  }, { reviewedHead: head, implementerSessionId: "impl", reviewMode: "criteria", expectedCriteriaIds: ["AC2"] }).verdict, "changes_requested");
+  assert.throws(() => validateReviewerReceipt({
+    ...base, review_mode: "final", verdict: "approved",
+    criteria: [{ id: "AC1", status: "passed", finding: "" }],
+  }, { reviewedHead: head, implementerSessionId: "impl", reviewMode: "final", expectedCriteriaIds: ["AC1", "AC2"] }), /does not cover every requested criterion/);
+  assert.throws(() => validateReviewerReceipt({
+    ...base, review_mode: "criteria", verdict: "changes_requested",
+    criteria: [{ id: "AC9", status: "failed", finding: "invented scope" }],
+  }, { reviewedHead: head, implementerSessionId: "impl", reviewMode: "criteria", expectedCriteriaIds: ["AC2"] }), /unexpected reviewer criterion AC9/);
+});
+
+test("failedCriterionFindings gives the implementer only currently failed criteria", () => {
+  const byId = new Map([["AC2", { id: "AC2", text: "second behavior" }]]);
+  assert.deepEqual(failedCriterionFindings({ criteria: [
+    { id: "AC2", status: "failed", finding: "fix this exact bug" },
+  ] }, byId), ["AC2 (second behavior): fix this exact bug"]);
+  assert.equal(formatAcceptanceCriteria([{ id: "AC2", text: "second behavior" }]), "AC2: second behavior");
 });

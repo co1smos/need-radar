@@ -227,6 +227,7 @@ __marimo__/
 /.sandcastle/worktrees/
 /.sandcastle/logs/
 /.sandcastle/runs/
+/.sandcastle/orchestrator.lock/
 
 # Node/TypeScript orchestration artifacts
 node_modules/

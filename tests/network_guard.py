@@ -3,7 +3,7 @@ import sys
 
 
 CREDENTIALS_PATH = "/home/ubuntu/projects/need-radar/credentials.env"
-LIVE_STATE_PATH = "/home/ubuntu/.local/state/need-radar/ticket-9"
+LIVE_STATE_PATH = "/home/ubuntu/.local/state/need-radar"
 
 
 def _deny(event, arguments):

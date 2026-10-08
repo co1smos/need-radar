@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["phase", "status", "session_id", "final_head", "completed_at", "results"],
+  "properties": {
+    "phase": { "type": "string", "enum": ["merger"] },
+    "status": { "type": "string", "enum": ["completed"] },
+    "session_id": { "type": "string", "minLength": 1 },
+    "final_head": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "completed_at": { "type": "string", "minLength": 1 },
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["issue_number", "status", "detail"],
+        "properties": {
+          "issue_number": { "type": "integer", "minimum": 1 },
+          "status": { "type": "string", "enum": ["merged", "rejected"] },
+          "detail": { "type": "string" }
+        }
+      }
+    }
+  }
+}

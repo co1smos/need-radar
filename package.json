@@ -2,9 +2,11 @@
   "name": "need-radar-orchestration",
   "private": true,
   "scripts": {
-    "sandcastle": "tsx .sandcastle/main.mts",
-    "sandcastle:preflight": "tsx .sandcastle/main.mts --preflight",
-    "test:sandcastle-workflow": "node --test .sandcastle/workflow-core.test.mjs",
+    "ralph": "tsx .sandcastle/main.mts",
+    "ralph:check": "tsx .sandcastle/main.mts --preflight",
+    "test": "npm run test:ralph && npm run test:offline",
+    "test:ralph": "node --test .sandcastle/workflow-core.test.mjs .sandcastle/orchestrator-process.test.mjs",
+    "test:offline": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tests python3 -m unittest discover -s tests -q",
     "typecheck:sandcastle-workflow": "tsc --noEmit --allowJs --checkJs false --module nodenext --moduleResolution nodenext --target es2022 --lib esnext --types node --skipLibCheck .sandcastle/main.mts"
   },
   "devDependencies": {

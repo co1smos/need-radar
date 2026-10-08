@@ -1,27 +1,28 @@
 import { createSandbox } from "@ai-hero/sandcastle";
 import { noSandbox } from "@ai-hero/sandcastle/sandboxes/no-sandbox";
 import { execFile } from "node:child_process";
-import { copyFile, mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
 import {
   buildImplementerRoundContext,
-  buildCodexPhaseCommand,
+  buildPhaseCommand,
   declaredBlockerNumbers,
-  hasLingeringUnsnoozeState,
+  extractAcceptanceCriteria,
+  failedCriterionFindings,
+  formatAcceptanceCriteria,
   parseCliOptions,
-  parseProviderEnvName,
   roundArtifactPaths,
-  roundDecision,
-  runPhaseWithRetry,
-  selectReadyIssue,
+  selectReadyIssues,
   shellQuote,
-  validateFreshSessionId,
+  summarizeSettled,
+  successfulCandidates,
+  updateReviewState,
   validateImplementerReceipt,
+  validateMergerReceipt,
   validateReviewerReceipt,
-  validateSessionEvidence,
 } from "./workflow-core.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -29,26 +30,15 @@ const root = process.cwd();
 const options = parseCliOptions(process.argv.slice(2));
 const runId = `${Date.now()}-${process.pid}`;
 const artifactRoot = join(root, ".sandcastle", "runs", runId);
-const reviewerModel = process.env.SANDCASTLE_REVIEW_MODEL || "gpt-6-astra";
-const reviewerEffort = process.env.SANDCASTLE_REVIEW_EFFORT || "medium";
-const usedSessionIds = new Set<string>();
-const phaseState: Record<string, any> = {pid: process.pid, runId, status: "running"};
-async function publish(update: Record<string, any>) {
-  Object.assign(phaseState, update, {updatedAt: new Date().toISOString()});
-  await mkdir(artifactRoot, {recursive: true});
-  const path = join(artifactRoot, "state.json");
-  await writeFile(path + ".tmp", JSON.stringify(phaseState, null, 2));
-  await rename(path + ".tmp", path);
-  console.log(JSON.stringify(phaseState));
-}
+const lockDir = join(root, ".sandcastle", "orchestrator.lock");
 
-const run = async (file: string, args: string[], cwd = root) => {
+type CommandResult = { exitCode: number; stdout: string; stderr: string };
+type Issue = any;
+type Candidate = { issue: Issue; branch: string; head: string; ticketRoot: string };
+
+const run = async (file: string, args: string[], cwd = root): Promise<CommandResult> => {
   try {
-    const result = await execFileAsync(file, args, {
-      cwd,
-      encoding: "utf8",
-      maxBuffer: 10 * 1024 * 1024,
-    });
+    const result = await execFileAsync(file, args, { cwd, encoding: "utf8", maxBuffer: 20 * 1024 * 1024 });
     return { exitCode: 0, stdout: result.stdout, stderr: result.stderr };
   } catch (error: any) {
     return {
@@ -61,41 +51,9 @@ const run = async (file: string, args: string[], cwd = root) => {
 
 const requireOk = async (file: string, args: string[], cwd = root) => {
   const result = await run(file, args, cwd);
-  if (result.exitCode !== 0) {
-    throw new Error(`${file} ${args.join(" ")} failed: ${result.stderr || result.stdout}`);
-  }
+  if (result.exitCode !== 0) throw new Error(`${file} ${args.join(" ")} failed: ${result.stderr || result.stdout}`);
   return result.stdout.trim();
 };
-
-const commandOk = async (command: string, cwd = root) => {
-  const result = await run("/bin/sh", ["-c", command], cwd);
-  return result;
-};
-
-async function resolveIssues() {
-  const list = JSON.parse(await requireOk("gh", [
-    "issue", "list", "--state", "all", "--limit", "100",
-    "--json", "number,title,body,state,labels,url",
-  ]));
-  const byNumber = new Map(list.map((issue: any) => [issue.number, issue]));
-  for (const issue of list) {
-    issue.nativeBlockers = JSON.parse(await requireOk("gh", ["api",
-      `repos/co1smos/need-radar/issues/${issue.number}/dependencies/blocked_by`]));
-  }
-  return list.map((issue: any) => ({
-    ...issue,
-    labels: issue.labels.map((label: any) => label.name),
-    blockers: [...issue.nativeBlockers, ...declaredBlockerNumbers(issue.body).map((number) => ({
-      number,
-      state: (byNumber.get(number) as any)?.state ?? "OPEN",
-    }))],
-  }));
-}
-
-async function readProviderEnvName() {
-  const configPath = join(process.env.CODEX_HOME || join(homedir(), ".codex"), "config.toml");
-  return parseProviderEnvName(await readFile(configPath, "utf8"));
-}
 
 function fillTemplate(template: string, values: Record<string, string | number>) {
   return template.replace(/\{\{([A-Z_]+)\}\}/g, (_, key) => {
@@ -104,400 +62,340 @@ function fillTemplate(template: string, values: Record<string, string | number>)
   });
 }
 
-async function createPane(cwd: string) {
+async function repoSlug() {
+  return requireOk("gh", ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"]);
+}
+
+async function resolveIssues(): Promise<Issue[]> {
+  const slug = await repoSlug();
+  const list = JSON.parse(await requireOk("gh", [
+    "issue", "list", "--state", "all", "--limit", "200",
+    "--json", "number,title,body,state,labels,url",
+  ]));
+  const byNumber = new Map(list.map((issue: any) => [issue.number, issue]));
+  for (const issue of list) {
+    const result = await run("gh", ["api", `repos/${slug}/issues/${issue.number}/dependencies/blocked_by`]);
+    issue.nativeBlockerNumbers = result.exitCode === 0
+      ? JSON.parse(result.stdout).map((blocker: any) => blocker.number)
+      : [];
+  }
+  return list.map((issue: any) => ({
+    ...issue,
+    labels: issue.labels.map((label: any) => label.name),
+    blockers: [...new Set([...issue.nativeBlockerNumbers, ...declaredBlockerNumbers(issue.body)])]
+      .sort((a: any, b: any) => a - b)
+      .map((number: any) => ({ number, state: (byNumber.get(number) as any)?.state ?? "OPEN" })),
+  }));
+}
+
+async function readCodexProviderEnvName() {
+  const configPath = join(process.env.CODEX_HOME || join(homedir(), ".codex"), "config.toml");
+  const text = await readFile(configPath, "utf8");
+  const provider = text.match(/^model_provider\s*=\s*["']([^"']+)["']/m)?.[1];
+  if (!provider) return undefined;
+  const escaped = provider.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const section = text.match(new RegExp(`\\[model_providers\\.${escaped}\\]([\\s\\S]*?)(?=\\n\\[|$)`))?.[1] || "";
+  return section.match(/^env_key\s*=\s*["']([A-Za-z_][A-Za-z0-9_]*)["']/m)?.[1];
+}
+
+async function createPane(cwd: string, metadata: Record<string, string>) {
   if (process.env.HERDR_ENV !== "1") throw new Error("workflow must run inside Herdr");
   const args = ["pane", "split", "--current", "--direction", "right", "--cwd", cwd];
-  // Reuse host Codex authentication; never put credentials in CLI arguments.
+  for (const [key, value] of Object.entries(metadata)) args.push("--env", `${key}=${value}`);
   args.push("--no-focus");
   const payload = JSON.parse(await requireOk("herdr", args));
   const paneId = payload?.result?.pane?.pane_id;
-  if (!paneId) throw new Error("Herdr did not return the created pane ID");
+  if (!paneId) throw new Error("Herdr did not return a pane ID");
   return paneId as string;
 }
 
-async function closePane(paneId: string) {
-  const payload = JSON.parse(await requireOk("herdr", ["pane", "process-info", "--pane", paneId]));
-  const info = payload.result.process_info;
-  if (info.foreground_processes.some((p: any) => p.pid !== info.shell_pid)) {
-    throw new Error(`worker still active in ${paneId}; preserve pane and worktree for supervisor`);
-  }
-  await requireOk("herdr", ["pane", "close", paneId]);
-}
-
+async function closePane(paneId: string) { await run("herdr", ["pane", "close", paneId]); }
 async function readPane(paneId: string) {
-  const result = await run("herdr", [
-    "pane", "read", paneId, "--source", "recent-unwrapped", "--lines", "300",
-  ]);
+  const result = await run("herdr", ["pane", "read", paneId, "--source", "recent-unwrapped", "--lines", "400"]);
   return result.stdout || result.stderr;
 }
 
-async function readPaneInfo(paneId: string) {
-  const result = await run("herdr", ["pane", "get", paneId]);
-  if (result.exitCode !== 0) return { error: result.stderr || result.stdout };
-  try {
-    return JSON.parse(result.stdout)?.result?.pane;
-  } catch {
-    return { error: "Herdr returned invalid pane metadata" };
-  }
-}
-
-async function readPaneEvidence(paneId: string) {
-  const paneInfo = await readPaneInfo(paneId);
-  return `Herdr pane metadata:\n${JSON.stringify(paneInfo, null, 2)}\n\nRecent pane output:\n${await readPane(paneId)}`;
-}
-
-async function readRollouts(worktreePath: string, phaseStartedAt: string) {
-  const rootDir = join(process.env.CODEX_HOME || join(homedir(), ".codex"), "sessions");
-  const found: any[] = [];
-  async function walk(directory: string) {
-    for (const entry of await readdir(directory, { withFileTypes: true }).catch(() => [])) {
-      const path = join(directory, entry.name);
-      if (entry.isDirectory()) await walk(path);
-      else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-        const info = await stat(path);
-        if (info.mtimeMs < Date.parse(phaseStartedAt) - 60_000) continue;
-        const first = (await readFile(path, "utf8")).split("\n")[0];
-        try {
-          const record = JSON.parse(first);
-          if (record.type === "session_meta") {
-            found.push({
-              sessionId: record.payload.session_id || record.payload.id,
-              cwd: record.payload.cwd,
-              startedAt: record.payload.timestamp || record.timestamp,
-              path,
-            });
-          }
-        } catch { /* ignore unrelated or partial rollout files */ }
-      }
-    }
-  }
-  await walk(rootDir);
-  return found.filter((item) => item.cwd === worktreePath);
-}
-
 async function readOptionalJson(path: string) {
+  try { return JSON.parse(await readFile(path, "utf8")); }
+  catch (error: any) { if (error.code === "ENOENT" || error instanceof SyntaxError) return undefined; throw error; }
+}
+
+async function runPhase({
+  phase, ticket, worktreePath, promptPath, schemaPath, receiptPath, paneEvidencePath, config, providerEnvName,
+}: any) {
+  const env: Record<string, string> = {
+    RALPH_RUN_ID: runId,
+    RALPH_PHASE: phase,
+    RALPH_TICKET: ticket == null ? "merger" : String(ticket),
+  };
+  if (providerEnvName && process.env[providerEnvName]) env[providerEnvName] = process.env[providerEnvName]!;
+  const paneId = await createPane(worktreePath, env);
+  const exitPath = `${receiptPath}.exit`;
+  const command = buildPhaseCommand({ ...config, worktreePath, schemaPath, receiptPath, promptPath });
+  const tracked = `${command}\nralph_exit=$?\nprintf '%s' "$ralph_exit" > ${shellQuote(exitPath)}`;
   try {
-    return JSON.parse(await readFile(path, "utf8"));
+    await requireOk("herdr", ["pane", "run", paneId, `/bin/sh -c ${shellQuote(tracked)}`]);
+    const deadline = Date.now() + options.timeoutMs;
+    while (Date.now() < deadline) {
+      const exitText = await readFile(exitPath, "utf8").catch(() => undefined);
+      if (exitText !== undefined) {
+        const receipt = await readOptionalJson(receiptPath);
+        if (exitText.trim() === "0" && receipt !== undefined) {
+          await writeFile(paneEvidencePath, await readPane(paneId));
+          return { receipt };
+        }
+        const output = await readPane(paneId);
+        throw new Error(`${phase} worker exited with code ${exitText.trim()} before valid receipt\n${output}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    throw new Error(`${phase} worker timed out`);
+  } finally {
+    await writeFile(paneEvidencePath, await readPane(paneId)).catch(() => {});
+    await closePane(paneId);
+  }
+}
+
+async function runTicket(issue: Issue, iteration: number, baseSha: string, providerEnvName?: string): Promise<Candidate> {
+  const ticketRoot = join(artifactRoot, `iteration-${iteration}`, `issue-${issue.number}`);
+  await mkdir(join(ticketRoot, "control"), { recursive: true });
+  const branch = `${options.branchPrefix}${issue.number}`;
+  await using sandbox = await createSandbox({ branch, baseBranch: baseSha, sandbox: noSandbox(), cwd: root });
+  const execInWorktree = (command: string) => sandbox.exec(command);
+  const top = await execInWorktree("git rev-parse --show-toplevel");
+  if (top.exitCode !== 0) throw new Error(top.stderr || top.stdout);
+  const worktreePath = top.stdout.trim();
+  const templates = {
+    implementer: await readFile(join(root, ".sandcastle", "implementer-prompt.md"), "utf8"),
+    reviewer: await readFile(join(root, ".sandcastle", "reviewer-prompt.md"), "utf8"),
+  };
+  const acceptanceCriteria = extractAcceptanceCriteria(issue.body);
+  const criteriaById = new Map(acceptanceCriteria.map((criterion: any) => [criterion.id, criterion]));
+  let reviewState = acceptanceCriteria.map((criterion: any) => ({ ...criterion, status: "pending" }));
+  const usedSessionIds = new Set<string>();
+  let round = 1;
+  let candidateHead = baseSha;
+  let reviewerFindings: string[] = [];
+  let focusedTestEvidence = "";
+  let lastImplementerSessionId = "";
+
+  const writeReviewState = async (phase: string) => {
+    await writeFile(join(ticketRoot, "review-state.json"), JSON.stringify({ phase, criteria: reviewState }, null, 2));
+  };
+
+  const runReviewer = async ({ mode, criteria, artifacts }: any) => {
+    const finalMode = mode === "final";
+    const promptPath = finalMode ? artifacts.finalReviewerPromptPath : artifacts.reviewerPromptPath;
+    const schemaPath = finalMode ? artifacts.finalReviewerSchemaPath : artifacts.reviewerSchemaPath;
+    const receiptPath = finalMode ? artifacts.finalReviewerReceiptPath : artifacts.reviewerReceiptPath;
+    const panePath = finalMode ? artifacts.finalReviewerPanePath : artifacts.reviewerPanePath;
+    const passed = reviewState.filter((criterion: any) => criterion.status === "passed");
+    await writeFile(promptPath, fillTemplate(templates.reviewer, {
+      ISSUE_NUMBER: issue.number,
+      ISSUE_TITLE: issue.title,
+      ISSUE_BODY: issue.body,
+      BASE_SHA: baseSha,
+      CANDIDATE_HEAD: candidateHead,
+      REVIEW_MODE: mode,
+      ALL_CRITERIA: formatAcceptanceCriteria(acceptanceCriteria),
+      CRITERIA_TO_REVIEW: formatAcceptanceCriteria(criteria),
+      PASSED_CRITERIA: finalMode
+        ? "(not applicable; final review re-evaluates all criteria from scratch)"
+        : (passed.length ? formatAcceptanceCriteria(passed) : "(none yet)"),
+      TEST_EVIDENCE: focusedTestEvidence,
+    }));
+    await copyFile(join(root, ".sandcastle", "reviewer-schema.json"), schemaPath);
+    const reviewer = await runPhase({
+      phase: finalMode ? "final-reviewer" : "reviewer",
+      ticket: issue.number,
+      worktreePath,
+      promptPath,
+      schemaPath,
+      receiptPath,
+      paneEvidencePath: panePath,
+      config: options.reviewer,
+      providerEnvName,
+    });
+    validateReviewerReceipt(reviewer.receipt, {
+      reviewedHead: candidateHead,
+      implementerSessionId: lastImplementerSessionId,
+      reviewMode: mode,
+      expectedCriteriaIds: criteria.map((criterion: any) => criterion.id),
+    });
+    if (usedSessionIds.has(reviewer.receipt.session_id)) throw new Error("reviewer session reused");
+    usedSessionIds.add(reviewer.receipt.session_id);
+    const headAfter = await execInWorktree("git rev-parse HEAD");
+    if (headAfter.stdout.trim() !== candidateHead) throw new Error("reviewer changed Git HEAD");
+    const dirty = await execInWorktree("git status --short --untracked-files=no");
+    if (dirty.stdout.trim()) throw new Error(`reviewer left tracked changes:\n${dirty.stdout}`);
+    if (reviewer.receipt.verdict === "blocked") throw new Error(`reviewer blocked: ${reviewer.receipt.blocker}`);
+    reviewState = updateReviewState(reviewState, reviewer.receipt);
+    await writeReviewState(finalMode ? "final-review" : "criteria-review");
+    return reviewer.receipt;
+  };
+
+  await writeReviewState("initial");
+
+  while (true) {
+    const artifacts = roundArtifactPaths(ticketRoot, round);
+    const previousHead = candidateHead;
+    await writeFile(artifacts.implementerPromptPath, fillTemplate(templates.implementer, {
+      ISSUE_NUMBER: issue.number, ISSUE_TITLE: issue.title, ISSUE_BODY: issue.body,
+      BASE_SHA: baseSha, BRANCH: branch,
+      ROUND_CONTEXT: buildImplementerRoundContext({ round, currentHead: candidateHead, reviewerFindings, focusedTestEvidence }),
+    }));
+    await copyFile(join(root, ".sandcastle", "implementer-schema.json"), artifacts.implementerSchemaPath);
+    const implementer = await runPhase({
+      phase: "implementer", ticket: issue.number, worktreePath,
+      promptPath: artifacts.implementerPromptPath, schemaPath: artifacts.implementerSchemaPath,
+      receiptPath: artifacts.implementerReceiptPath, paneEvidencePath: artifacts.implementerPanePath,
+      config: options.implementer, providerEnvName,
+    });
+    const head = await execInWorktree("git rev-parse HEAD");
+    if (head.exitCode !== 0) throw new Error(head.stderr);
+    candidateHead = head.stdout.trim();
+    validateImplementerReceipt(implementer.receipt, { issueNumber: issue.number, head: candidateHead });
+    if (usedSessionIds.has(implementer.receipt.session_id)) throw new Error("implementer session reused");
+    usedSessionIds.add(implementer.receipt.session_id);
+    lastImplementerSessionId = implementer.receipt.session_id;
+    if (candidateHead === previousHead) throw new Error("implementer did not create a new candidate commit");
+
+    const focused = await execInWorktree(options.focusedTest);
+    focusedTestEvidence = `${focused.stdout}\n${focused.stderr}`;
+    await writeFile(artifacts.focusedTestPath, focusedTestEvidence);
+    if (focused.exitCode !== 0) throw new Error("focused implementation gate failed");
+
+    const pendingCriteria = reviewState.filter((criterion: any) => criterion.status === "pending");
+    const criteriaReceipt = await runReviewer({ mode: "criteria", criteria: pendingCriteria, artifacts });
+    if (criteriaReceipt.verdict === "changes_requested") {
+      reviewerFindings = failedCriterionFindings(criteriaReceipt, criteriaById);
+      round += 1;
+      continue;
+    }
+
+    const finalReceipt = await runReviewer({ mode: "final", criteria: acceptanceCriteria, artifacts });
+    if (finalReceipt.verdict === "approved") break;
+    reviewerFindings = failedCriterionFindings(finalReceipt, criteriaById);
+    round += 1;
+  }
+
+  const final = await execInWorktree(options.finalTest);
+  await writeFile(join(ticketRoot, "final-test.txt"), `${final.stdout}\n${final.stderr}`);
+  if (final.exitCode !== 0) throw new Error("final acceptance gate failed");
+  await writeFile(join(ticketRoot, "result.json"), JSON.stringify({
+    status: "reviewed-local-candidate",
+    issue: issue.number,
+    branch,
+    head: candidateHead,
+    rounds: round,
+    acceptanceCriteria: reviewState,
+  }, null, 2));
+  return { issue, branch, head: candidateHead, ticketRoot };
+}
+
+async function runMerger(candidates: Candidate[], iteration: number, providerEnvName?: string) {
+  if (!candidates.length) return undefined;
+  const mergerRoot = join(artifactRoot, `iteration-${iteration}`, "merger");
+  await mkdir(join(mergerRoot, "control"), { recursive: true });
+  const targetBranch = await requireOk("git", ["branch", "--show-current"]);
+  const candidatesText = candidates.map((c) => `- issue #${c.issue.number}: branch ${c.branch}, reviewed HEAD ${c.head}`).join("\n");
+  const promptPath = join(mergerRoot, "control", "merger.md");
+  const schemaPath = join(mergerRoot, "control", "merger-schema.json");
+  const receiptPath = join(mergerRoot, "merger.json");
+  const panePath = join(mergerRoot, "merger-pane.txt");
+  const template = await readFile(join(root, ".sandcastle", "merger-prompt.md"), "utf8");
+  await writeFile(promptPath, fillTemplate(template, {
+    TARGET_BRANCH: targetBranch, CANDIDATES: candidatesText, INTEGRATION_TEST: options.integrationTest,
+  }));
+  await copyFile(join(root, ".sandcastle", "merger-schema.json"), schemaPath);
+  const merger = await runPhase({
+    phase: "merger", ticket: undefined, worktreePath: root, promptPath, schemaPath,
+    receiptPath, paneEvidencePath: panePath, config: options.merger, providerEnvName,
+  });
+  validateMergerReceipt(merger.receipt, candidates.map((c) => c.issue.number));
+  const currentHead = await requireOk("git", ["rev-parse", "HEAD"]);
+  if (currentHead !== merger.receipt.final_head) throw new Error("merger final HEAD does not match repository HEAD");
+  const integration = await run("/bin/sh", ["-c", options.integrationTest], root);
+  await writeFile(join(mergerRoot, "controller-integration-test.txt"), `${integration.stdout}\n${integration.stderr}`);
+  if (integration.exitCode !== 0) throw new Error("controller integration verification failed after merger");
+  return merger.receipt;
+}
+
+async function preflight(providerEnvName?: string) {
+  const required = ["git", "gh", "herdr", "codex", "unsnooze", "npm"];
+  for (const command of required) await requireOk("sh", ["-c", `command -v ${shellQuote(command)}`]);
+  if (process.env.HERDR_ENV !== "1") throw new Error("workflow must run inside Herdr");
+  if (providerEnvName && !process.env[providerEnvName]) throw new Error(`required Codex provider variable ${providerEnvName} is absent`);
+  const issues = await resolveIssues();
+  const ready = selectReadyIssues(issues, { overrideNumber: options.issueOverride, maxParallel: options.maxParallel });
+  console.log(JSON.stringify({ status: "preflight-ok", runId, routing: {
+    implementer: options.implementer, reviewer: options.reviewer, merger: options.merger,
+  }, maxParallel: options.maxParallel, readyIssues: ready.map((i) => i.number) }, null, 2));
+}
+
+async function acquireLock() {
+  try {
+    await mkdir(lockDir);
+    await writeFile(join(lockDir, "owner.json"), JSON.stringify({ runId, pid: process.pid, startedAt: new Date().toISOString() }, null, 2));
   } catch (error: any) {
-    if (error.code === "ENOENT" || error instanceof SyntaxError) return undefined;
+    if (error.code === "EEXIST") throw new Error("another Ralph orchestrator already owns this repository");
     throw error;
   }
 }
 
-async function runPhase({
-  phase,
-  worktreePath,
-  promptPath,
-  schemaPath,
-  receiptPath,
-  paneEvidencePath,
-  providerEnvName,
-}: {
-  phase: "implementer" | "reviewer";
-  worktreePath: string;
-  promptPath: string;
-  schemaPath: string;
-  receiptPath: string;
-  paneEvidencePath: string;
-  providerEnvName: string;
-}) {
-  await publish({phase, worktreePath});
-  const result = await runPhaseWithRetry({
-    timeoutMs: options.timeoutMs,
-    now: Date.now,
-    sleep: (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)),
-    start: async (attempt: number) => {
-      const phaseStartedAt = new Date().toISOString();
-      // Isolate receipts and exit markers so a failed attempt cannot satisfy a retry.
-      const attemptReceiptPath = `${receiptPath}.attempt-${attempt}`;
-      const exitPath = `${attemptReceiptPath}.exit`;
-      const paneId = await createPane(worktreePath);
-      await publish({workerPane: paneId, attempt});
-      const command = buildCodexPhaseCommand({
-        model: phase === "reviewer" ? reviewerModel : options.model,
-        effort: phase === "reviewer" ? reviewerEffort : options.effort,
-        worktreePath,
-        schemaPath,
-        receiptPath: attemptReceiptPath,
-        promptPath,
-      });
-      try {
-        // A dedicated shell writes the status only after Unsnooze has exited.
-        // Do not infer exit from an idle/missing agent_session during startup.
-        const trackedCommand = `export TMPDIR=${shellQuote(join(homedir(), '.hermes/cache/scratch'))}\n${command}\nsandcastle_exit=$?\nprintf '%s\\n' "$sandcastle_exit" > ${shellQuote(exitPath)}`;
-        await requireOk("herdr", ["pane", "run", paneId,
-          `/bin/sh -c ${shellQuote(trackedCommand)}`]);
-        return { paneId, phaseStartedAt, attemptReceiptPath, exitPath, attempt };
-      } catch (error) {
-        await closePane(paneId);
-        throw error;
-      }
-    },
-    inspect: async (worker: any) => {
-      // Read exit first, then receipt: an exit marker guarantees receipt writes ended.
-      let exitCode = await readOptionalJson(worker.exitPath);
-      const receipt = await readOptionalJson(worker.attemptReceiptPath);
-      const liveInfo = await readPaneInfo(worker.paneId);
-      if (liveInfo?.agent_session?.agent === "codex") worker.session = liveInfo.agent_session;
-      if (exitCode !== undefined) {
-        const payload = JSON.parse(await requireOk("herdr", ["pane", "process-info", "--pane", worker.paneId]));
-        const info = payload.result.process_info;
-        if (info.foreground_processes.some((p: any) => p.pid !== info.shell_pid)) exitCode = undefined;
-      }
-      return {
-        receipt,
-        exitCode,
-        output: exitCode === undefined ? "" : await readPane(worker.paneId),
-      };
-    },
-    validate: async (worker: any, receipt: any) => {
-      const paneInfo = await readPaneInfo(worker.paneId);
-      validateSessionEvidence({
-        receiptSessionId: receipt.session_id,
-        paneSession: worker.session || paneInfo?.agent_session,
-        paneUnsnoozeOwner: paneInfo?.tokens?.unsnooze_owner,
-        rollouts: await readRollouts(worktreePath, worker.phaseStartedAt),
-        worktreePath,
-        phaseStartedAt: worker.phaseStartedAt,
-      });
-      validateFreshSessionId(receipt.session_id, usedSessionIds);
-    },
-    close: async (worker: any) => {
-      try {
-        const evidence = await readPaneEvidence(worker.paneId);
-        await writeFile(`${paneEvidencePath}.attempt-${worker.attempt}`, evidence);
-        await writeFile(paneEvidencePath, evidence);
-      } finally {
-        await closePane(worker.paneId);
-      }
-    },
-  });
-  await writeFile(receiptPath, `${JSON.stringify(result.receipt, null, 2)}\n`);
-  return { receipt: result.receipt };
-}
+let ownsLock = false;
 
 async function main() {
-const issues = await resolveIssues();
-const issue = selectReadyIssue(issues, options.issueOverride);
-const baseSha = await requireOk("git", ["rev-parse", options.baseSha]);
-const branch = options.branch || `sandcastle/issue-${issue.number}`;
-const providerEnvName = "host-codex-auth";
-const requiredCommands = ["git", "gh", "herdr", "codex", "unsnooze", "python3"];
-for (const command of requiredCommands) await requireOk("sh", ["-c", `command -v ${shellQuote(command)}`]);
-if (process.env.HERDR_ENV !== "1") throw new Error("run inside a managed Herdr tab");
-for (const command of [options.focusedTest, options.finalTest]) {
-  if (!command.trim()) throw new Error("test command is empty");
+  const providerEnvName = await readCodexProviderEnvName();
+  if (options.dryRun) return preflight(providerEnvName);
+  await acquireLock();
+  ownsLock = true;
+  await mkdir(artifactRoot, { recursive: true });
+  await writeFile(join(artifactRoot, "run.json"), JSON.stringify({ runId, pid: process.pid, options, startedAt: new Date().toISOString() }, null, 2));
+  let iteration = 1;
+  let completedIterations = 0;
+  try {
+    while (true) {
+      const issues = await resolveIssues();
+      const ready = selectReadyIssues(issues, { overrideNumber: options.issueOverride, maxParallel: options.maxParallel });
+      if (!ready.length) break;
+      const baseSha = await requireOk("git", ["rev-parse", options.baseSha]);
+      const iterationRoot = join(artifactRoot, `iteration-${iteration}`);
+      await mkdir(iterationRoot, { recursive: true });
+      await writeFile(join(iterationRoot, "plan.json"), JSON.stringify({ iteration, baseSha, issues: ready.map((i) => i.number) }, null, 2));
+
+      const settled = await Promise.allSettled(ready.map((issue) => runTicket(issue, iteration, baseSha, providerEnvName)));
+      const summary = summarizeSettled(ready, settled);
+      const candidates = successfulCandidates(summary) as Candidate[];
+      for (const entry of summary) {
+        if (entry.outcome.status === "rejected") {
+          console.error(`issue #${entry.issue.number} failed this iteration: ${entry.outcome.reason}`);
+        }
+      }
+      await writeFile(join(iterationRoot, "settled.json"), JSON.stringify(summary.map((entry: any) => ({
+        issue: entry.issue.number,
+        status: entry.outcome.status,
+        ...(entry.outcome.status === "rejected" ? { error: String(entry.outcome.reason) } : { head: (entry.outcome.value as Candidate).head }),
+      })), null, 2));
+      await runMerger(candidates, iteration, providerEnvName);
+      completedIterations += 1;
+      if (options.issueOverride !== undefined) break;
+      iteration += 1;
+    }
+    console.log(JSON.stringify({ status: "complete", runId, iterations: completedIterations }, null, 2));
+  } finally {
+    if (ownsLock) {
+      await rm(lockDir, { recursive: true, force: true });
+      ownsLock = false;
+    }
+  }
 }
 
-const plan = {
-  issue: { number: issue.number, title: issue.title, url: issue.url },
-  baseSha,
-  branch,
-  model: options.model,
-  effort: options.effort,
-  timeoutMs: options.timeoutMs,
-  reviewerModel,
-  reviewerEffort,
-  tests: { focused: options.focusedTest, final: options.finalTest },
-  providerEnvName,
-  phases: ["implementer", "reviewer"],
-  githubMutation: false,
-};
-
-if (options.dryRun) {
-  const artifacts = roundArtifactPaths("<artifacts>", 1);
-  console.log(JSON.stringify({
-    status: "preflight-ok",
-    ...plan,
-    plannedCommands: {
-      implementer: buildCodexPhaseCommand({
-        model: options.model,
-        effort: options.effort,
-        worktreePath: "<worktree>",
-        schemaPath: artifacts.implementerSchemaPath,
-        receiptPath: artifacts.implementerReceiptPath,
-        promptPath: artifacts.implementerPromptPath,
-      }),
-      reviewer: buildCodexPhaseCommand({
-        model: reviewerModel,
-        effort: reviewerEffort,
-        worktreePath: "<worktree>",
-        schemaPath: artifacts.reviewerSchemaPath,
-        receiptPath: artifacts.reviewerReceiptPath,
-        promptPath: artifacts.reviewerPromptPath,
-      }),
-    },
-  }, null, 2));
-  process.exit(0);
-}
-
-await mkdir(artifactRoot, { recursive: true });
-await writeFile(join(artifactRoot, "plan.json"), `${JSON.stringify(plan, null, 2)}\n`);
-await publish({issue: issue.number, branch, phase: "starting"});
-
-const sandbox = await createSandbox({
-  branch,
-  baseBranch: baseSha,
-  sandbox: noSandbox(),
-  cwd: root,
-});
-const execInWorktree = async (command: string) => sandbox.exec(command);
-const top = await execInWorktree("git rev-parse --show-toplevel");
-if (top.exitCode !== 0) throw new Error(top.stderr || top.stdout);
-const worktreePath = top.stdout.trim();
-const startHead = await requireOk("git", ["rev-parse", "HEAD"], worktreePath);
-if (startHead !== baseSha) throw new Error("candidate branch differs from explicit base SHA");
-await publish({worktreePath, baseSha});
-const reviewBase = process.env.SANDCASTLE_REVIEW_BASE || baseSha;
-await requireOk("git", ["merge-base", "--is-ancestor", reviewBase, startHead], worktreePath);
-const context = process.env.SANDCASTLE_CONTEXT_FILE
-  ? await readFile(process.env.SANDCASTLE_CONTEXT_FILE, "utf8") : "";
-issue.body += `\n\nCurrent authorized execution context:\n${context}`;
-const controlDir = join(artifactRoot, "control");
-await mkdir(controlDir, { recursive: true });
-
-const templates = {
-  implementer: await readFile(join(root, ".sandcastle", "implementer-prompt.md"), "utf8"),
-  reviewer: await readFile(join(root, ".sandcastle", "reviewer-prompt.md"), "utf8"),
-};
-const implementerSessionIds: string[] = [];
-const reviewerSessionIds: string[] = [];
-let round = 1;
-let candidateHead = baseSha;
-let reviewerFindings: string[] = context ? [context] : [];
-let focusedTestEvidence = "";
-
-while (true) {
-  await publish({round, phase: "implementer", head: candidateHead});
-  const artifacts = roundArtifactPaths(artifactRoot, round);
-  const previousCandidateHead = candidateHead;
-  const implementerPrompt = fillTemplate(templates.implementer, {
-    ISSUE_NUMBER: issue.number,
-    ISSUE_TITLE: issue.title,
-    ISSUE_BODY: issue.body,
-    BASE_SHA: reviewBase,
-    BRANCH: branch,
-    ROUND_CONTEXT: buildImplementerRoundContext({
-      round,
-      currentHead: candidateHead,
-      reviewerFindings,
-      focusedTestEvidence,
-    }),
-  });
-  await writeFile(artifacts.implementerPromptPath, implementerPrompt);
-  await copyFile(join(root, ".sandcastle", "implementer-schema.json"), artifacts.implementerSchemaPath);
-
-  const implementer = await runPhase({
-    phase: "implementer",
-    worktreePath,
-    promptPath: artifacts.implementerPromptPath,
-    schemaPath: artifacts.implementerSchemaPath,
-    receiptPath: artifacts.implementerReceiptPath,
-    paneEvidencePath: artifacts.implementerPanePath,
-    providerEnvName,
-  });
-  const implementationHeadResult = await execInWorktree("git rev-parse HEAD");
-  if (implementationHeadResult.exitCode !== 0) throw new Error(implementationHeadResult.stderr);
-  candidateHead = implementationHeadResult.stdout.trim();
-  validateImplementerReceipt(implementer.receipt, { issueNumber: issue.number, head: candidateHead });
-  validateFreshSessionId(implementer.receipt.session_id, usedSessionIds);
-  usedSessionIds.add(implementer.receipt.session_id);
-  implementerSessionIds.push(implementer.receipt.session_id);
-  if (candidateHead === previousCandidateHead) throw new Error("implementer did not create a new candidate commit");
-
-  const focused = await execInWorktree(options.focusedTest);
-  focusedTestEvidence = `${focused.stdout}\n${focused.stderr}`;
-  await writeFile(artifacts.focusedTestPath, focusedTestEvidence);
-  if (roundDecision("approved", focused.exitCode) === "correct") {
-    reviewerFindings.push(`Round ${round}: controller test gate failed:\n${focusedTestEvidence}`);
-    round += 1;
-    continue;
-  }
-
-  const reviewerPrompt = fillTemplate(templates.reviewer, {
-    ISSUE_NUMBER: issue.number,
-    ISSUE_TITLE: issue.title,
-    ISSUE_BODY: issue.body,
-    BASE_SHA: reviewBase,
-    CANDIDATE_HEAD: candidateHead,
-    TEST_EVIDENCE: focusedTestEvidence + "\nCumulative findings:\n" + reviewerFindings.join("\n"),
-  });
-  await writeFile(artifacts.reviewerPromptPath, reviewerPrompt);
-  await copyFile(join(root, ".sandcastle", "reviewer-schema.json"), artifacts.reviewerSchemaPath);
-
-  const reviewer = await runPhase({
-    phase: "reviewer",
-    worktreePath,
-    promptPath: artifacts.reviewerPromptPath,
-    schemaPath: artifacts.reviewerSchemaPath,
-    receiptPath: artifacts.reviewerReceiptPath,
-    paneEvidencePath: artifacts.reviewerPanePath,
-    providerEnvName,
-  });
-  validateReviewerReceipt(reviewer.receipt, {
-    reviewedHead: candidateHead,
-    implementerSessionId: implementer.receipt.session_id,
-  });
-  validateFreshSessionId(reviewer.receipt.session_id, usedSessionIds);
-  usedSessionIds.add(reviewer.receipt.session_id);
-  reviewerSessionIds.push(reviewer.receipt.session_id);
-
-  const headAfterReview = await execInWorktree("git rev-parse HEAD");
-  if (headAfterReview.stdout.trim() !== candidateHead) throw new Error("reviewer changed Git HEAD");
-  const dirtyAfterReview = await execInWorktree("git status --short");
-  if (dirtyAfterReview.stdout.trim()) {
-    throw new Error(`reviewer left tracked worktree changes:\n${dirtyAfterReview.stdout}`);
-  }
-
-  if (reviewer.receipt.verdict === "approved") {
-    const final = await execInWorktree(options.finalTest);
-    await writeFile(join(artifactRoot, "final-test.txt"), `${final.stdout}\n${final.stderr}`);
-    if (roundDecision(reviewer.receipt.verdict, final.exitCode) === "accept") break;
-    reviewerFindings.push(`Final gate failed:\n${final.stdout}\n${final.stderr}`);
-    round += 1;
-    continue;
-  }
-  if (reviewer.receipt.verdict === "blocked") {
-    throw new Error(`reviewer verdict blocked: ${reviewer.receipt.findings.join("; ")}`);
-  }
-  reviewerFindings.push(...reviewer.receipt.findings);
-  round += 1;
-}
-
-
-const dirty = await execInWorktree("git status --short --untracked-files=no");
-if (dirty.stdout.trim()) throw new Error(`tracked worktree changes remain:\n${dirty.stdout}`);
-
-const unsnoozeStatus = await commandOk("unsnooze status");
-const warnings = [...implementerSessionIds, ...reviewerSessionIds]
-  .filter((sessionId) => hasLingeringUnsnoozeState(unsnoozeStatus.stdout, sessionId))
-  .map((sessionId) => `Unsnooze still tracks ${sessionId}; retained as cleanup evidence`);
-await writeFile(join(artifactRoot, "result.json"), `${JSON.stringify({
-  status: "reviewed-local-candidate",
-  issue: issue.number,
-  branch,
-  baseSha,
-  head: candidateHead,
-  rounds: round,
-  implementerSessionIds,
-  reviewerSessionIds,
-  verdict: "approved",
-  warnings,
-}, null, 2)}\n`);
-
-console.log(JSON.stringify({
-  status: "reviewed-local-candidate",
-  issue: issue.number,
-  branch,
-  head: candidateHead,
-  artifacts: artifactRoot,
-  warnings,
-}, null, 2));
-// Retain the candidate worktree for supervisor verification; no unbounded cleanup.
-await publish({status: "reviewed-local-candidate", phase: "terminal", head: candidateHead});
-}
-await main().catch(async error => {
-  await publish({status: "blocked", phase: "terminal", error: String(error)});
+main().catch(async (error) => {
   console.error(String(error));
+  if (ownsLock) {
+    await rm(lockDir, { recursive: true, force: true }).catch(() => {});
+    ownsLock = false;
+  }
   process.exitCode = 1;
 });
