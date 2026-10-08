@@ -39,7 +39,7 @@ REQUEST_TIMEOUT_SECONDS = 30
 RETENTION_DAYS = 7
 MAX_JSON_DEPTH = 64
 MAX_URL_DECODE_ROUNDS = 16
-MAX_NESTED_URLS = 8
+MAX_NESTED_URLS = 16
 MAX_SANITIZE_DEPTH = 32
 MAX_BILLING_HEADER_DIGITS = 18
 FEED_ID = "tikhub.x.reddit-app-fetch-subreddit-feed"
@@ -126,6 +126,23 @@ class CollectorError(Exception):
 
 class SanitizationError(ValueError):
     pass
+
+
+class WithheldValue(str):
+    pass
+
+
+REDACTED_WITHHELD = WithheldValue("[REDACTED_WITHHELD]")
+
+
+def contains_withheld(value):
+    if isinstance(value, WithheldValue):
+        return True
+    if isinstance(value, dict):
+        return any(contains_withheld(key) or contains_withheld(item) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(contains_withheld(item) for item in value)
+    return False
 
 
 @dataclass
@@ -289,18 +306,6 @@ def atomic_json(path, value):
 
 
 def redact_assignments(value):
-    value = decode_escaped_ascii(value)
-    if value is None:
-        return "[REDACTED]"
-    for _ in range(MAX_URL_DECODE_ROUNDS):
-        normalized = decode_escaped_ascii(html.unescape(value))
-        if normalized is None:
-            return "[REDACTED]"
-        if normalized == value:
-            break
-        value = normalized
-    else:
-        return "[REDACTED]"
     value = redact_quoted_url_userinfo(value, whole_url=True)
     parts = []
     offset = 0
@@ -325,6 +330,13 @@ def redact_assignments(value):
         start = match.end()
         unterminated_quote = False
         quoted_value = False
+        candidate = value[start:]
+        candidate = candidate.lstrip()
+        if re.match(
+            r"(?:[>|](?:[+-]\d?|\d?[+-]?)(?=\s|#|$)|(?i:\\?[rubf]|br|rb|fr|rf)[\"'`])",
+            candidate,
+        ):
+            return REDACTED_WITHHELD
         quote_start = start
         while quote_start < len(value) and value[quote_start] == "\\":
             quote_start += 1
@@ -387,7 +399,7 @@ def redact_encoded_uri_userinfo(value):
     for match in re.finditer(r"\S+", value):
         token = match.group()
         candidate = token.strip("\"'`()[]{}<>,;.")
-        if "%" not in candidate:
+        if not any(marker in candidate for marker in ("%", "&", "\\")):
             continue
         raw_scheme = URL_SCHEME.search(candidate)
         if raw_scheme:
@@ -398,6 +410,16 @@ def redact_encoded_uri_userinfo(value):
             )
             at = authority.find("@")
             if 0 <= at < boundary:
+                start = match.start() + token.index(candidate)
+                end = start + len(candidate)
+                authority_at = raw_scheme.end() + at
+                parts.extend((
+                    value[offset:start],
+                    candidate[:raw_scheme.end()],
+                    "[REDACTED]@",
+                    candidate[authority_at + 1:],
+                ))
+                offset = end
                 continue
             if not re.search(r"%(?:25)*40", authority[:boundary], re.IGNORECASE):
                 continue
@@ -472,12 +494,14 @@ def redact_quoted_url_userinfo(value, whole_url=False):
 def safe_string(value, secrets=(), _depth=0):
     if value is None:
         return None
+    if contains_withheld(value):
+        return REDACTED_WITHHELD
     if _depth > MAX_NESTED_URLS:
-        return "[REDACTED]"
+        return REDACTED_WITHHELD
     text = str(value).encode("utf-8", errors="replace").decode("utf-8")
     text = decode_escaped_ascii(text)
     if text is None:
-        return "[REDACTED]"
+        return REDACTED_WITHHELD
     text = redact_encoded_uri_userinfo(text)
     text = redact_quoted_url_userinfo(text)
     decoded_parts = []
@@ -485,18 +509,17 @@ def safe_string(value, secrets=(), _depth=0):
     for match in EMBEDDED_URL.finditer(text):
         decoded = decode_url_component(text[offset:match.start()])
         if decoded is None:
-            return "[REDACTED]"
+            return REDACTED_WITHHELD
         decoded_parts.extend((decoded, match.group(0)))
         offset = match.end()
     decoded = decode_url_component(text[offset:])
     if decoded is None:
-        return "[REDACTED]"
+        return REDACTED_WITHHELD
     decoded_parts.append(decoded)
     text = "".join(decoded_parts)
-    for secret in secrets:
-        if secret:
-            text = text.replace(secret, "[REDACTED]")
     text = redact_assignments(text)
+    if contains_withheld(text):
+        return REDACTED_WITHHELD
     text = redact_quoted_url_userinfo(text)
     parts = []
     offset = 0
@@ -505,35 +528,46 @@ def safe_string(value, secrets=(), _depth=0):
         parts.append(safe_url(match.group(0), secrets, _depth + 1))
         offset = match.end()
     parts.append(safe_text(text[offset:], secrets, _depth + 1))
-    return "".join(part or "" for part in parts)
+    if contains_withheld(parts):
+        return REDACTED_WITHHELD
+    text = "".join(part or "" for part in parts)
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    return text
 
 
 def safe_text(value, secrets=(), _depth=0):
     if value is None:
         return None
+    if contains_withheld(value):
+        return REDACTED_WITHHELD
     if _depth > MAX_NESTED_URLS:
-        return "[REDACTED]"
-    text = decode_escaped_ascii(str(value))
-    if text is None:
-        return "[REDACTED]"
-    text = redact_encoded_uri_userinfo(text)
-    decoded = decode_url_component(text)
+        return REDACTED_WITHHELD
+    decoded = decode_url_component(redact_encoded_uri_userinfo(str(value)))
     if decoded is None:
-        return "[REDACTED]"
+        return REDACTED_WITHHELD
+    if EMBEDDED_URL.search(decoded):
+        return safe_string(decoded, secrets, _depth + 1)
+    decoded = redact_assignments(decoded)
+    if contains_withheld(decoded):
+        return REDACTED_WITHHELD
     for secret in secrets:
         if secret:
             decoded = decoded.replace(secret, "[REDACTED]")
-    if EMBEDDED_URL.search(decoded):
-        return safe_string(decoded, secrets, _depth + 1)
-    return redact_assignments(decoded)
+    return decoded
 
 
 def decode_url_component(value):
     if not isinstance(value, str):
         return None
+    if len(value.encode("utf-8", errors="replace")) > MAX_RESPONSE_BYTES:
+        return None
     for _ in range(MAX_URL_DECODE_ROUNDS):
         decoded = decode_escaped_ascii(html.unescape(urllib.parse.unquote(value)))
         if decoded is None:
+            return None
+        if len(decoded.encode("utf-8", errors="replace")) > MAX_RESPONSE_BYTES:
             return None
         if decoded == value:
             return value
@@ -547,17 +581,7 @@ def decode_url_component(value):
 
 
 def normalize_sensitive_key(value):
-    for _ in range(MAX_URL_DECODE_ROUNDS):
-        decoded = decode_url_component(value)
-        if decoded is None:
-            return None
-        normalized = decode_escaped_ascii(html.unescape(decoded))
-        if normalized is None:
-            return None
-        if normalized == value:
-            return normalized
-        value = normalized
-    return None
+    return decode_url_component(value)
 
 
 def decode_escaped_ascii(value):
@@ -585,8 +609,11 @@ def decode_escaped_ascii(value):
 def safe_url(value, secrets=(), _depth=0):
     if not isinstance(value, str):
         return value
+    if contains_withheld(value):
+        return REDACTED_WITHHELD
     if _depth > MAX_NESTED_URLS:
-        return "[REDACTED_URL]"
+        return REDACTED_WITHHELD
+    value = redact_encoded_uri_userinfo(value)
     if any(ord(character) <= 0x20 or ord(character) == 0x7f for character in value):
         return "[REDACTED_URL]"
     if re.search(r"%(?![0-9a-f]{2})", value, re.IGNORECASE):
@@ -601,7 +628,10 @@ def safe_url(value, secrets=(), _depth=0):
         hostname = decode_url_component(parsed.hostname or "")
         if hostname is None:
             return "[REDACTED_URL]"
-        host = urllib.parse.quote(safe_string(hostname, secrets, _depth + 1), safe=".-:")
+        safe_hostname = safe_string(hostname, secrets, _depth + 1)
+        if contains_withheld(safe_hostname):
+            return REDACTED_WITHHELD
+        host = urllib.parse.quote(safe_hostname, safe=".-:")
         if ":" in host and not host.startswith("["):
             host = "[" + host + "]"
         if parsed.port:
@@ -636,15 +666,20 @@ def safe_url(value, secrets=(), _depth=0):
             else:
                 item = safe_string(decoded_item, secrets, _depth + 1)
             key = safe_string(decoded_key, secrets, _depth + 1)
+        if contains_withheld(key) or contains_withheld(item):
+            return REDACTED_WITHHELD
         query.append((key, item))
     decoded_path = decode_url_component(parsed.path)
     if decoded_path is None:
         return "[REDACTED_URL]"
+    safe_path = safe_string(decoded_path, secrets, _depth + 1)
+    if contains_withheld(safe_path):
+        return REDACTED_WITHHELD
     return urllib.parse.urlunsplit((
         parsed.scheme,
         host,
         urllib.parse.quote(
-            safe_string(decoded_path, secrets, _depth + 1),
+            safe_path,
             safe="/:@-._~!$&'()*+,;=",
         ),
         urllib.parse.urlencode(query, doseq=True),
@@ -668,9 +703,23 @@ def sanitize(value, secrets=(), key="", _depth=0):
             if normalized_name is None or re.search(
                 r"%(?![0-9a-f]{2})|\\u[0-9a-f]{4}", normalized_name, re.IGNORECASE
             ):
-                raise SanitizationError("response_sanitization_failed")
+                withheld_key = REDACTED_WITHHELD
+                index = 2
+                while withheld_key in result:
+                    withheld_key = WithheldValue(f"{REDACTED_WITHHELD}#{index}")
+                    index += 1
+                result[withheld_key] = REDACTED_WITHHELD
+                continue
             sensitive_name = SENSITIVE_KEYS.search(normalized_name.replace("\\", ""))
             cleaned = "[REDACTED_KEY]" if sensitive_name else safe_string(decoded_name, secrets)
+            if contains_withheld(cleaned):
+                withheld_key = REDACTED_WITHHELD
+                index = 2
+                while withheld_key in result:
+                    withheld_key = WithheldValue(f"{REDACTED_WITHHELD}#{index}")
+                    index += 1
+                result[withheld_key] = REDACTED_WITHHELD
+                continue
             unique = cleaned
             index = 2
             while unique in result:
@@ -683,15 +732,21 @@ def sanitize(value, secrets=(), key="", _depth=0):
     if isinstance(value, list):
         return [sanitize(item, secrets, _depth=_depth + 1) for item in value]
     if isinstance(value, str):
+        normalized = decode_url_component(value)
+        if normalized is None:
+            return safe_string(value, secrets)
         try:
-            nested = parse_json(value)
+            nested = parse_json(normalized)
         except json.JSONDecodeError:
             nested = None
         except ValueError:
             return "[REDACTED_INVALID_JSON]"
         if isinstance(nested, (dict, list)):
+            sanitized_nested = sanitize(nested, secrets, _depth=_depth + 1)
+            if contains_withheld(sanitized_nested):
+                return REDACTED_WITHHELD
             return json.dumps(
-                sanitize(nested, secrets, _depth=_depth + 1),
+                sanitized_nested,
                 ensure_ascii=True,
                 sort_keys=True,
                 separators=(",", ":"),
@@ -716,8 +771,9 @@ def sanitize_body(body, secrets=()):
         except (json.JSONDecodeError, ValueError, RecursionError):
             return "[REDACTED_INVALID_JSON]"
         try:
-            return json.dumps(
-                sanitize(value, secrets), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            sanitized = sanitize(value, secrets)
+            return REDACTED_WITHHELD if contains_withheld(sanitized) else json.dumps(
+                sanitized, ensure_ascii=True, sort_keys=True, separators=(",", ":")
             )
         except SanitizationError:
             raise
@@ -1619,7 +1675,7 @@ class Collector:
         self.previous_record = record_id
         return record_id, body, headers
 
-    def annotate_record_validation(self, code):
+    def annotate_record_validation(self, code, processing_complete=True):
         if not self.counts["record_ids"]:
             return
         path = self.recordings_dir / self.counts["record_ids"][-1]
@@ -1633,13 +1689,13 @@ class Collector:
             raise CollectorError("record_validation_persistence_failed", "blocked")
         if code not in errors:
             errors.append(code)
-        record["processing_complete"] = True
+        record["processing_complete"] = processing_complete
         try:
             atomic_json(path, record)
         except (OSError, CollectorError):
             raise CollectorError("record_validation_persistence_failed", "blocked") from None
 
-    def annotate_record_error(self, code):
+    def annotate_record_error(self, code, processing_complete=True):
         if not self.counts["record_ids"]:
             return
         path = self.recordings_dir / self.counts["record_ids"][-1]
@@ -1647,7 +1703,7 @@ class Collector:
             with path.open(encoding="utf-8") as source:
                 record = json.load(source)
             record["error"] = code
-            record["processing_complete"] = True
+            record["processing_complete"] = processing_complete
             if code == "billing_amount_unknown_reconciliation_required":
                 record["billing"]["charged_micro_usd"] = None
                 record["billing"]["charge_status"] = "unknown"
@@ -1681,8 +1737,8 @@ class Collector:
                 self.annotate_record_validation("response_cursor_not_utf8")
                 raise CollectorError("response_cursor_not_utf8", "failed") from None
 
-    def fail_record(self, code, status="failed"):
-        self.annotate_record_error(code)
+    def fail_record(self, code, status="failed", incomplete=False):
+        self.annotate_record_error(code, processing_complete=not incomplete)
         raise CollectorError(code, status)
 
     def reserve(self, state_path, state, route_name, params):
@@ -1802,6 +1858,8 @@ class Collector:
             sanitization_error = None
             try:
                 body = sanitize_body(result.body, [self.credentials.token])
+                if contains_withheld(body):
+                    sanitization_error = "response_sanitization_failed"
             except SanitizationError:
                 body = "[REDACTED_INVALID_JSON]"
                 sanitization_error = "response_sanitization_failed"
@@ -1815,26 +1873,28 @@ class Collector:
                 },
                 request_headers=headers,
             )
+            if sanitization_error:
+                self.annotate_record_validation(sanitization_error, processing_complete=False)
             try:
                 _, successful, _ = self.settle(state_path, state, result, reservation, successful_response)
             except CollectorError as error:
-                self.fail_record(error.code, error.status)
+                self.fail_record(error.code, error.status, incomplete=bool(sanitization_error))
             served_via = header(result.headers, "X-Treg-Served-Via")
             cache = header(result.headers, "X-Treg-Cache")
             if served_via and str(served_via).lower().startswith("overflow:"):
                 state["limit_breach"] = True
                 atomic_json(state_path, state)
-                self.fail_record("provider_overflow_fallback_detected")
+                self.fail_record("provider_overflow_fallback_detected", incomplete=bool(sanitization_error))
             if cache and str(cache).lower() == "hit":
                 state["limit_breach"] = True
                 atomic_json(state_path, state)
-                self.fail_record("provider_cache_hit_despite_bypass")
+                self.fail_record("provider_cache_hit_despite_bypass", incomplete=bool(sanitization_error))
             if result.truncated:
-                self.fail_record("response_exceeded_recording_size_limit")
+                self.fail_record("response_exceeded_recording_size_limit", incomplete=bool(sanitization_error))
             if result.status in (401, 403):
-                self.fail_record("provider_authentication_or_permission_failure")
+                self.fail_record("provider_authentication_or_permission_failure", incomplete=bool(sanitization_error))
             if sanitization_error:
-                self.fail_record(sanitization_error)
+                self.fail_record(sanitization_error, incomplete=True)
             if result.status in (408, 425, 429, 500, 502, 503, 504) and local_retries < MAX_RETRIES:
                 local_retries += 1
                 try:
@@ -2215,6 +2275,16 @@ def run_replay(args, clock):
                 invalid_recordings += 1
                 replay_errors.append("recording_sanitization_failed")
                 continue
+            if contains_withheld(sanitized_record):
+                validation_errors = sanitized_record.get("validation_errors")
+                if not isinstance(validation_errors, list):
+                    validation_errors = []
+                if "response_sanitization_failed" not in validation_errors:
+                    validation_errors.append("response_sanitization_failed")
+                sanitized_record["validation_errors"] = validation_errors
+                if sanitized_record.get("error") is None:
+                    sanitized_record["error"] = "response_sanitization_failed"
+                sanitized_record["processing_complete"] = False
             if sanitized_record != record:
                 record = {**sanitized_record, "replay_sanitization_applied": True}
                 request = record.get("request")

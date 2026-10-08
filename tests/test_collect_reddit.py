@@ -726,12 +726,31 @@ print(safe_string({payload!r}))
         for _ in range(collect_reddit.MAX_URL_DECODE_ROUNDS + 1):
             encoded = html.escape(encoded, quote=True)
         text = "password=" + encoded
-        persisted = self.collect_text_recording(text)
+        page = fixture_body("feed-page-1.json")
+        page["data"]["subredditV3"]["elements"]["edges"][0]["node"]["text"] = text
+        code, stdout, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            FixtureTransport([response(200, page)]),
+            FakeCredentials(),
+        )
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("response_sanitization_failed", json.loads(stdout)["errors"])
+        record_path = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(record_path.read_text())
+        self.assertFalse(record["processing_complete"])
+        self.assertEqual(record["error"], "response_sanitization_failed")
+        self.assertIn("response_sanitization_failed", record["validation_errors"])
+        self.assertIsInstance(record["request"], dict)
+        self.assertIsInstance(record["billing"], dict)
+        persisted = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
         self.assertNotIn(secret, persisted)
 
-        source = next(self.recordings_dir.glob("record-*.json"))
+        source = record_path
         record = json.loads(source.read_text())
         record["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]["text"] = text
+        record["error"] = None
+        record["processing_complete"] = True
+        record.pop("validation_errors", None)
         source.write_text(json.dumps(record), encoding="utf-8")
         source.chmod(0o600)
         replay_code, replay_stdout, replay_stderr = self.run_cli([
@@ -739,13 +758,40 @@ print(safe_string({payload!r}))
             "--state-dir", str(self.state_dir),
         ])
 
-        self.assertEqual(replay_code, 0, replay_stderr)
+        self.assertEqual(replay_code, 2, replay_stderr)
+        self.assertIn("response_sanitization_failed", json.loads(replay_stdout)["errors"])
         all_artifacts = "\n".join(
             path.read_text() for path in self.recordings_dir.glob("*.json")
         )
         self.assertNotIn(secret, all_artifacts)
         self.assertNotIn(secret, replay_stdout)
         self.assertNotIn(secret, replay_stderr)
+        replayed = json.loads(source.read_text())
+        self.assertFalse(replayed["processing_complete"])
+        self.assertIn("response_sanitization_failed", replayed["validation_errors"])
+
+    def test_withheld_response_preserves_unknown_billing_hold_and_lineage(self):
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["text"] = 'password = r"""fixture-withheld-unknown-charge-secret'
+        code, stdout, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            FixtureTransport([response(200, page, cost=None)]),
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 2, stderr)
+        report = json.loads(stdout)
+        self.assertIn("billing_amount_unknown_reconciliation_required", report["errors"])
+        state = json.loads((self.state_dir / "state.json").read_text())
+        self.assertFalse(state["pending"]["charge_known"])
+        self.assertEqual(state["reserved_micro_usd"], collect_reddit.ROUTES["feed"]["max_charge_micro_usd"])
+        record = json.loads(next(self.recordings_dir.glob("record-*.json")).read_text())
+        self.assertIn("response_sanitization_failed", record["validation_errors"])
+        self.assertFalse(record["processing_complete"])
+        self.assertIsInstance(record["request"], dict)
+        self.assertIsInstance(record["billing"], dict)
+        self.assertNotIn("fixture-withheld-unknown-charge-secret", json.dumps(record))
 
     def test_redacts_private_secret_and_api_token_assignments_in_prose(self):
         persisted = self.collect_text_recording(
@@ -786,12 +832,23 @@ print(safe_string({payload!r}))
         self.assertNotIn("fixture-query-secret", persisted)
 
     def test_residual_non_ascii_unicode_escapes_are_redacted_before_persistence(self):
-        self.collect_text_recording(r"unicode note=\u79d8\u5bc6")
-        record = json.loads(next(self.recordings_dir.glob("record-*.json")).read_text())
-        text = record["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]["text"]
+        page = fixture_body("feed-page-1.json")
+        page["data"]["subredditV3"]["elements"]["edges"][0]["node"]["text"] = (
+            r"unicode note=\u79d8\u5bc6"
+        )
+        code, stdout, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            FixtureTransport([response(200, page)]),
+            FakeCredentials(),
+        )
 
-        self.assertNotIn("79d8", text)
-        self.assertNotIn("秘密", text)
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("response_sanitization_failed", json.loads(stdout)["errors"])
+        record = json.loads(next(self.recordings_dir.glob("record-*.json")).read_text())
+        self.assertFalse(record["processing_complete"])
+        self.assertIn("response_sanitization_failed", record["validation_errors"])
+        self.assertNotIn("79d8", json.dumps(record))
+        self.assertNotIn("秘密", json.dumps(record))
 
     def test_excessively_encoded_dictionary_key_fails_closed_with_lineage(self):
         page = fixture_body("feed-page-1.json")
@@ -1134,6 +1191,175 @@ print(safe_string({payload!r}))
             self.assertNotIn(secret, stdout)
         self.assertIn("public-tail", replayed)
         self.assertIn("another-public-tail", replayed)
+
+    def test_normalizes_html_percent_and_unicode_credentials_before_classification(self):
+        source_text = (
+            "connect postgres&#58;//fixture-html-uri-user:fixture-html&#47;uri-secret@localhost/db\n"
+            "connect postgres://fixture-percent-uri-user:fixture-percent%2Furi-secret@localhost/db\n"
+            "pass%26%23119%3Bord=fixture-percent-html-value-secret; "
+            r"pass\u0077ord=fixture-unicode-value-secret"
+        )
+        secrets = (
+            "fixture-html-uri-user",
+            "fixture-html/uri-secret",
+            "fixture-percent-uri-user",
+            "fixture-percent/uri-secret",
+            "fixture-percent-html-value-secret",
+            "fixture-unicode-value-secret",
+        )
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["text"] = source_text
+        post["pass%26%23119%3Bord"] = "fixture-percent-html-key-secret"
+        post["\\u0070assword"] = "fixture-unicode-key-secret"
+        post["public_fixture_text"] = "ordinary useful fixture text"
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            FixtureTransport([response(200, page)]),
+            FakeCredentials(),
+        )
+        self.assertEqual(code, 0, stderr)
+        persisted = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        for secret in secrets:
+            self.assertNotIn(secret, persisted)
+        self.assertNotIn("fixture-percent-html-key-secret", persisted)
+        self.assertNotIn("fixture-unicode-key-secret", persisted)
+        self.assertIn("ordinary useful fixture text", persisted)
+
+        source = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(source.read_text())
+        post = record["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["text"] = source_text
+        post["pass%26%23119%3Bord"] = "fixture-percent-html-key-secret"
+        post["\\u0070assword"] = "fixture-unicode-key-secret"
+        source.write_text(json.dumps(record))
+
+        replay_code, replay_stdout, replay_stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(replay_code, 0, replay_stderr)
+        replayed = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        for secret in secrets:
+            self.assertNotIn(secret, replayed)
+            self.assertNotIn(secret, replay_stdout)
+        self.assertNotIn("fixture-percent-html-key-secret", replayed)
+        self.assertNotIn("fixture-unicode-key-secret", replayed)
+        self.assertIn("ordinary useful fixture text", replayed)
+
+    def test_redacts_raw_string_and_yaml_block_credentials_in_collection_and_replay(self):
+        source_text = (
+            'password = r"""fixture-raw-string-secret\nfixture-raw-string-continuation"""\n'
+            "api_token: >- # folded credential\n"
+            "  fixture-yaml-block-secret\n"
+            "  fixture-yaml-block-continuation\n"
+        )
+        secrets = (
+            "fixture-raw-string-secret",
+            "fixture-raw-string-continuation",
+            "fixture-yaml-block-secret",
+            "fixture-yaml-block-continuation",
+        )
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["text"] = source_text
+        post["public_fixture_text"] = "ordinary useful fixture text"
+        code, stdout, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            FixtureTransport([response(200, page)]),
+            FakeCredentials(),
+        )
+        report = json.loads(stdout)
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("response_sanitization_failed", report["errors"])
+        self.assertNotEqual(report["validation"]["feed_schema"], "valid")
+        persisted = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        collection_record = json.loads(next(self.recordings_dir.glob("record-*.json")).read_text())
+        self.assertFalse(collection_record["processing_complete"])
+        self.assertEqual(collection_record["error"], "response_sanitization_failed")
+        self.assertIn("response_sanitization_failed", collection_record["validation_errors"])
+        for secret in secrets:
+            self.assertNotIn(secret, persisted)
+        self.assertIn("ordinary useful fixture text", persisted)
+
+        source = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(source.read_text())
+        post = record["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["text"] = source_text
+        record["error"] = None
+        record.pop("validation_errors", None)
+        source.write_text(json.dumps(record))
+
+        replay_code, replay_stdout, _ = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(replay_code, 2)
+        self.assertIn("response_sanitization_failed", json.loads(replay_stdout)["errors"])
+        replayed = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        for secret in secrets:
+            self.assertNotIn(secret, replayed)
+            self.assertNotIn(secret, replay_stdout)
+        self.assertIn("ordinary useful fixture text", replayed)
+        replayed_record = json.loads(source.read_text())
+        self.assertFalse(replayed_record["processing_complete"])
+        self.assertIn("response_sanitization_failed", replayed_record["validation_errors"])
+        self.assertIsInstance(replayed_record["request"], dict)
+        self.assertIsInstance(replayed_record["billing"], dict)
+
+    def test_withheld_marker_text_is_not_treated_as_withheld_evidence(self):
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["text"] = "An ordinary marker example: [REDACTED_WITHHELD]"
+        code, stdout, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            FixtureTransport([response(200, page)]),
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("response_sanitization_failed", json.loads(stdout)["errors"])
+        record_path = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(record_path.read_text())
+        self.assertTrue(record["processing_complete"])
+
+        replay_code, replay_stdout, replay_stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(replay_code, 0, replay_stderr)
+        self.assertNotIn("response_sanitization_failed", json.loads(replay_stdout)["errors"])
+        self.assertTrue(json.loads(record_path.read_text())["processing_complete"])
+
+    def test_replay_withholds_malformed_legacy_key_and_preserves_accounting_lineage(self):
+        self.collect_text_recording("safe synthetic text")
+        source = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(source.read_text())
+        post = record["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["public_fixture_text"] = "ordinary useful fixture text"
+        post["[REDACTED_WITHHELD]"] = "ordinary marker-key sibling"
+        post[r"\u0025" + "25" * 20 + "41"] = "fixture-replay-overlimit-key-secret"
+        source.write_text(json.dumps(record))
+
+        replay_code, replay_stdout, replay_stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(replay_code, 2, replay_stderr)
+        self.assertIn("response_sanitization_failed", json.loads(replay_stdout)["errors"])
+        persisted = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        self.assertNotIn("fixture-replay-overlimit-key-secret", persisted)
+        self.assertIn("ordinary useful fixture text", persisted)
+        self.assertIn("ordinary marker-key sibling", persisted)
+        replayed = json.loads(source.read_text())
+        self.assertFalse(replayed["processing_complete"])
+        self.assertIn("response_sanitization_failed", replayed["validation_errors"])
+        self.assertIsInstance(replayed["request"], dict)
+        self.assertIsInstance(replayed["billing"], dict)
 
     def test_redacts_folded_authorization_header_continuations(self):
         persisted = self.collect_text_recording(

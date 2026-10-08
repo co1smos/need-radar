@@ -10,6 +10,10 @@ Implementation and bounded-acquisition authorization are recorded by the owner. 
 
 **Live status: unverified and blocked; safety hold remains active.** Offline tests cannot establish live route behavior, eligibility, permission, billing, deletion rights, or the status of the earlier attempt. They do not establish zero live attempts or zero cost. The tests deny socket activity and access to real credential and ticket-state paths, including in the help subprocess. The direct-connection regression uses a stub resolver and is stopped before socket creation; no collector transport or HTTP request is run.
 
+**Offline sanitizer update (October 8, 2026; issue #3):** Source strings, dictionary keys, and URL components share bounded normalization before sensitive classification and known-secret removal. URL/HTML decoding is limited to 16 outer rounds; ASCII-Unicode/escaped-slash decoding is separately bounded. Input is limited to 8 MiB, nested URL processing to 16 levels, and JSON sanitization to 32 levels. Sensitive keys and credential assignments are classified after normalization. This is not a Python or YAML parser: raw-string prefixes and YAML literal/folded block indicators on sensitive assignments cause that field to be withheld as `[REDACTED_WITHHELD]`; an undecodable dictionary key is replaced by a withheld marker entry. These outcomes carry `response_sanitization_failed` validation evidence and `processing_complete: false`. Collection and replay preserve request/accounting lineage; an unknown charge remains held for reconciliation. Literal source text or keys that merely contain the marker are not themselves classified as withheld. Benign sibling fields remain available when another field is withheld. Valid opaque pagination cursors are not decoded or rewritten by this policy.
+
+This change certifies offline code only. The incident dated October 7, 2026 remains unresolved, the seven-day recording-retention control is unchanged, and live acquisition, account/source permissions, approved seeds/window, budget reconciliation, and idle deletion enforcement remain gated by issue #19.
+
 To clear the historical hold in a later, separately authorized activation, the supervisor must use actual provider/account evidence to determine the request outcome and actual charge; update the private canonical state under its ticket lock; add that actual charge to `spent_micro_usd` and increment `successful_requests` only if the evidence establishes success; and update `incident_hold` with the same incident reference, `status: "reconciled"`, the evidence-backed `outcome`, actual integer `charge_micro_usd` (including zero only when proven), an `evidence_ref`, and `reconciled_at`. The collector's ordinary `reconcile` command handles only its own persisted pending request and cannot resolve this historical incident. Do not use an acknowledgement, a free-text claim, or an assumed zero charge. Review the real manifest evidence and establish authorized deletion enforcement before any live run; this correction does not perform those steps or mark acquisition complete.
 
 ## Cumulative review criteria
@@ -52,10 +56,10 @@ This matrix carries forward the initial and resumed independent findings. “Cod
 | Deterministic bounded feed/comment collection with pagination, bounded retries, and auth/limit stops. | [x] Exercised with synthetic transports and persistent budget tests; no provider fallback or browser loop. | [ ] Endpoint schemas, account eligibility, permissions, and enforceable charges remain unverified. |
 | Private sanitized response/provenance recordings and network-free replay. | [x] Persistence, redaction, lineage, expiry, replay validation, and billing uncertainty have offline regressions. | [ ] Confirm provider/source recording and removal rights; establish idle-time deletion enforcement. |
 | Honest capability and coverage reporting, including incomplete/truncated/billing-unknown cases. | [x] Reports distinguish supported/partial/failed/blocked and preserve failures without claiming complete acquisition. | [ ] A successful synthetic response is not live acquisition evidence. |
-| Runnable end-to-end check with an observed result. | [x] 104 focused Reddit tests and 123 total Python tests pass; synthetic feed/comment pagination, sanitization (including structured `clientSecret` variants, HTML-encoded sensitive keys, multiply encoded assignments, mixed HTML/percent credentials, non-HTTP URI userinfo, and triple-quoted credentials in collection and replay), accounting, invalid-cursor replay lineage, legacy-recording sanitization, and offline replay are exercised under Hermes-TMPDIR network and protected-path guards. Python compilation and offline CLI help pass. | [ ] No live request or provider/account verification was performed. |
+| Runnable end-to-end check with an observed result. | [x] 111 focused Reddit tests and 179 total offline Python tests pass; synthetic feed/comment pagination, bounded sanitization and withholding, accounting, cursor lineage, legacy-recording replay, and collection-to-recording-to-replay run under Hermes-TMPDIR network and protected-path guards. | [ ] No live request or provider/account verification was performed. |
 | Observability, provenance, redaction, and untrusted-source handling. | [x] Request inputs, configuration, outputs, billing/error evidence, lineage, and validation remain private and redacted before persistence. | [ ] Live retention terms and observed end-to-end evidence remain supervisor-owned. |
 
-The 104-test focused Reddit suite and 123-test full Python suite passed. Python compilation and CLI help passed. `TMPDIR` pointed to Hermes scratch; unittest audit hooks denied socket activity and access to canonical credential/state paths, and both Python subprocess tests installed their own guards. All fixture outcomes are synthetic/offline; the unresolved historical request and acquisition authorization gates remain active.
+On October 8, 2026, `npm test` passed (22 orchestration tests and 179 offline Python tests), `npm run typecheck:sandcastle-workflow` passed, Python compilation passed, and the public CLI help check passed. The focused Reddit suite passed all 111 tests. The candidate worktree had no `node_modules`; `npm test` used a temporary symlink to the already-installed primary-checkout dependencies, removed at command exit. No packages were installed. `TMPDIR` pointed to Hermes scratch; unittest audit hooks denied socket activity and access to canonical credential/state paths, including subprocesses. All fixture outcomes are synthetic/offline; the unresolved historical request and acquisition authorization gates remain active.
 
 No canonical state or credential files were changed. No external evidence was created or inferred; the historical incident and all other live prerequisites remain separate holds.
 
@@ -99,13 +103,22 @@ Missing or mismatched manifest fields block before credentials load. `collect --
 Offline checks use only synthetic fixtures and temporary state:
 
 ```sh
+set -e
+export TMPDIR=/home/ubuntu/.hermes/cache/scratch
+export PYTHONDONTWRITEBYTECODE=1
+if [ ! -e node_modules ]; then
+  test -d /home/ubuntu/projects/need-radar/node_modules
+  ln -s /home/ubuntu/projects/need-radar/node_modules node_modules
+  trap 'rm node_modules' EXIT
+fi
+npm test
 python3 -m unittest discover -s tests -p 'test_collect_reddit.py' -v
-python3 -m unittest discover -s tests -v
-python3 -m py_compile scripts/collect_reddit.py tests/test_collect_reddit.py
+npm run typecheck:sandcastle-workflow
+PYTHONPYCACHEPREFIX="$TMPDIR/issue-3-pycache" python3 -m py_compile scripts/collect_reddit.py tests/test_collect_reddit.py
 python3 scripts/collect_reddit.py --help
 ```
 
-The test-process socket and live-path guards are active in both unittest commands. The help subprocess receives a temporary `sitecustomize.py` guard under `TMPDIR`, and verifies blocked socket and credential-path attempts before printing help. Synthetic collection requires an explicitly injected test credential loader; tests do not fall back to the production credential file. The direct-connection regression uses a stub resolver and asserts the guard blocks before a socket is created; it does not run the collector transport or make a real connection.
+The test-process socket and live-path guards are active in the Python test commands. The help subprocess receives a temporary `sitecustomize.py` guard under `TMPDIR`, and verifies blocked socket and credential-path attempts before printing help. Synthetic collection requires an explicitly injected test credential loader; tests do not fall back to the production credential file. The direct-connection regression uses a stub resolver and asserts the guard blocks before a socket is created; it does not run the collector transport or make a real connection. If this worktree has no `node_modules`, the conditional above reuses the already-installed primary-checkout dependency tree for `npm test` and removes the temporary symlink; it does not install packages.
 
 There is intentionally no safe runnable live command in this checkout: the historical incident remains unresolved and external prerequisites remain unverified. Only after the supervisor completes the evidence-backed state reconciliation above, reviews all actual manifest evidence, and establishes authorized retention enforcement may a later activation review consider this bounded command shape; replace each bracketed value only with its approved input:
 
