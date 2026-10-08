@@ -8,7 +8,7 @@ import { spawn } from "node:child_process";
 
 const sourceRoot = fileURLToPath(new URL("..", import.meta.url));
 const mainPath = join(sourceRoot, ".sandcastle", "main.mts");
-const tsxCli = join(sourceRoot, "node_modules", "tsx", "dist", "cli.mjs");
+const tsxCli = fileURLToPath(import.meta.resolve("tsx/cli"));
 
 async function exists(path) {
   try { await access(path); return true; } catch { return false; }
