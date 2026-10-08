@@ -1169,6 +1169,79 @@ print(safe_string({payload!r}))
             self.assertNotIn(secret, stdout)
         self.assertIn("A benign fixture sentence remains useful.", replayed)
 
+    def test_redacts_html_encoded_authority_delimiters_in_collection_and_replay(self):
+        source_text = " ".join((
+            "postgres://user:fixture-html&#47;secret&#64;localhost/db",
+            "postgres://user:fixture-percent%26%23x2f%3Bsecret&#64;localhost/db",
+            "postgres://user:fixture-hex&#x2f;secret&#x40;localhost/db",
+            "A benign fixture sentence remains useful.",
+        ))
+        persisted = self.collect_text_recording(source_text)
+
+        for secret in ("fixture-html", "fixture-percent", "fixture-hex"):
+            self.assertNotIn(secret, persisted)
+        self.assertIn("A benign fixture sentence remains useful.", persisted)
+
+        source = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(source.read_text())
+        post = record["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["text"] = source_text
+        source.write_text(json.dumps(record), encoding="utf-8")
+
+        code, stdout, stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(code, 0, stderr)
+        replayed = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        for secret in ("fixture-html", "fixture-percent", "fixture-hex"):
+            self.assertNotIn(secret, replayed)
+            self.assertNotIn(secret, stdout)
+        self.assertIn("A benign fixture sentence remains useful.", replayed)
+
+    def test_path_and_hostname_decode_exhaustion_is_withheld_through_replay(self):
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        path_url = "https://example.org/%" + "25" * 20 + "70assword=fixture-path-secret"
+        host_url = "https://" + "%" + "25" * 20 + "65xample.org/path"
+        post["text"] = f"path {path_url} host {host_url} benign fixture note"
+
+        code, stdout, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            FixtureTransport([response(200, page)]),
+            FakeCredentials(),
+        )
+
+        report = json.loads(stdout)
+        source = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(source.read_text())
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("response_sanitization_failed", report["errors"])
+        self.assertIn("response_sanitization_failed", record["validation_errors"])
+        self.assertFalse(record["processing_complete"])
+        self.assertEqual(record["request"]["attempt"], 1)
+        self.assertEqual(record["billing"]["charge_status"], "reported")
+        self.assertNotIn("fixture-path-secret", json.dumps(record))
+
+        record["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]["text"] = post["text"]
+        record["error"] = None
+        record["processing_complete"] = True
+        record.pop("validation_errors", None)
+        source.write_text(json.dumps(record), encoding="utf-8")
+
+        replay_code, replay_stdout, replay_stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        replayed = json.loads(source.read_text())
+        self.assertEqual(replay_code, 2, replay_stderr)
+        self.assertIn("response_sanitization_failed", json.loads(replay_stdout)["errors"])
+        self.assertIn("response_sanitization_failed", replayed["validation_errors"])
+        self.assertFalse(replayed["processing_complete"])
+        self.assertNotIn("fixture-path-secret", source.read_text())
+
     def test_depth_exhausted_url_is_withheld_with_request_lineage(self):
         page = fixture_body("feed-page-1.json")
         post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
@@ -1809,13 +1882,17 @@ print(safe_string({payload!r}))
         post["access%255Ftoken"] = "fixture-access-value"
         transport = FixtureTransport([response(200, page)])
 
-        code, _, stderr = self.run_cli(
+        code, stdout, stderr = self.run_cli(
             self.args("--max-feed-pages", "1", "--max-posts", "0"),
             transport,
             FakeCredentials("fixture/radar-1234"),
         )
 
-        self.assertEqual(code, 0, stderr)
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("response_sanitization_failed", json.loads(stdout)["errors"])
+        record = json.loads(next(self.recordings_dir.glob("record-*.json")).read_text())
+        self.assertFalse(record["processing_complete"])
+        self.assertIn("response_sanitization_failed", record["validation_errors"])
         persisted = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
         for _ in range(12):
             persisted = unquote(persisted)

@@ -431,7 +431,11 @@ def redact_encoded_uri_userinfo(value):
                 ))
                 offset = end
                 continue
-            if not re.search(r"%(?:25)*40", authority[:boundary], re.IGNORECASE):
+            if not re.search(
+                r"%(?:25)*40|&#(?:0*64|x0*40);|&commat;",
+                authority[:boundary],
+                re.IGNORECASE,
+            ):
                 continue
         decoded = decode_url_component(candidate)
         if decoded is None or not URL_SCHEME.search(decoded) or "@" not in decoded:
@@ -637,7 +641,7 @@ def safe_url(value, secrets=(), _depth=0):
     try:
         hostname = decode_url_component(parsed.hostname or "")
         if hostname is None:
-            return "[REDACTED_URL]"
+            return REDACTED_WITHHELD
         safe_hostname = safe_string(hostname, secrets, _depth + 1)
         if contains_withheld(safe_hostname):
             return REDACTED_WITHHELD
@@ -681,7 +685,7 @@ def safe_url(value, secrets=(), _depth=0):
         query.append((key, item))
     decoded_path = decode_url_component(parsed.path)
     if decoded_path is None:
-        return "[REDACTED_URL]"
+        return REDACTED_WITHHELD
     safe_path = safe_string(decoded_path, secrets, _depth + 1)
     if contains_withheld(safe_path):
         return REDACTED_WITHHELD
