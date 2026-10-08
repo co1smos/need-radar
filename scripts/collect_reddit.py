@@ -109,7 +109,7 @@ SENSITIVE_ASSIGNMENT_PREFIX = re.compile(
         x-amz-(?:credential|security-token|signature)|
         x-goog-(?:credential|signature)|x-treg-token
     )
-    (?:\\*["'])?\s*(?:\\*[:=])(?:\s|\\[nrt])*
+    (?:\\*["'])?\s*(?:\\*[:=])(?:\s|\\+[nrt])*
     '''
 )
 PRIVATE_KEY_BEGIN = re.compile(r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----", re.IGNORECASE)
@@ -328,10 +328,11 @@ def redact_assignments(value):
         quote_start = start
         while quote_start < len(value) and value[quote_start] == "\\":
             quote_start += 1
+        opening_slashes = quote_start - start
         if quote_start < len(value) and value[quote_start] in "\"'`":
             quoted_value = True
             quote = value[quote_start]
-            escaped_quote = quote_start != start
+            escaped_quote = opening_slashes > 0
             limit = len(value)
             end = quote_start + 1
             while end < limit:
@@ -342,8 +343,8 @@ def redact_assignments(value):
                     slash_count = end - escape_start
                     if end < limit and value[end] == quote:
                         if (
-                            escaped_quote and slash_count == 1
-                            or not escaped_quote and slash_count % 2 == 0
+                            (escaped_quote and slash_count == opening_slashes)
+                            or (not escaped_quote and slash_count % 2 == 0)
                         ):
                             end += 1
                             break
@@ -504,6 +505,20 @@ def decode_url_component(value):
     return value
 
 
+def normalize_sensitive_key(value):
+    for _ in range(MAX_URL_DECODE_ROUNDS):
+        decoded = decode_url_component(value)
+        if decoded is None:
+            return None
+        normalized = decode_escaped_ascii(html.unescape(decoded))
+        if normalized is None:
+            return None
+        if normalized == value:
+            return normalized
+        value = normalized
+    return None
+
+
 def decode_escaped_ascii(value):
     if not isinstance(value, str):
         return None
@@ -560,14 +575,26 @@ def safe_url(value, secrets=(), _depth=0):
         decoded_item = decode_url_component(item)
         if decoded_key is None or decoded_item is None:
             return "[REDACTED_URL]"
-        if decoded_key.strip().lower() in SENSITIVE_QUERY_KEYS or SENSITIVE_KEYS.search(decoded_key):
+        normalized_key = normalize_sensitive_key(decoded_key)
+        if normalized_key is None:
+            return "[REDACTED_URL]"
+        sensitive_key = (
+            normalized_key.strip().lower() in SENSITIVE_QUERY_KEYS
+            or SENSITIVE_KEYS.search(normalized_key)
+        )
+        if sensitive_key:
+            key = (
+                safe_string(normalized_key, secrets, _depth + 1)
+                if normalized_key.strip().lower() in SENSITIVE_QUERY_KEYS
+                else "[REDACTED_KEY]"
+            )
             item = "[REDACTED]"
         else:
             if EMBEDDED_URL.search(decoded_item):
                 item = "[REDACTED]"
             else:
                 item = safe_string(decoded_item, secrets, _depth + 1)
-        key = safe_string(decoded_key, secrets, _depth + 1)
+            key = safe_string(decoded_key, secrets, _depth + 1)
         query.append((key, item))
     decoded_path = decode_url_component(parsed.path)
     if decoded_path is None:
@@ -594,11 +621,14 @@ def sanitize(value, secrets=(), key="", _depth=0):
         for name, item in value.items():
             original = str(name)
             decoded_name = decode_url_component(original)
-            if decoded_name is None or re.search(
-                r"%(?![0-9a-f]{2})|\\u[0-9a-f]{4}", decoded_name, re.IGNORECASE
+            normalized_name = (
+                normalize_sensitive_key(decoded_name) if decoded_name is not None else None
+            )
+            if normalized_name is None or re.search(
+                r"%(?![0-9a-f]{2})|\\u[0-9a-f]{4}", normalized_name, re.IGNORECASE
             ):
                 raise SanitizationError("response_sanitization_failed")
-            sensitive_name = SENSITIVE_KEYS.search(decoded_name.replace("\\", ""))
+            sensitive_name = SENSITIVE_KEYS.search(normalized_name.replace("\\", ""))
             cleaned = "[REDACTED_KEY]" if sensitive_name else safe_string(decoded_name, secrets)
             unique = cleaned
             index = 2

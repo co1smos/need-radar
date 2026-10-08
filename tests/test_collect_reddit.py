@@ -568,6 +568,9 @@ print(safe_string({payload!r}))
             "fixture-four-json-layers-secret",
             "fixture-multiply-unicode-label-secret",
             "fixture-html-quoted-password with spaces",
+            "fixture-multiline-json-newline-password with spaces",
+            "fixture-multiline-json-tab-password with spaces",
+            "fixture-multiline-json-return-password with spaces",
         )
         for layers, secret in zip((3, 4), secrets):
             value = f'password: "{secret}"'
@@ -580,6 +583,18 @@ print(safe_string({payload!r}))
         encoded_values["html_quoted"] = (
             "password=&quot;fixture-html-quoted-password with spaces&quot;; safe-tail"
         )
+        for whitespace, name, secret in zip(
+            ("\n", "\t", "\r"),
+            ("newline", "tab", "return"),
+            secrets[4:],
+        ):
+            multiline = (
+                f'password:{whitespace}"first line {secret}"; '
+                f"fixture-{name}-safe-tail"
+            )
+            for _ in range(2):
+                multiline = json.dumps(multiline)
+            encoded_values[f"multiline_{name}"] = multiline
 
         page = fixture_body("feed-page-1.json")
         post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
@@ -623,6 +638,8 @@ print(safe_string({payload!r}))
             self.assertNotIn(secret, persisted)
             self.assertNotIn(secret, all_artifacts)
             self.assertNotIn(secret, collection_stdout + stderr)
+        for name in ("newline", "tab", "return"):
+            self.assertIn(f"fixture-{name}-safe-tail", persisted)
 
         recorded_post["text"] = untrusted_text
         record_path.write_text(json.dumps(recorded), encoding="utf-8")
@@ -1243,6 +1260,55 @@ print(safe_string({payload!r}))
         ):
             self.assertNotIn(secret, persisted)
         self.assertNotIn("access_token", persisted)
+
+    def test_html_encoded_sensitive_keys_are_redacted_in_collection_and_replay(self):
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["pass&#119;ord"] = "fixture-html-value-84721"
+        post["pass%26%23119%3Bord"] = "fixture-html-value-84722"
+        post["url"] = (
+            "https://example.org/?pass%26%23119%3Bord=fixture-html-value-84723"
+            "&pass%2526%2523119%253Bord=fixture-html-value-84724"
+        )
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            FixtureTransport([response(200, page)]),
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        record_path = next(self.recordings_dir.glob("record-*.json"))
+        original = json.loads(record_path.read_text())
+        secrets = (
+            "fixture-html-value-84721",
+            "fixture-html-value-84722",
+            "fixture-html-value-84723",
+            "fixture-html-value-84724",
+        )
+        for secret in secrets:
+            self.assertNotIn(secret, record_path.read_text())
+
+        recorded_post = (
+            original["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        )
+        recorded_post["pass&#119;ord"] = "fixture-html-value-84721"
+        recorded_post["pass%26%23119%3Bord"] = "fixture-html-value-84722"
+        recorded_post["url"] = (
+            "https://example.org/?pass%26%23119%3Bord=fixture-html-value-84723"
+            "&pass%2526%2523119%253Bord=fixture-html-value-84724"
+        )
+        record_path.write_text(json.dumps(original), encoding="utf-8")
+        record_path.chmod(0o600)
+
+        replay_code, _, replay_stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(replay_code, 0, replay_stderr)
+        artifacts = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        for secret in secrets:
+            self.assertNotIn(secret, artifacts)
 
     def test_post_permalink_must_belong_to_approved_community(self):
         self.assertEqual(
