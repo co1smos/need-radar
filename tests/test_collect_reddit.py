@@ -1011,6 +1011,89 @@ print(safe_string({payload!r}))
             self.assertNotIn(secret, replayed)
             self.assertNotIn(secret, stdout)
 
+    def test_redacts_encoded_non_http_uri_userinfo_in_collection_and_replay(self):
+        safe_uris = ("postgres://localhost/db", "https://example.org/path?q=fixture%40example.org")
+        encoded_uris = (
+            "postgres://fixture-space-user:fixture%20space-password@localhost/db",
+            "redis://fixture-slash-user:fixture%2Fslash-password@cache.internal/0",
+            "amqp://fixture-encoded-user:fixture%2Fencoded-password@queue.internal/vhost",
+        )
+        source_text = " ".join((
+            *safe_uris,
+            *(quote(uri, safe="") for uri in encoded_uris),
+            *(uri.replace("://", "%3A%2F%2F") for uri in encoded_uris),
+        ))
+        persisted = self.collect_text_recording(source_text)
+        secrets = (
+            "fixture-space-user", "space-password", "fixture-slash-user",
+            "slash-password", "fixture-encoded-user", "encoded-password",
+        )
+        for secret in secrets:
+            self.assertNotIn(secret, persisted)
+        self.assertIn("postgres://localhost/db", persisted)
+        self.assertIn("fixture@example.org", persisted)
+
+        source = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(source.read_text())
+        post = record["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["text"] = source_text
+        source.write_text(json.dumps(record))
+
+        code, stdout, stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(code, 0, stderr)
+        replayed = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        for secret in secrets:
+            self.assertNotIn(secret, replayed)
+            self.assertNotIn(secret, stdout)
+
+    def test_redacts_normalized_spaced_private_key_fields_in_collection_and_replay(self):
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        secrets = (
+            "fixture-spaced-private-key-secret",
+            "fixture-percent-spaced-private-key-secret",
+            "fixture-html-spaced-private-key-secret",
+        )
+        post.update({
+            "private key": secrets[0],
+            "private%20key": secrets[1],
+            "private&#32;key": secrets[2],
+            "public key": "fixture-public-key-value",
+        })
+        code, _, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            FixtureTransport([response(200, page)]),
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        source = next(self.recordings_dir.glob("record-*.json"))
+        persisted = source.read_text()
+        for secret in secrets:
+            self.assertNotIn(secret, persisted)
+        self.assertIn("fixture-public-key-value", persisted)
+
+        record = json.loads(persisted)
+        recorded_post = record["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        recorded_post.update(dict(zip(("private key", "private%20key", "private&#32;key"), secrets)))
+        source.write_text(json.dumps(record))
+
+        replay_code, replay_stdout, replay_stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(replay_code, 0, replay_stderr)
+        replayed = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        for secret in secrets:
+            self.assertNotIn(secret, replayed)
+            self.assertNotIn(secret, replay_stdout)
+        self.assertIn("fixture-public-key-value", replayed)
+
     def test_redacts_triple_quoted_credentials_in_collection_and_replay(self):
         source_text = (
             'password = """fixture-triple-double-first\n'

@@ -72,7 +72,7 @@ ALLOWED_RESPONSE_HEADERS = {
     "x-treg-served-by",
 }
 SENSITIVE_KEYS = re.compile(
-    r"(?:^|[_-])(?:access[_-]?token|refresh[_-]?token|token|api[_-]?key|api[_-]?token|key|private[_-]?key|client[_-]?secret|secret[_-]?key|secret|password|passwd|cookie|auth|authorization|credential|signature)(?:$|[_-])",
+    r"(?:^|[_-])(?:access[_-]?token|refresh[_-]?token|token|api[_-]?key|api[_-]?token|key|private(?:[_-]|\s+)?key|client[_-]?secret|secret[_-]?key|secret|password|passwd|cookie|auth|authorization|credential|signature)(?:$|[_-])",
     re.IGNORECASE,
 )
 SENSITIVE_QUERY_KEYS = {
@@ -381,6 +381,39 @@ def redact_assignments(value):
     return "".join(parts)
 
 
+def redact_encoded_uri_userinfo(value):
+    parts = []
+    offset = 0
+    for match in re.finditer(r"\S+", value):
+        token = match.group()
+        candidate = token.strip("\"'`()[]{}<>,;.")
+        if "%" not in candidate:
+            continue
+        raw_scheme = URL_SCHEME.search(candidate)
+        if raw_scheme:
+            authority = candidate[raw_scheme.end():]
+            boundary = min(
+                (index for char in "/?#" if (index := authority.find(char)) >= 0),
+                default=len(authority),
+            )
+            at = authority.find("@")
+            if 0 <= at < boundary:
+                continue
+            if not re.search(r"%(?:25)*40", authority[:boundary], re.IGNORECASE):
+                continue
+        decoded = decode_url_component(candidate)
+        if decoded is None or not URL_SCHEME.search(decoded) or "@" not in decoded:
+            continue
+        start = match.start() + token.index(candidate)
+        end = start + len(candidate)
+        parts.extend((value[offset:start], "[REDACTED_URL]"))
+        offset = end
+    if not parts:
+        return value
+    parts.append(value[offset:])
+    return "".join(parts)
+
+
 def redact_quoted_url_userinfo(value, whole_url=False):
     parts = []
     offset = 0
@@ -445,6 +478,7 @@ def safe_string(value, secrets=(), _depth=0):
     text = decode_escaped_ascii(text)
     if text is None:
         return "[REDACTED]"
+    text = redact_encoded_uri_userinfo(text)
     text = redact_quoted_url_userinfo(text)
     decoded_parts = []
     offset = 0
@@ -482,6 +516,7 @@ def safe_text(value, secrets=(), _depth=0):
     text = decode_escaped_ascii(str(value))
     if text is None:
         return "[REDACTED]"
+    text = redact_encoded_uri_userinfo(text)
     decoded = decode_url_component(text)
     if decoded is None:
         return "[REDACTED]"
