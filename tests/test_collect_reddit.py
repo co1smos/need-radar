@@ -308,6 +308,38 @@ if os.environ.get("NEED_RADAR_OFFLINE_TESTS") == "1":
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("replay", result.stdout)
 
+    def test_public_cli_replays_synthetic_recording_under_child_guards(self):
+        self.collect_text_recording("ordinary useful synthetic fixture text")
+        scratch = pathlib.Path(os.environ.get("TMPDIR", tempfile.gettempdir()))
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(CLI),
+                "replay",
+                "--recordings-dir", str(self.recordings_dir),
+                "--state-dir", str(self.state_dir),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=ROOT,
+            env={
+                "HOME": str(scratch),
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONPATH": str(ROOT / "tests"),
+                "TMPDIR": str(scratch),
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "NEED_RADAR_OFFLINE_TESTS": "1",
+            },
+            timeout=5,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["network_requests"], 0)
+        self.assertEqual(report["source"], "reddit")
+        self.assertNotIn("response_sanitization_failed", report["errors"])
+
     def test_direct_connection_is_stopped_before_socket_creation(self):
         address = (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", 443))
         with patch("socket.getaddrinfo", return_value=[address]) as resolve:
@@ -1356,6 +1388,49 @@ print(safe_string({payload!r}))
             self.assertNotIn(secret, replay_stdout)
         self.assertIn("ordinary useful fixture text", replayed)
         replayed_record = json.loads(source.read_text())
+        self.assertFalse(replayed_record["processing_complete"])
+        self.assertIn("response_sanitization_failed", replayed_record["validation_errors"])
+        self.assertIsInstance(replayed_record["request"], dict)
+        self.assertIsInstance(replayed_record["billing"], dict)
+
+    def test_withholds_raw_credential_literal_suffix_in_collection_and_replay(self):
+        source_text = 'password = "ordinary prefix" r"fixture-raw-string-suffix-secret"'
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["text"] = source_text
+        post["public_fixture_text"] = "ordinary useful fixture text"
+
+        code, stdout, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            FixtureTransport([response(200, page)]),
+            FakeCredentials(),
+        )
+
+        record_path = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(record_path.read_text())
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("response_sanitization_failed", json.loads(stdout)["errors"])
+        self.assertFalse(record["processing_complete"])
+        self.assertIn("response_sanitization_failed", record["validation_errors"])
+        self.assertNotIn("fixture-raw-string-suffix-secret", record_path.read_text())
+        self.assertIn("ordinary useful fixture text", record_path.read_text())
+
+        post = record["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["text"] = source_text
+        record["error"] = None
+        record.pop("validation_errors", None)
+        record_path.write_text(json.dumps(record))
+
+        replay_code, replay_stdout, replay_stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(replay_code, 2, replay_stderr)
+        self.assertEqual(json.loads(replay_stdout)["network_requests"], 0)
+        self.assertNotIn("fixture-raw-string-suffix-secret", record_path.read_text())
+        self.assertIn("response_sanitization_failed", json.loads(replay_stdout)["errors"])
+        replayed_record = json.loads(record_path.read_text())
         self.assertFalse(replayed_record["processing_complete"])
         self.assertIn("response_sanitization_failed", replayed_record["validation_errors"])
         self.assertIsInstance(replayed_record["request"], dict)

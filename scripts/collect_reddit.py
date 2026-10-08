@@ -322,6 +322,12 @@ def redact_assignments(value):
     if parts:
         parts.append(value[offset:])
         value = "".join(parts)
+    first_assignment = SENSITIVE_ASSIGNMENT_PREFIX.search(value)
+    if first_assignment and re.search(
+        r"(?i)(?<![a-z0-9_])(?:\\?[rubf]|br|rb|fr|rf)[\"'`]",
+        value[first_assignment.end():],
+    ):
+        return REDACTED_WITHHELD
     parts = []
     offset = 0
     while match := SENSITIVE_ASSIGNMENT_PREFIX.search(value, offset):
@@ -332,10 +338,7 @@ def redact_assignments(value):
         quoted_value = False
         candidate = value[start:]
         candidate = candidate.lstrip()
-        if re.match(
-            r"(?:[>|](?:[+-]\d?|\d?[+-]?)(?=\s|#|$)|(?i:\\?[rubf]|br|rb|fr|rf)[\"'`])",
-            candidate,
-        ):
+        if re.match(r"[>|](?:[+-]\d?|\d?[+-]?)(?=\s|#|$)", candidate):
             return REDACTED_WITHHELD
         quote_start = start
         while quote_start < len(value) and value[quote_start] == "\\":
