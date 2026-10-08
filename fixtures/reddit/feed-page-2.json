@@ -1,0 +1,22 @@
+{
+  "code": 200,
+  "data": {
+    "subredditV3": {
+      "elements": {
+        "dist": 1,
+        "pageInfo": {"endCursor": null, "hasNextPage": false},
+        "edges": [
+          {
+            "node": {
+              "groupId": "t3_demo2",
+              "url": "https://www.reddit.com/r/example/comments/demo2/synthetic-post/",
+              "title": "Synthetic post two",
+              "text": "Second clearly synthetic fixture post.",
+              "createdAt": "2026-10-06T13:00:00Z"
+            }
+          }
+        ]
+      }
+    }
+  }
+}
