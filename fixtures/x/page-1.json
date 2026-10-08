@@ -1,0 +1,33 @@
+{
+  "output": {
+    "found": true,
+    "data": {
+      "items": [
+        {
+          "id": "990000000000000001",
+          "url": "https://x.com/synthetic/status/990000000000000001",
+          "text": "Synthetic post: pagination and context recovery matter.",
+          "createdUtc": 1790856000,
+          "conversationId": "990000000000000001",
+          "isReply": false,
+          "inReplyToId": null
+        },
+        {
+          "id": "990000000000000002",
+          "url": "https://x.com/synthetic/status/990000000000000002",
+          "text": "Synthetic out-of-window post.",
+          "createdUtc": 1791028800,
+          "conversationId": "990000000000000002",
+          "isReply": false,
+          "inReplyToId": null
+        }
+      ],
+      "nextCursor": "synthetic-cursor-2"
+    }
+  },
+  "provider": "AnyAPI",
+  "costUsd": 0.00065,
+  "items": 2,
+  "replayed": false,
+  "source": {"id": "synthetic-x", "name": "Synthetic X provider", "kind": "synthetic"}
+}
