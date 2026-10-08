@@ -31,6 +31,14 @@ const options = parseCliOptions(process.argv.slice(2));
 const runId = `${Date.now()}-${process.pid}`;
 const artifactRoot = join(root, ".sandcastle", "runs", runId);
 const lockDir = join(root, ".sandcastle", "orchestrator.lock");
+const MAX_REVIEW_ROUNDS = 20;
+
+class NeedsTriageError extends Error {
+  constructor(issueNumber: number) {
+    super(`issue #${issueNumber} reached ${MAX_REVIEW_ROUNDS} review rounds`);
+    this.name = "NeedsTriageError";
+  }
+}
 
 type CommandResult = { exitCode: number; stdout: string; stderr: string };
 type Issue = any;
@@ -178,6 +186,7 @@ async function runTicket(issue: Issue, iteration: number, baseSha: string, provi
   let reviewerFindings: string[] = [];
   let focusedTestEvidence = "";
   let lastImplementerSessionId = "";
+  const followups = new Set<string>();
 
   const writeReviewState = async (phase: string) => {
     await writeFile(join(ticketRoot, "review-state.json"), JSON.stringify({ phase, criteria: reviewState }, null, 2));
@@ -224,6 +233,7 @@ async function runTicket(issue: Issue, iteration: number, baseSha: string, provi
     });
     if (usedSessionIds.has(reviewer.receipt.session_id)) throw new Error("reviewer session reused");
     usedSessionIds.add(reviewer.receipt.session_id);
+    for (const note of reviewer.receipt.followups) followups.add(note);
     const headAfter = await execInWorktree("git rev-parse HEAD");
     if (headAfter.stdout.trim() !== candidateHead) throw new Error("reviewer changed Git HEAD");
     const dirty = await execInWorktree("git status --short --untracked-files=no");
@@ -237,6 +247,14 @@ async function runTicket(issue: Issue, iteration: number, baseSha: string, provi
   await writeReviewState("initial");
 
   while (true) {
+    if (round > MAX_REVIEW_ROUNDS) {
+      await writeFile(join(ticketRoot, "needs-triage.json"), JSON.stringify({
+        status: "needs_triage", issue: issue.number, rounds: MAX_REVIEW_ROUNDS,
+        branch, head: candidateHead, criteria: reviewState,
+        latestFindings: reviewerFindings, followups: [...followups],
+      }, null, 2));
+      throw new NeedsTriageError(issue.number);
+    }
     const artifacts = roundArtifactPaths(ticketRoot, round);
     const previousHead = candidateHead;
     await writeFile(artifacts.implementerPromptPath, fillTemplate(templates.implementer, {
@@ -289,6 +307,7 @@ async function runTicket(issue: Issue, iteration: number, baseSha: string, provi
     head: candidateHead,
     rounds: round,
     acceptanceCriteria: reviewState,
+    followups: [...followups],
   }, null, 2));
   return { issue, branch, head: candidateHead, ticketRoot };
 }
@@ -354,10 +373,13 @@ async function main() {
   await writeFile(join(artifactRoot, "run.json"), JSON.stringify({ runId, pid: process.pid, options, startedAt: new Date().toISOString() }, null, 2));
   let iteration = 1;
   let completedIterations = 0;
+  const triageIssues = new Set<number>();
   try {
     while (true) {
       const issues = await resolveIssues();
-      const ready = selectReadyIssues(issues, { overrideNumber: options.issueOverride, maxParallel: options.maxParallel });
+      const ready = selectReadyIssues(issues, {
+        overrideNumber: options.issueOverride, maxParallel: options.maxParallel, excludedNumbers: triageIssues,
+      });
       if (!ready.length) break;
       const baseSha = await requireOk("git", ["rev-parse", options.baseSha]);
       const iterationRoot = join(artifactRoot, `iteration-${iteration}`);
@@ -369,12 +391,14 @@ async function main() {
       const candidates = successfulCandidates(summary) as Candidate[];
       for (const entry of summary) {
         if (entry.outcome.status === "rejected") {
+          if (entry.outcome.reason instanceof NeedsTriageError) triageIssues.add(entry.issue.number);
           console.error(`issue #${entry.issue.number} failed this iteration: ${entry.outcome.reason}`);
         }
       }
       await writeFile(join(iterationRoot, "settled.json"), JSON.stringify(summary.map((entry: any) => ({
         issue: entry.issue.number,
-        status: entry.outcome.status,
+        status: entry.outcome.status === "rejected" && entry.outcome.reason instanceof NeedsTriageError
+          ? "needs_triage" : entry.outcome.status,
         ...(entry.outcome.status === "rejected" ? { error: String(entry.outcome.reason) } : { head: (entry.outcome.value as Candidate).head }),
       })), null, 2));
       await runMerger(candidates, iteration, providerEnvName);
@@ -382,7 +406,10 @@ async function main() {
       if (options.issueOverride !== undefined) break;
       iteration += 1;
     }
-    console.log(JSON.stringify({ status: "complete", runId, iterations: completedIterations }, null, 2));
+    console.log(JSON.stringify({
+      status: triageIssues.size ? "complete_with_triage" : "complete",
+      runId, iterations: completedIterations, needsTriage: [...triageIssues],
+    }, null, 2));
   } finally {
     if (ownsLock) {
       await rm(lockDir, { recursive: true, force: true });

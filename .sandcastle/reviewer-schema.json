@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
   "additionalProperties": false,
-  "required": ["phase", "status", "review_mode", "verdict", "session_id", "reviewed_head", "completed_at", "criteria", "blocker"],
+  "required": ["phase", "status", "review_mode", "verdict", "session_id", "reviewed_head", "completed_at", "criteria", "followups", "blocker"],
   "properties": {
     "phase": { "type": "string", "enum": ["reviewer"] },
     "status": { "type": "string", "enum": ["completed"] },
@@ -24,6 +24,7 @@
         }
       }
     },
+    "followups": { "type": "array", "items": { "type": "string", "minLength": 1 } },
     "blocker": { "type": "string" }
   }
 }

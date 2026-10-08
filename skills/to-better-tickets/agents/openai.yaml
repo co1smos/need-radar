@@ -1,0 +1,3 @@
+interface:
+  display_name: "To Better Tickets"
+  short_description: "Bounded agent-ready tickets with explicit failure modes"

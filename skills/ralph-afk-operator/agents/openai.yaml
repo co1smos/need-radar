@@ -1,0 +1,3 @@
+interface:
+  display_name: "Ralph AFK Operator"
+  short_description: "Start and supervise the repo-local Ralph orchestrator."
