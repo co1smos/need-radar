@@ -1,5 +1,6 @@
 import contextlib
 import hashlib
+import html
 import io
 import json
 import os
@@ -413,7 +414,7 @@ if os.environ.get("NEED_RADAR_OFFLINE_TESTS") == "1":
 
     def test_malformed_quoted_redaction_is_bounded_in_subprocess(self):
         scratch = pathlib.Path(os.environ.get("TMPDIR", tempfile.gettempdir()))
-        payload = 'password="' + "\\" * 30 + "unterminated fixture-regression-secret"
+        payload = 'password="' + "\\" * 1000 + "unterminated fixture-regression-secret"
         probe = f"""import os, pathlib, sys
 sys.path.insert(0, {str(ROOT / 'scripts')!r})
 blocked_network = {SOCKET_AUDIT_EVENTS!r}
@@ -559,6 +560,119 @@ print(safe_string({payload!r}))
         self.assertNotIn("fixture-newline-whitespace-secret", persisted)
         self.assertNotIn("fixture-tab-whitespace-secret", persisted)
         self.assertIn("safe-tail", persisted)
+
+    def test_redacts_multiply_encoded_assignments_in_collection_and_replay(self):
+        encoded_values = {}
+        secrets = (
+            "fixture-three-json-layers-secret",
+            "fixture-four-json-layers-secret",
+            "fixture-multiply-unicode-label-secret",
+            "fixture-html-quoted-password with spaces",
+        )
+        for layers, secret in zip((3, 4), secrets):
+            value = f'password: "{secret}"'
+            for _ in range(layers):
+                value = json.dumps(value)
+            encoded_values[f"encoded_{layers}"] = value
+        encoded_values["unicode_label"] = (
+            r'pass\\u005cu0077ord: "fixture-multiply-unicode-label-secret"'
+        )
+        encoded_values["html_quoted"] = (
+            "password=&quot;fixture-html-quoted-password with spaces&quot;; safe-tail"
+        )
+
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        untrusted_text = " | ".join(("Archived source", *encoded_values.values()))
+        post["text"] = untrusted_text
+        code, collection_stdout, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            FixtureTransport([response(200, page)]),
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 0, stderr)
+        record_path = next(self.recordings_dir.glob("record-*.json"))
+
+        def recursively_decode(value):
+            for _ in range(collect_reddit.MAX_URL_DECODE_ROUNDS + 4):
+                normalized = html.unescape(
+                    unquote(collect_reddit.decode_escaped_ascii(value) or value)
+                )
+                try:
+                    decoded = json.loads(normalized)
+                except (json.JSONDecodeError, ValueError):
+                    decoded = None
+                if isinstance(decoded, str):
+                    value = decoded
+                elif normalized == value:
+                    break
+                else:
+                    value = normalized
+            return value
+
+        recorded = json.loads(record_path.read_text())
+        recorded_post = recorded["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        persisted = "\n".join(
+            recursively_decode(part) for part in recorded_post["text"].split(" | ")
+        )
+        all_artifacts = "\n".join(
+            path.read_text() for path in self.recordings_dir.glob("*.json")
+        )
+        for secret in secrets:
+            self.assertNotIn(secret, persisted)
+            self.assertNotIn(secret, all_artifacts)
+            self.assertNotIn(secret, collection_stdout + stderr)
+
+        recorded_post["text"] = untrusted_text
+        record_path.write_text(json.dumps(recorded), encoding="utf-8")
+        record_path.chmod(0o600)
+        replay_code, replay_stdout, replay_stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(replay_code, 0, replay_stderr)
+        replayed = json.loads(record_path.read_text())
+        replayed_post = replayed["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        persisted = "\n".join(
+            recursively_decode(part) for part in replayed_post["text"].split(" | ")
+        )
+        all_artifacts = "\n".join(
+            path.read_text() for path in self.recordings_dir.glob("*.json")
+        )
+        for secret in secrets:
+            self.assertNotIn(secret, persisted)
+            self.assertNotIn(secret, all_artifacts)
+            self.assertNotIn(secret, replay_stdout)
+            self.assertNotIn(secret, replay_stderr)
+
+    def test_fails_closed_on_overlimit_html_credentials_in_collection_and_replay(self):
+        secret = "fixture-html-overlimit-password with spaces"
+        encoded = f'"{secret}"'
+        for _ in range(collect_reddit.MAX_URL_DECODE_ROUNDS + 1):
+            encoded = html.escape(encoded, quote=True)
+        text = "password=" + encoded
+        persisted = self.collect_text_recording(text)
+        self.assertNotIn(secret, persisted)
+
+        source = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(source.read_text())
+        record["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]["text"] = text
+        source.write_text(json.dumps(record), encoding="utf-8")
+        source.chmod(0o600)
+        replay_code, replay_stdout, replay_stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(replay_code, 0, replay_stderr)
+        all_artifacts = "\n".join(
+            path.read_text() for path in self.recordings_dir.glob("*.json")
+        )
+        self.assertNotIn(secret, all_artifacts)
+        self.assertNotIn(secret, replay_stdout)
+        self.assertNotIn(secret, replay_stderr)
 
     def test_redacts_private_secret_and_api_token_assignments_in_prose(self):
         persisted = self.collect_text_recording(

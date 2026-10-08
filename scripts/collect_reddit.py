@@ -5,6 +5,7 @@ import datetime as dt
 import email.utils
 import fcntl
 import hashlib
+import html
 import json
 import math
 import os
@@ -108,7 +109,7 @@ SENSITIVE_ASSIGNMENT_PREFIX = re.compile(
         x-amz-(?:credential|security-token|signature)|
         x-goog-(?:credential|signature)|x-treg-token
     )
-    (?:\\?["'])?\s*(?:\\?[:=])(?:\s|\\[nrt])*
+    (?:\\*["'])?\s*(?:\\*[:=])(?:\s|\\[nrt])*
     '''
 )
 PRIVATE_KEY_BEGIN = re.compile(r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----", re.IGNORECASE)
@@ -291,6 +292,15 @@ def redact_assignments(value):
     value = decode_escaped_ascii(value)
     if value is None:
         return "[REDACTED]"
+    for _ in range(MAX_URL_DECODE_ROUNDS):
+        normalized = decode_escaped_ascii(html.unescape(value))
+        if normalized is None:
+            return "[REDACTED]"
+        if normalized == value:
+            break
+        value = normalized
+    else:
+        return "[REDACTED]"
     value = redact_quoted_url_userinfo(value, whole_url=True)
     parts = []
     offset = 0
@@ -315,7 +325,9 @@ def redact_assignments(value):
         start = match.end()
         unterminated_quote = False
         quoted_value = False
-        quote_start = start + 1 if value.startswith((r'\"', r"\'"), start) else start
+        quote_start = start
+        while quote_start < len(value) and value[quote_start] == "\\":
+            quote_start += 1
         if quote_start < len(value) and value[quote_start] in "\"'`":
             quoted_value = True
             quote = value[quote_start]
@@ -497,11 +509,13 @@ def decode_escaped_ascii(value):
         return None
     for _ in range(MAX_URL_DECODE_ROUNDS):
         decoded = re.sub(
-            r"\\u([0-9a-f]{4})|\\/",
+            r"\\+u([0-9a-f]{4})|\\+/",
             lambda match: (
                 chr(int(match.group(1), 16))
                 if match.group(1) and int(match.group(1), 16) < 128
-                else "/" if match.group(0) == r"\/" else match.group(0)
+                else match.group(0)
+                if match.group(1)
+                else "/"
             ),
             value,
             flags=re.IGNORECASE,
