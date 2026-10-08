@@ -1016,6 +1016,16 @@ print(safe_string({payload!r}))
         ):
             self.assertNotIn(secret, persisted)
 
+    def test_redacted_userinfo_does_not_withhold_an_ordinary_url(self):
+        persisted = self.collect_text_recording(
+            "Useful context: https://fixture-user:fixture-password@example.org/path safe-tail"
+        )
+
+        self.assertNotIn("fixture-user", persisted)
+        self.assertNotIn("fixture-password", persisted)
+        self.assertIn("https://[REDACTED]@example.org/path", persisted)
+        self.assertIn("safe-tail", persisted)
+
     def test_replay_redacts_legacy_recordings_before_reuse(self):
         self.collect_text_recording("safe synthetic text")
         source = next(self.recordings_dir.glob("record-*.json"))

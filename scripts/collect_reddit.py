@@ -442,7 +442,7 @@ def redact_encoded_uri_userinfo(value):
                 parts.extend((
                     value[offset:start],
                     candidate[:raw_scheme.end()],
-                    "[REDACTED]@",
+                    "%5BREDACTED%5D@",
                     candidate[authority_at + 1:],
                 ))
                 offset = end
@@ -505,7 +505,7 @@ def redact_quoted_url_userinfo(value, whole_url=False):
             offset = end
             search_offset = offset
         elif at is not None:
-            parts.extend((value[offset:start], value[start:scheme_end], "[REDACTED]@"))
+            parts.extend((value[offset:start], value[start:scheme_end], "%5BREDACTED%5D@"))
             offset = at + 1
             search_offset = offset
         elif quoted_space:
@@ -657,11 +657,22 @@ def safe_url(value, secrets=(), _depth=0):
     authority_end = re.search(r"[/?#]", authority)
     if authority_end:
         authority = authority[:authority_end.start()]
+    unredacted_assignment = normalized_value is not None and any(
+        not re.match(
+            r"\[REDACTED\](?=$|[\s&;#])",
+            normalized_value[match.end():],
+            re.IGNORECASE,
+        )
+        for match in SENSITIVE_ASSIGNMENT_PREFIX.finditer(normalized_value)
+    )
+    redacted_userinfo = re.match(
+        r"(?:%5B|\[)REDACTED(?:%5D|\])@", authority, re.IGNORECASE
+    )
     malformed_url = (
         REDACTED_URL_WITHHELD
         if normalized_value is None
-        or SENSITIVE_ASSIGNMENT_PREFIX.search(normalized_value)
-        or "@" in authority
+        or unredacted_assignment
+        or ("@" in authority and not redacted_userinfo)
         else "[REDACTED_URL]"
     )
     if any(ord(character) <= 0x20 or ord(character) == 0x7f for character in value):
