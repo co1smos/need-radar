@@ -1808,17 +1808,121 @@ print(safe_string({payload!r}))
         post["text"] = "copied from " + malformed
         transport = FixtureTransport([response(200, page)])
 
-        code, _, stderr = self.run_cli(
+        code, stdout, stderr = self.run_cli(
             self.args("--max-feed-pages", "1", "--max-posts", "0"),
             transport,
             FakeCredentials(),
         )
 
-        self.assertEqual(code, 0, stderr)
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("response_sanitization_failed", json.loads(stdout)["errors"])
+        record = json.loads(next(self.recordings_dir.glob("record-*.json")).read_text())
+        self.assertFalse(record["processing_complete"])
+        self.assertIn("response_sanitization_failed", record["validation_errors"])
+        self.assertIsInstance(record["request"], dict)
+        self.assertIsInstance(record["billing"], dict)
         persisted = "\n".join(path.read_text() for path in self.recordings_dir.glob("record-*.json"))
         for secret in ("fixture-user", "fixture-password", "fixture-credential"):
             self.assertNotIn(secret, persisted)
         self.assertIn("[REDACTED_URL]", persisted)
+
+    def test_malformed_credential_url_marks_collection_and_replay_incomplete(self):
+        malformed = "https://example.org/%ZZ?password=fixture-malformed-secret"
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["url"] = malformed
+        post["text"] = "ordinary useful fixture text"
+
+        code, stdout, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            FixtureTransport([response(200, page)]),
+            FakeCredentials(),
+        )
+
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("response_sanitization_failed", json.loads(stdout)["errors"])
+        record_path = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(record_path.read_text())
+        self.assertFalse(record["processing_complete"])
+        self.assertIn("response_sanitization_failed", record["validation_errors"])
+        self.assertIsInstance(record["request"], dict)
+        self.assertIsInstance(record["billing"], dict)
+        self.assertNotIn("fixture-malformed-secret", record_path.read_text())
+        self.assertIn("ordinary useful fixture text", record_path.read_text())
+
+        recorded_post = (
+            record["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        )
+        recorded_post["url"] = malformed
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        record_path.chmod(0o600)
+
+        replay_code, replay_stdout, replay_stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(replay_code, 2, replay_stderr)
+        self.assertEqual(json.loads(replay_stdout)["network_requests"], 0)
+        self.assertIn("response_sanitization_failed", json.loads(replay_stdout)["errors"])
+        replayed = json.loads(record_path.read_text())
+        self.assertFalse(replayed["processing_complete"])
+        self.assertIn("response_sanitization_failed", replayed["validation_errors"])
+        self.assertIsInstance(replayed["request"], dict)
+        self.assertIsInstance(replayed["billing"], dict)
+        self.assertNotIn("fixture-malformed-secret", record_path.read_text())
+
+    def test_mixed_encoded_uri_authority_credentials_are_withheld_in_collection_and_replay(self):
+        source = "postgres://user:fixture-secret%2Ftail%26%2364%3Blocalhost/db"
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["text"] = "ordinary useful fixture text"
+        post["description"] = source
+
+        code, stdout, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            FixtureTransport([response(200, page)]),
+            FakeCredentials(),
+        )
+
+        record_path = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(record_path.read_text())
+        persisted = record_path.read_text()
+        for _ in range(collect_reddit.MAX_URL_DECODE_ROUNDS + 2):
+            persisted = unquote(html.unescape(persisted))
+        self.assertFalse("fixture-secret" in persisted, "fixture credential survived collection")
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("response_sanitization_failed", json.loads(stdout)["errors"])
+        self.assertFalse(record["processing_complete"])
+        self.assertIn("response_sanitization_failed", record["validation_errors"])
+        self.assertIsInstance(record["request"], dict)
+        self.assertIsInstance(record["billing"], dict)
+        self.assertIn("ordinary useful fixture text", record_path.read_text())
+
+        recorded_post = (
+            record["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        )
+        recorded_post["description"] = source
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        record_path.chmod(0o600)
+
+        replay_code, replay_stdout, replay_stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(replay_code, 2, replay_stderr)
+        self.assertEqual(json.loads(replay_stdout)["network_requests"], 0)
+        self.assertIn("response_sanitization_failed", json.loads(replay_stdout)["errors"])
+        replayed = json.loads(record_path.read_text())
+        persisted = record_path.read_text()
+        for _ in range(collect_reddit.MAX_URL_DECODE_ROUNDS):
+            persisted = unquote(html.unescape(persisted))
+        self.assertFalse("fixture-secret" in persisted, "fixture credential survived replay")
+        self.assertFalse(replayed["processing_complete"])
+        self.assertIn("response_sanitization_failed", replayed["validation_errors"])
+        self.assertIsInstance(replayed["request"], dict)
+        self.assertIsInstance(replayed["billing"], dict)
 
     def test_nested_signed_url_is_redacted_in_persisted_artifacts(self):
         page = fixture_body("feed-page-1.json")

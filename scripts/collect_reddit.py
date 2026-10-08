@@ -115,6 +115,10 @@ SENSITIVE_ASSIGNMENT_PREFIX = re.compile(
 PRIVATE_KEY_BEGIN = re.compile(r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----", re.IGNORECASE)
 EMBEDDED_URL = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 URL_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
+ENCODED_HTML_AT = re.compile(
+    r"%(?:25)*26%(?:25)*23(?:0*64|x0*40)(?:%(?:25)*3b|;)?",
+    re.IGNORECASE,
+)
 
 
 class CollectorError(Exception):
@@ -133,6 +137,7 @@ class WithheldValue(str):
 
 
 REDACTED_WITHHELD = WithheldValue("[REDACTED_WITHHELD]")
+REDACTED_URL_WITHHELD = WithheldValue("[REDACTED_URL]")
 
 
 def contains_withheld(value):
@@ -418,6 +423,17 @@ def redact_encoded_uri_userinfo(value):
                         break
                     index = authority.find(character, index + 1)
             boundary = min(boundaries, default=len(authority))
+            if "@" not in authority[:boundary] and ENCODED_HTML_AT.search(authority[:boundary]):
+                decoded_authority = decode_url_component(authority[:boundary])
+                if decoded_authority is None:
+                    return REDACTED_WITHHELD
+                decoded_at = decoded_authority.find("@")
+                decoded_boundaries = [
+                    index for character in "/?#"
+                    if (index := decoded_authority.find(character)) >= 0
+                ]
+                if decoded_at > min(decoded_boundaries, default=len(decoded_authority)):
+                    return REDACTED_WITHHELD
             at = authority.find("@")
             if 0 <= at < boundary:
                 start = match.start() + token.index(candidate)
@@ -517,6 +533,8 @@ def safe_string(value, secrets=(), _depth=0):
     if text is None:
         return REDACTED_WITHHELD
     text = redact_encoded_uri_userinfo(text)
+    if contains_withheld(text):
+        return REDACTED_WITHHELD
     text = redact_quoted_url_userinfo(text)
     decoded_parts = []
     offset = 0
@@ -558,7 +576,10 @@ def safe_text(value, secrets=(), _depth=0):
         return REDACTED_WITHHELD
     if _depth > MAX_NESTED_URLS:
         return REDACTED_WITHHELD
-    decoded = decode_url_component(redact_encoded_uri_userinfo(str(value)))
+    redacted = redact_encoded_uri_userinfo(str(value))
+    if contains_withheld(redacted):
+        return REDACTED_WITHHELD
+    decoded = decode_url_component(redacted)
     if decoded is None:
         return REDACTED_WITHHELD
     if EMBEDDED_URL.search(decoded):
@@ -628,14 +649,29 @@ def safe_url(value, secrets=(), _depth=0):
     if _depth > MAX_NESTED_URLS:
         return REDACTED_WITHHELD
     value = redact_encoded_uri_userinfo(value)
+    if contains_withheld(value):
+        return REDACTED_WITHHELD
+    normalized_value = decode_url_component(value)
+    scheme_match = URL_SCHEME.match(normalized_value or value)
+    authority = (normalized_value or value)[scheme_match.end():] if scheme_match else ""
+    authority_end = re.search(r"[/?#]", authority)
+    if authority_end:
+        authority = authority[:authority_end.start()]
+    malformed_url = (
+        REDACTED_URL_WITHHELD
+        if normalized_value is None
+        or SENSITIVE_ASSIGNMENT_PREFIX.search(normalized_value)
+        or "@" in authority
+        else "[REDACTED_URL]"
+    )
     if any(ord(character) <= 0x20 or ord(character) == 0x7f for character in value):
-        return "[REDACTED_URL]"
+        return malformed_url
     if re.search(r"%(?![0-9a-f]{2})", value, re.IGNORECASE):
-        return "[REDACTED_URL]"
+        return malformed_url
     try:
         parsed = urllib.parse.urlsplit(value)
     except ValueError:
-        return "[REDACTED_URL]"
+        return malformed_url
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
         return "[REDACTED_URL]"
     try:
@@ -653,7 +689,7 @@ def safe_url(value, secrets=(), _depth=0):
         if parsed.username is not None or parsed.password is not None:
             host = "%5BREDACTED%5D@" + host
     except ValueError:
-        return "[REDACTED_URL]"
+        return malformed_url
     query = []
     for key, item in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
         decoded_key = decode_url_component(key)
