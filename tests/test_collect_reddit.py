@@ -971,6 +971,87 @@ print(safe_string({payload!r}))
         ):
             self.assertNotIn(secret, persisted)
 
+    def test_redacts_non_http_uri_userinfo_in_collection_and_replay(self):
+        source_text = (
+            "connect postgres://fixture-postgres-user:fixture-postgres-password@localhost/db "
+            "and redis://fixture-redis-user:fixture-redis-password@localhost/0 "
+            "and Amqp+TLS://fixture-amqp-user:fixture-amqp-password@queue.internal/vhost "
+            "and postgresql+srv://fixture-encoded%40user:fixture-encoded%2Fpassword@db.internal/name"
+        )
+        persisted = self.collect_text_recording(source_text)
+        secrets = (
+            "fixture-postgres-user",
+            "fixture-postgres-password",
+            "fixture-redis-user",
+            "fixture-redis-password",
+            "fixture-amqp-user",
+            "fixture-amqp-password",
+            "fixture-encoded",
+        )
+        for secret in secrets:
+            self.assertNotIn(secret, persisted)
+        for host in ("localhost/db", "localhost/0", "queue.internal/vhost", "db.internal/name"):
+            self.assertIn(host, persisted)
+
+        source = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(source.read_text())
+        post = record["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["text"] = source_text
+        source.write_text(json.dumps(record))
+
+        code, stdout, stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["counts"]["replay_sanitized_recordings"], 1)
+        replayed = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        for secret in secrets:
+            self.assertNotIn(secret, replayed)
+            self.assertNotIn(secret, stdout)
+
+    def test_redacts_triple_quoted_credentials_in_collection_and_replay(self):
+        source_text = (
+            'password = """fixture-triple-double-first\n'
+            'fixture-triple-double-second""" public-tail\n'
+            "api_token = '''fixture-triple-single-first\n"
+            "fixture-triple-single-second''' another-public-tail\n"
+            'password = """fixture-triple-unclosed-secret\n'
+            "fixture-after-unclosed-secret"
+        )
+        persisted = self.collect_text_recording(source_text)
+        secrets = (
+            "fixture-triple-double-first",
+            "fixture-triple-double-second",
+            "fixture-triple-single-first",
+            "fixture-triple-single-second",
+            "fixture-triple-unclosed-secret",
+            "fixture-after-unclosed-secret",
+        )
+        for secret in secrets:
+            self.assertNotIn(secret, persisted)
+
+        source = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(source.read_text())
+        post = record["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["text"] = source_text
+        source.write_text(json.dumps(record))
+
+        code, stdout, stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["counts"]["replay_sanitized_recordings"], 1)
+        replayed = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        for secret in secrets:
+            self.assertNotIn(secret, replayed)
+            self.assertNotIn(secret, stdout)
+        self.assertIn("public-tail", replayed)
+        self.assertIn("another-public-tail", replayed)
+
     def test_redacts_folded_authorization_header_continuations(self):
         persisted = self.collect_text_recording(
             "Authorization: Bearer fixture-header-first-secret\r\n"

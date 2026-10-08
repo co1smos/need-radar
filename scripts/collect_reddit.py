@@ -114,7 +114,7 @@ SENSITIVE_ASSIGNMENT_PREFIX = re.compile(
 )
 PRIVATE_KEY_BEGIN = re.compile(r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----", re.IGNORECASE)
 EMBEDDED_URL = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
-URL_SCHEME = re.compile(r"https?://", re.IGNORECASE)
+URL_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
 
 
 class CollectorError(Exception):
@@ -332,25 +332,27 @@ def redact_assignments(value):
         if quote_start < len(value) and value[quote_start] in "\"'`":
             quoted_value = True
             quote = value[quote_start]
+            delimiter_width = 3 if value.startswith(quote * 3, quote_start) else 1
+            delimiter = quote * delimiter_width
             escaped_quote = opening_slashes > 0
             limit = len(value)
-            end = quote_start + 1
+            end = quote_start + delimiter_width
             while end < limit:
                 if value[end] == "\\":
                     escape_start = end
                     while end < limit and value[end] == "\\":
                         end += 1
                     slash_count = end - escape_start
-                    if end < limit and value[end] == quote:
+                    if end < limit and value.startswith(delimiter, end):
                         if (
                             (escaped_quote and slash_count == opening_slashes)
                             or (not escaped_quote and slash_count % 2 == 0)
                         ):
-                            end += 1
+                            end += delimiter_width
                             break
-                        end += 1
-                elif value[end] == quote:
-                    end += 1
+                        end += delimiter_width
+                elif value.startswith(delimiter, end):
+                    end += delimiter_width
                     break
                 else:
                     end += 1
@@ -410,20 +412,20 @@ def redact_quoted_url_userinfo(value, whole_url=False):
             elif character in "/?#\r\n\t <>" or character.isspace():
                 break
             index += 1
-        if quoted_space:
-            if at is None:
-                parts.extend((value[offset:start], "[REDACTED]"))
-                return "".join(parts)
-            if whole_url:
-                end = at + 1
-                while end < len(value) and not value[end].isspace() and value[end] not in '<>"\'':
-                    end += 1
-                parts.extend((value[offset:start], "[REDACTED_URL]"))
-                offset = end
-            else:
-                parts.extend((value[offset:start], value[start:scheme_end], "[REDACTED]@"))
-                offset = at + 1
+        if at is not None and quoted_space and whole_url:
+            end = at + 1
+            while end < len(value) and not value[end].isspace() and value[end] not in '<>"\'':
+                end += 1
+            parts.extend((value[offset:start], "[REDACTED_URL]"))
+            offset = end
             search_offset = offset
+        elif at is not None:
+            parts.extend((value[offset:start], value[start:scheme_end], "[REDACTED]@"))
+            offset = at + 1
+            search_offset = offset
+        elif quoted_space:
+            parts.extend((value[offset:start], "[REDACTED]"))
+            return "".join(parts)
         else:
             if index >= len(value):
                 break
@@ -443,6 +445,7 @@ def safe_string(value, secrets=(), _depth=0):
     text = decode_escaped_ascii(text)
     if text is None:
         return "[REDACTED]"
+    text = redact_quoted_url_userinfo(text)
     decoded_parts = []
     offset = 0
     for match in EMBEDDED_URL.finditer(text):
