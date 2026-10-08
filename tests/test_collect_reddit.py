@@ -1107,6 +1107,58 @@ print(safe_string({payload!r}))
             self.assertNotIn(secret, replayed)
             self.assertNotIn(secret, stdout)
 
+    def test_redacts_html_encoded_non_http_uri_userinfo_in_collection_and_replay(self):
+        source_text = (
+            "postgres://user:fixture-html&#47;secret@localhost/db "
+            "postgres://user:fixture-hex&#x2f;secret@localhost/db "
+            "A benign fixture sentence remains useful."
+        )
+        persisted = self.collect_text_recording(source_text)
+
+        for secret in ("fixture-html", "fixture-hex"):
+            self.assertNotIn(secret, persisted)
+        self.assertIn("A benign fixture sentence remains useful.", persisted)
+
+        source = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(source.read_text())
+        post = record["response"]["body"]["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["text"] = source_text
+        source.write_text(json.dumps(record), encoding="utf-8")
+
+        code, stdout, stderr = self.run_cli([
+            "replay", "--recordings-dir", str(self.recordings_dir),
+            "--state-dir", str(self.state_dir),
+        ])
+
+        self.assertEqual(code, 0, stderr)
+        replayed = "\n".join(path.read_text() for path in self.recordings_dir.glob("*.json"))
+        for secret in ("fixture-html", "fixture-hex"):
+            self.assertNotIn(secret, replayed)
+            self.assertNotIn(secret, stdout)
+        self.assertIn("A benign fixture sentence remains useful.", replayed)
+
+    def test_depth_exhausted_url_is_withheld_with_request_lineage(self):
+        page = fixture_body("feed-page-1.json")
+        post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]
+        post["url"] = "https://example.org/?note=%" + "25" * 20 + "70assword%3Dfixture-depth-secret"
+
+        code, stdout, stderr = self.run_cli(
+            self.args("--max-feed-pages", "1", "--max-posts", "0"),
+            FixtureTransport([response(200, page)]),
+            FakeCredentials(),
+        )
+
+        report = json.loads(stdout)
+        record = json.loads(next(self.recordings_dir.glob("record-*.json")).read_text())
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("response_sanitization_failed", report["errors"])
+        self.assertIn("response_sanitization_failed", record["validation_errors"])
+        self.assertFalse(record["processing_complete"])
+        self.assertEqual(record["error"], "response_sanitization_failed")
+        self.assertEqual(record["request"]["attempt"], 1)
+        self.assertEqual(record["billing"]["charge_status"], "reported")
+        self.assertNotIn("fixture-depth-secret", json.dumps(record))
+
     def test_redacts_normalized_spaced_private_key_fields_in_collection_and_replay(self):
         page = fixture_body("feed-page-1.json")
         post = page["data"]["subredditV3"]["elements"]["edges"][0]["node"]

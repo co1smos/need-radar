@@ -404,10 +404,17 @@ def redact_encoded_uri_userinfo(value):
         raw_scheme = URL_SCHEME.search(candidate)
         if raw_scheme:
             authority = candidate[raw_scheme.end():]
-            boundary = min(
-                (index for char in "/?#" if (index := authority.find(char)) >= 0),
-                default=len(authority),
-            )
+            boundaries = []
+            for character in "/?#":
+                index = authority.find(character)
+                while index >= 0:
+                    if character != "#" or not re.match(
+                        r"&#(?:\d+|x[0-9a-f]+);", authority[max(0, index - 1):], re.IGNORECASE
+                    ):
+                        boundaries.append(index)
+                        break
+                    index = authority.find(character, index + 1)
+            boundary = min(boundaries, default=len(authority))
             at = authority.find("@")
             if 0 <= at < boundary:
                 start = match.start() + token.index(candidate)
@@ -645,10 +652,10 @@ def safe_url(value, secrets=(), _depth=0):
         decoded_key = decode_url_component(key)
         decoded_item = decode_url_component(item)
         if decoded_key is None or decoded_item is None:
-            return "[REDACTED_URL]"
+            return REDACTED_WITHHELD
         normalized_key = normalize_sensitive_key(decoded_key)
         if normalized_key is None:
-            return "[REDACTED_URL]"
+            return REDACTED_WITHHELD
         sensitive_key = (
             normalized_key.strip().lower() in SENSITIVE_QUERY_KEYS
             or SENSITIVE_KEYS.search(normalized_key)
