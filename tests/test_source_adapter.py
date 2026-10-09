@@ -58,6 +58,20 @@ class SourceAdapterTests(unittest.TestCase):
         self.assertEqual(normalization["status"], "partial")
         self.assertEqual(normalization["errors"], [])
         self.assertEqual(len(prepared["records"]), 5)
+        self.assertEqual(normalization["coverage"]["sources"]["reddit"], {
+            "status": "partial",
+            "input_count": 3,
+            "prepared_count": 3,
+            "returned_count": 2,
+            "omitted_count": 1,
+            "omissions_unknown": True,
+            "failure_count": 0,
+            "omission_reasons": ["reddit:reddit-comment-deleted: withheld"],
+            "failure_reasons": [],
+        })
+        self.assertEqual(normalization["coverage"]["sources"]["x"]["status"], "synthetic_complete")
+        self.assertEqual(normalization["coverage"]["sources"]["x"]["input_count"], 2)
+        self.assertEqual(normalization["coverage"]["sources"]["x"]["returned_count"], 2)
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -144,7 +158,9 @@ class SourceAdapterTests(unittest.TestCase):
             self.assertEqual(replay.returncode, 0, replay.stderr)
             replay_snapshot = read_frozen_snapshot(replay_output / "snapshot.json")
             self.assertEqual(replay_snapshot["items"], items)
-            self.assertEqual((replay_output / "report.md").read_bytes(), (output / "report.md").read_bytes())
+            self.assertIn("## Source coverage", (output / "report.md").read_text())
+            self.assertNotIn("## Source coverage", (replay_output / "report.md").read_text())
+            self.assertIn("Agent context handoff is repetitive", (replay_output / "report.md").read_text())
 
     def test_source_results_preserve_synthetic_judge_for_assessment(self):
         fixture = json.loads(json.dumps(self.fixture))
@@ -241,10 +257,64 @@ class SourceAdapterTests(unittest.TestCase):
             self.assertTrue(any("posts[0].comments[2] is malformed" in error for error in snapshot["source_normalization"]["errors"]))
             self.assertTrue(all(item["flags"]["partial_coverage"] for item in snapshot["items"][:3]))
             self.assertTrue(all(item["flags"]["incomplete"] for item in snapshot["items"][:3]))
+            reddit_coverage = snapshot["source_normalization"]["coverage"]["sources"]["reddit"]
+            self.assertEqual(reddit_coverage["input_count"], 4)
+            self.assertEqual(reddit_coverage["omitted_count"], 2)
+            self.assertEqual(reddit_coverage["failure_count"], 1)
             self.assertEqual(snapshot["items"][0]["discovery_origin"]["access_token"], "[REDACTED]")
             for artifact in output.iterdir():
                 if artifact.is_file():
                     self.assertNotIn(b"synthetic-redaction-probe", artifact.read_bytes(), artifact.name)
+
+    def test_missing_source_is_not_reported_as_an_empty_success(self):
+        source_results = json.loads(json.dumps(self.fixture["source_results"]))
+        del source_results["x"]
+        normalization_response = {
+            "results": [
+                row for row in self.fixture["normalization_model"]["response"]["results"]
+                if row["record_id"].startswith("reddit:")
+            ]
+        }
+
+        result = adapt_source_results(source_results, normalization_response)
+
+        self.assertEqual(result["status"], "partial")
+        x_coverage = result["coverage"]["sources"]["x"]
+        self.assertEqual(x_coverage["status"], "missing")
+        self.assertEqual(x_coverage["input_count"], 0)
+        self.assertEqual(x_coverage["returned_count"], 0)
+        self.assertEqual(x_coverage["omitted_count"], 0)
+        self.assertTrue(x_coverage["omissions_unknown"])
+        self.assertEqual(x_coverage["failure_count"], 1)
+        self.assertIn("response envelope is missing or malformed", x_coverage["failure_reasons"][0])
+
+        source_results["x"] = {"partial": False, "origin": {"query": "synthetic"}, "posts": []}
+        empty_result = adapt_source_results(source_results, normalization_response)
+        self.assertEqual(empty_result["coverage"]["sources"]["x"]["status"], "empty")
+        self.assertEqual(empty_result["coverage"]["sources"]["x"]["failure_count"], 0)
+
+    def test_no_findings_report_keeps_missing_source_degradation_visible(self):
+        fixture = json.loads(json.dumps(self.fixture))
+        del fixture["source_results"]["x"]
+        fixture["normalization_model"]["response"]["results"] = [
+            row for row in fixture["normalization_model"]["response"]["results"]
+            if row["record_id"].startswith("reddit:")
+        ]
+        fixture["model"]["response"] = []
+        hermes_tmp = Path.home() / ".hermes" / "cache" / "scratch"
+        with tempfile.TemporaryDirectory(dir=hermes_tmp) as directory:
+            root = Path(directory)
+            fixture_path = self.write_fixture(root, fixture)
+            output = root / "run"
+            result = self.run_cli(fixture_path, output, hermes_tmp)
+            report = (output / "report.md").read_text(encoding="utf-8")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Status: no_findings", report)
+        self.assertIn("No findings.", report)
+        self.assertIn("x: missing", report)
+        self.assertIn("failures 1", report)
+        self.assertIn("omissions unknown", report)
 
     def test_network_credentials_and_live_state_are_denied_in_process_and_child(self):
         with tempfile.TemporaryDirectory() as directory:

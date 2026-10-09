@@ -773,6 +773,11 @@ def run(serve_dir, fixture_path, output):
                         "promotion_recommendation": "none",
                     }
                 )
+                source_coverage = snapshot.get("source_normalization", {}).get("coverage")
+                duplicate_groups = selection.get("cross_source_duplicate_groups", [])
+                if source_coverage is not None:
+                    assessment_comparison["source_coverage"] = source_coverage
+                assessment_comparison["cross_source_duplicate_groups"] = duplicate_groups
                 assessment_report = comparison.render_markdown(assessment_comparison)
                 result = {
                     "status": "complete" if complete else "incomplete",
@@ -798,6 +803,8 @@ def run(serve_dir, fixture_path, output):
                         "errors": parity_errors,
                     },
                     "incomplete_reasons": incomplete_reasons,
+                    "source_coverage": source_coverage,
+                    "cross_source_duplicate_groups": duplicate_groups,
                     "assessment_comparison": assessment_comparison,
                     "assessment_comparison_report_sha256": digest(assessment_report.encode()),
                     "assessment_artifacts": {
