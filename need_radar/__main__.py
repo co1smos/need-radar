@@ -732,6 +732,10 @@ def run(fixture_path, output):
                         )
                     ids["configuration_id"] = configuration_meta["artifact_id"]
                     sequence_offset += 1
+                    if setting_errors:
+                        run_span["attributes"]["result_status"] = "invalid_configuration"
+                        run_span["output"] = {"status": "invalid_configuration", "ids": ids}
+                        return "invalid_configuration"
 
                 with tracer.span("fixture_validation", inputs={"fixture": fixture}) as span:
                     span["attributes"]["result_status"] = "valid"

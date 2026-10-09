@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -271,6 +272,24 @@ class ShadowRunnerTests(unittest.TestCase):
         self.assertEqual(artifact["attempted_requests"], 0)
         self.assertEqual(response, None)
         self.assertEqual(calls, [])
+
+    def test_invalid_shared_settings_stop_serve_before_extraction(self):
+        invalid_settings = settings(request_limit=0, candidate_limit=0)
+        invalid_settings["retry_policy"] = {"max_attempts": 2}
+        result, output = self.run_serve(invalid_settings)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("status=invalid_configuration", result.stdout)
+        configuration = json.loads((output / "shared-extraction-configuration.json").read_text())
+        self.assertEqual(configuration["status"], "invalid")
+        self.assertIn("offline extraction supports one attempt and no retries", configuration["errors"])
+        self.assertFalse((output / "prompt.json").exists())
+        self.assertFalse((output / "model-response.json").exists())
+        self.assertFalse((output / "candidates.json").exists())
+        self.assertFalse((output / "report.md").exists())
+        with sqlite3.connect(output / "lineage.sqlite3") as database:
+            stages = database.execute("SELECT stage, status FROM stages ORDER BY sequence").fetchall()
+        self.assertEqual(stages, [("shared_extraction_configuration", "invalid")])
 
     def test_failed_serve_is_not_replaced_by_shadow(self):
         serve_result, serve = self.run_serve(
