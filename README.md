@@ -2,7 +2,7 @@
 
 独立项目：持续发现 AI 开发/学习中具体、有价值、可解决、有合理规模切入口的 friction。
 
-**当前状态：设计讨论已完成；ticket #1 的离线 serve tracer 和 ticket #14 的 fake-only Discord delivery boundary 已实现。未连接实时来源、模型、定时任务或 Discord。**
+**当前状态：设计讨论已完成；ticket #1 离线 serve tracer、ticket #7 合成离线 assessment、ticket #11 Reddit+X 离线实验、ticket #13 HTML 投影和 ticket #14 fake-only Discord delivery boundary 已实现。未连接实时来源、模型、定时任务或 Discord。**
 
 项目路径：`/home/ubuntu/projects/need-radar`
 
@@ -25,7 +25,10 @@
 | [具体问题与实际回答全文](docs/grill/qa-transcript.md) | Q1–Q30 原始提问、Hermes 建议、对应的代理回答及实际结束消息，已核对原会话 |
 | [ChatGPT × Hermes 讨论摘要](docs/grill/discussion.md) | 中文结论、原始记录导航和后续实验例子；不是问答全文 |
 | [Design](docs/design.md) | 系统边界、extraction-only 实验、固定 judge、报告和完整 observability |
+| [Offline assessment](docs/assessment.md) | 固定 rubric、arm-blind evidence、failure isolation 与合成离线验证 |
 | [Decisions](docs/decisions.md) | 区分用户已定要求、可逆代理默认值与未来启用审批 |
+| [Extraction shadow runner](docs/shadow-runner.md) | #6 离线 v0/v1 parity、资源上限、failure isolation 与实测结果 |
+| [Mixed-source offline experiment](docs/mixed-source-experiment.md) | #11 synthetic Reddit+X fixture, per-source coverage, duplicate provenance, and assessed comparison |
 | [Activation checklist](docs/activation-checklist.md) | 真实接入前的预算、数据处理、频道配置和技术核查；目前全部未启用 |
 | [Owner brief](docs/owner-brief.md) | 本次对话中已经确认的意图和约束 |
 | [Evidence notes](docs/evidence-notes.md) | 已核实的文档/CLI 信息及尚未实测的依赖假设 |
@@ -64,6 +67,20 @@ python3 -m need_radar --output "$demo_dir"
 CLI 输出 `status=success`，并在目录中保存有序 `snapshot.json`、解析后的 v0 `prompt.json`、明确标记为合成边界的 `model-response.json`、已校验的 `candidates.json`、规范 `report.md` 和 SQLite `lineage.sqlite3`。所有阶段保留输入/输出哈希和前序阶段链接。合成 fixture 不是实时来源或模型验证。
 
 `report.md` 是规范报告，并明确标注合成/离线状态与验证边界：引用校验只确认摘录是保留文本的精确子串，不判断语义支持。Fixture 在任何产物写入前先做秘密值脱敏；不合规输入会退出失败，只写 `validation.json` 和对应 lineage，不会生成成功 snapshot。
+
+## Ticket #13：确定性 HTML 投影
+
+同一命令在 Markdown 成功后生成独立 `report.html`；HTML 只投影规范 Markdown，不重新总结。`report.html` 自带源 Markdown SHA-256，旁边的 `report.html.manifest.json` 关联父 report artifact ID、输入/输出哈希、renderer 配置和验证状态。渲染 trace/logs 保存在 `presentation/`。CSS 内嵌，不加载外部资源；只启用安全的 HTTP(S) 与文档内证据链接。渲染失败会记录失败 manifest/trace，但不会改变 serve 状态，也不会覆盖 `report.md`。
+
+可重跑的合成离线检查（测试会拒绝网络、凭证路径和 canonical live-state 读取，并使用 Hermes `TMPDIR`）：
+
+```sh
+TMPDIR=/home/ubuntu/.hermes/cache/scratch PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tests:. python3 -m unittest tests.test_report_html -v
+```
+
+本次实测：renderer/E2E 安全检查 `Ran 5 tests ... OK`；完整 Python offline suite `Ran 207 tests ... OK`。均为合成离线验证，不代表实时来源覆盖或目标 VPS 字体/分页验证。
+
+HTML 只证明合成内容的确定性转换、UTF-8 中文文本保留、链接/转义和离线资源边界；没有验证目标 VPS 的字体/浏览器排版。PDF 暂缓：仓库没有已验证的 PDF renderer，且不安装软件。
 
 脱敏覆盖敏感字段名、常见 token 形式以及 `Authorization`、`Cookie` 等凭证文本，是尽力而为而非通用秘密检测；未知格式仍可能漏过，因此不要提供真实凭证。无法解析的 JSON 也会保存不含原始输入的 `invalid_input` 记录及 lineage。
 
@@ -119,4 +136,4 @@ python3 -m compileall -q need_radar tests
 
 Hermes session：`20261006_114451_8a8410`，全程保留，详见 [session record](docs/grill/session.md)。
 
-后续 agent 先读 [AGENTS.md](AGENTS.md)。tickets #1/#2/#14 的实现均为离线/synthetic；未做实时来源调用、付费模型调用、cron 或真实 Discord 发布。任何实时接入与上线均需另行授权。
+后续 agent 先读 [AGENTS.md](AGENTS.md)。tickets #1/#2/#7/#11/#13/#14 的实现均为离线/synthetic；未做实时来源调用、付费模型调用、cron 或真实 Discord 发布。任何实时接入与上线均需另行授权。
