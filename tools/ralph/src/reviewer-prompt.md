@@ -27,8 +27,8 @@ Implementation gate evidence:
 
 Review rules:
 
-- Need Radar: this is offline code readiness only; live acquisition and historical incident reconciliation are separate follow-up gates, not reasons to reject an otherwise passing offline criterion. No network, credentials or canonical live-state access. Use synthetic checks with network/protected-path denial in the test process and children under Hermes TMPDIR. Do not weaken safety gates or invent live evidence.
-
+- Need Radar: the ticket's current acceptance criteria and explicit authorization gates define scope; `ready-for-agent` is not live authorization. Issues #9 (X) and #19 (Reddit) are reserved for separate, explicitly owner-authorized sessions; do not review them outside those sessions. For offline tickets, verify tests deny network, credential, and canonical live-state access in the test process and subprocesses and use Hermes `TMPDIR`. Do not access credentials or protected live state, and do not treat live calls, exports, schedules, or delivery as authorized by this prompt.
+- Do not weaken safety gates or invent live evidence; live/incident follow-ups do not block an otherwise passing offline criterion unless that criterion explicitly requires them.
 - Review the original acceptance criteria within the ticket's supported scope; do not broaden them.
 - Ask whether a reproducible failure is realistic and material enough to block this delivery, considering likelihood and impact. Violations of an explicit security boundary are material even if uncommon. Map every blocking finding to a requested criterion.
 - Record worthwhile non-blocking improvements as `followups`; they must not fail a criterion.

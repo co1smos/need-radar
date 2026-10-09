@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -13,6 +14,7 @@ import {
   selectReadyIssues,
   summarizeSettled,
   successfulCandidates,
+  unsuccessfulIssueNumbers,
   updateReviewState,
   validateImplementerReceipt,
   validateMergerReceipt,
@@ -21,33 +23,33 @@ import {
 
 const routingEnv = {
   RALPH_IMPLEMENTER_HARNESS: "codex",
-  RALPH_IMPLEMENTER_MODEL: "gpt-6-luna",
+  RALPH_IMPLEMENTER_MODEL: "test-implementer-model",
   RALPH_IMPLEMENTER_EFFORT: "max",
   RALPH_REVIEWER_HARNESS: "codex",
-  RALPH_REVIEWER_MODEL: "gpt-6-astra",
+  RALPH_REVIEWER_MODEL: "test-reviewer-model",
   RALPH_REVIEWER_EFFORT: "medium",
   RALPH_MERGER_HARNESS: "codex",
-  RALPH_MERGER_MODEL: "gpt-6-luna",
+  RALPH_MERGER_MODEL: "test-merger-model",
   RALPH_MERGER_EFFORT: "high",
 };
 
 test("parseCliOptions requires explicit routing for all phases", () => {
   assert.throws(() => parseCliOptions([], {}), /implementer harness, model, and effort/);
   const options = parseCliOptions([], routingEnv);
-  assert.deepEqual(options.implementer, { harness: "codex", model: "gpt-6-luna", effort: "max" });
-  assert.deepEqual(options.reviewer, { harness: "codex", model: "gpt-6-astra", effort: "medium" });
-  assert.deepEqual(options.merger, { harness: "codex", model: "gpt-6-luna", effort: "high" });
+  assert.deepEqual(options.implementer, { harness: "codex", model: "test-implementer-model", effort: "max" });
+  assert.deepEqual(options.reviewer, { harness: "codex", model: "test-reviewer-model", effort: "medium" });
+  assert.deepEqual(options.merger, { harness: "codex", model: "test-merger-model", effort: "high" });
   assert.equal(options.maxParallel, 4);
 });
 
 test("CLI phase routing overrides env", () => {
   const options = parseCliOptions([
-    "--implementer-model", "gpt-6-sol", "--reviewer-effort", "high",
-    "--merger-model", "gpt-6-astra", "--max-parallel", "2", "--preflight",
+    "--implementer-model", "override-implementer-model", "--reviewer-effort", "high",
+    "--merger-model", "override-merger-model", "--max-parallel", "2", "--preflight",
   ], routingEnv);
-  assert.equal(options.implementer.model, "gpt-6-sol");
+  assert.equal(options.implementer.model, "override-implementer-model");
   assert.equal(options.reviewer.effort, "high");
-  assert.equal(options.merger.model, "gpt-6-astra");
+  assert.equal(options.merger.model, "override-merger-model");
   assert.equal(options.maxParallel, 2);
   assert.equal(options.dryRun, true);
 });
@@ -86,11 +88,11 @@ test("selectReadyIssues supports a single issue override", () => {
 
 test("buildPhaseCommand builds a visible Codex/Unsnooze noninteractive command", () => {
   const command = buildPhaseCommand({
-    harness: "codex", model: "gpt-6-luna", effort: "high",
+    harness: "codex", model: "test-model", effort: "high",
     worktreePath: "/tmp/w t", schemaPath: "/tmp/schema.json", receiptPath: "/tmp/receipt.json", promptPath: "/tmp/prompt.md",
   });
   assert.match(command, /^unsnooze _run codex /);
-  assert.match(command, /--model gpt-6-luna/);
+  assert.match(command, /--model test-model/);
   assert.match(command, /model_reasoning_effort/);
   assert.match(command, /--output-last-message/);
   assert.match(command, /< \/tmp\/prompt\.md$/);
@@ -109,12 +111,37 @@ test("correction context contains exact review/test evidence", () => {
 
 test("implementer and reviewer receipts enforce core contracts", () => {
   const head = "a".repeat(40);
-  validateImplementerReceipt({ phase: "implementer", status: "completed", issue_number: 4, session_id: "session-a", head, completed_at: new Date().toISOString() }, { issueNumber: 4, head });
+  validateImplementerReceipt({ phase: "implementer", status: "completed", issue_number: 4, session_id: "session-a", head, completed_at: new Date().toISOString(), reason: "" }, { issueNumber: 4, head, previousHead: "b".repeat(40) });
   validateReviewerReceipt({
     phase: "reviewer", status: "completed", review_mode: "criteria", verdict: "approved",
     session_id: "session-b", reviewed_head: head, completed_at: new Date().toISOString(),
     criteria: [{ id: "AC1", status: "passed", finding: "" }], followups: [], blocker: "",
   }, { reviewedHead: head, implementerSessionId: "session-a", reviewMode: "criteria", expectedCriteriaIds: ["AC1"] });
+});
+
+test("implementer JSON schema allows explicit blocked/failed receipts with reasons", () => {
+  const schema = JSON.parse(readFileSync(new URL("./implementer-schema.json", import.meta.url), "utf8"));
+  assert.deepEqual(schema.properties.status.enum, ["completed", "blocked", "failed"]);
+  assert.ok(schema.required.includes("reason"));
+  assert.deepEqual(schema.properties.reason, { type: "string" });
+});
+
+test("implementer reports blocked or failed work without faking a new commit", () => {
+  const head = "a".repeat(40);
+  const base = {
+    phase: "implementer", issue_number: 4, session_id: "session-a",
+    head, completed_at: new Date().toISOString(),
+  };
+  const expected = { issueNumber: 4, head, previousHead: head };
+  assert.throws(() => validateImplementerReceipt({ ...base, status: "completed", reason: "" }, expected),
+    /did not create a new candidate commit/);
+  assert.equal(validateImplementerReceipt({ ...base, status: "blocked", reason: "source credential unavailable" }, expected).status, "blocked");
+  assert.equal(validateImplementerReceipt({ ...base, status: "failed", reason: "test regression requires further investigation" }, expected).status, "failed");
+  assert.throws(() => validateImplementerReceipt({ ...base, status: "blocked", reason: "" }, expected), /explain the reason/);
+  assert.throws(() => validateImplementerReceipt({ ...base, status: "failed" }, expected), /reason must be a string/);
+  assert.throws(() => validateImplementerReceipt({ ...base, status: "completed", reason: "couldn't fix" },
+    { ...expected, previousHead: "b".repeat(40) }), /empty reason/);
+  assert.throws(() => validateImplementerReceipt({ ...base, status: "surprise", reason: "" }, expected), /invalid implementer status/);
 });
 
 test("reviewer followups are non-blocking but validated", () => {
@@ -166,6 +193,39 @@ test("ticket-local failure does not cancel siblings and merger sees only fulfill
     [1, "fulfilled"], [2, "rejected"], [3, "fulfilled"],
   ]);
   assert.deepEqual(successfulCandidates(summary).map((x) => x.issue), [1, 3]);
+});
+
+test("failed tickets are excluded for the rest of the run without blocking eligible siblings", async () => {
+  const firstBatch = [issue(2), issue(3)];
+  const summary = summarizeSettled(firstBatch, await Promise.allSettled([
+    Promise.reject(new Error("implementer did not create a new candidate commit")),
+    Promise.resolve({ issue: issue(3), head: "c".repeat(40) }),
+  ]));
+  const skipped = new Set(unsuccessfulIssueNumbers(summary));
+  assert.deepEqual([...skipped], [2]);
+  assert.deepEqual(successfulCandidates(summary).map((result) => result.issue.number), [3]);
+  const nextFrontier = [
+    issue(2), // still open and ready, but failed in this run
+    issue(4, { blockers: [{ number: 3, state: "CLOSED" }] }),
+    issue(5, { blockers: [{ number: 2, state: "OPEN" }] }),
+  ];
+  assert.deepEqual(selectReadyIssues(nextFrontier, { maxParallel: 3, excludedNumbers: skipped }).map((i) => i.number), [4]);
+  assert.deepEqual(selectReadyIssues(nextFrontier, { maxParallel: 3 }).map((i) => i.number), [2, 4]);
+  assert.deepEqual(selectReadyIssues([issue(2)], { excludedNumbers: skipped }), []);
+});
+
+test("merger rejections are deferred rather than repeatedly reselected", () => {
+  const summary = [
+    { issue: issue(2), outcome: { status: "fulfilled", value: { issue: issue(2) } } },
+    { issue: issue(3), outcome: { status: "fulfilled", value: { issue: issue(3) } } },
+  ];
+  const mergerReceipt = { results: [
+    { issue_number: 2, status: "rejected", detail: "merge conflict" },
+    { issue_number: 3, status: "merged", detail: "pushed" },
+  ] };
+  const skipped = new Set(unsuccessfulIssueNumbers(summary, mergerReceipt));
+  assert.deepEqual([...skipped], [2]);
+  assert.deepEqual(selectReadyIssues([issue(2), issue(4)], { excludedNumbers: skipped }).map((i) => i.number), [4]);
 });
 
 test("all tickets failing yields an empty merger candidate set", async () => {

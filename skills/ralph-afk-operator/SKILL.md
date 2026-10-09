@@ -5,7 +5,7 @@ description: Start and supervise the repo-local Ralph orchestrator in AFK mode. 
 
 # Ralph AFK Operator
 
-Operate the repository's Ralph orchestrator. Do not reimplement its scheduler, ticket selection, review loop, or merge policy.
+Operate the repository's Ralph orchestrator. Do not reimplement its scheduler, ticket selection, review loop, or merge policy. In the source repository the controller lives under `src/`; when installed in another repository it lives under `tools/ralph/src/`. Keep generated run artifacts under `.ralph/runs/`, distinct from Sandcastle-managed `.sandcastle/worktrees/`.
 
 ## Start
 
@@ -14,6 +14,7 @@ Operate the repository's Ralph orchestrator. Do not reimplement its scheduler, t
 3. Confirm no Ralph orchestrator already owns the repository. Do not start a second one.
 4. Choose the harness, model, and effort explicitly for all three roles. V1 supports `codex` only; `claude-code` and `pi` are reserved startup values for later implementation.
 5. Run preflight first, then start the same command without `--preflight`.
+   Inspect the role prompt templates for stale single-ticket authorization restrictions before launch; scheduler preflight does not validate prompt scope. Repeated merger rejection after accepted reviews can indicate a stale merger prompt rather than an implementation failure.
 6. Keep the orchestrator itself in a visible Herdr terminal. The orchestrator creates visible owned Herdr panes for implementers, reviewers, correction implementers, and mergers.
 
 Example:
@@ -40,7 +41,7 @@ Inspect the orchestrator terminal and owned Herdr panes on a bounded cadence: 15
 
 Treat these as normal and do nothing:
 - ticket-local worker/test/review failures while the orchestrator keeps progressing;
-- a failed ticket being retried naturally in a later outer iteration;
+- a failed, blocked, or merger-rejected ticket being deferred for the rest of the current run;
 - a ticket paused at 20 review rounds while independent tickets continue;
 - healthy long-running agent output;
 - successful sibling tickets continuing after another ticket fails.
@@ -51,7 +52,7 @@ Look for evidence of a genuinely unhealthy run:
 - multiple owned Codex sessions show shared 429/quota exhaustion;
 - Herdr/process ownership is inconsistent enough that safe progress cannot continue.
 
-Do not infer failure from an idle-looking badge alone. Read terminal output and process/session evidence.
+Do not infer failure from an idle-looking badge alone. Read terminal output and process/session evidence. A normal `complete_with_failures` or `complete_with_triage` result ends the run and needs an owner-facing summary, **not** an automatic restart. A future run may intentionally reconsider open tickets.
 
 ## Recover
 
@@ -75,4 +76,4 @@ When a ticket hits the 20-round review limit, read its `needs-triage.json` and e
 When the orchestrator exits because no runnable ticket remains:
 - verify there are no still-owned active Herdr agents;
 - stop any monitoring/cron created for this run;
-- report the final outcome, meaningful non-blocking follow-ups from ticket results, triage summaries, and any tickets left open. Recommend which follow-ups merit backlog consideration; never create tickets or wait for owner approval.
+- report the final outcome, failed/blocked issues and their receipts, meaningful non-blocking follow-ups from ticket results, triage summaries, and any tickets left open. Recommend which follow-ups merit backlog consideration; never create tickets or wait for owner approval.

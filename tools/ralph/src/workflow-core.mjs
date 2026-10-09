@@ -204,12 +204,19 @@ export function buildImplementerRoundContext({ round, currentHead, reviewerFindi
 export function validateImplementerReceipt(receipt, expected) {
   assertRecord(receipt, "implementer receipt");
   expectEqual(receipt.phase, "implementer", "implementer phase");
-  expectEqual(receipt.status, "completed", "implementer status");
+  if (!["completed", "blocked", "failed"].includes(receipt.status)) throw new Error(`invalid implementer status: ${receipt.status}`);
   expectEqual(receipt.issue_number, expected.issueNumber, "implementer issue number");
   required(receipt.session_id, "implementer session_id");
   validateSha(receipt.head, "implementer head");
   expectEqual(receipt.head, expected.head, "implementer head");
   validateTimestamp(receipt.completed_at, "implementer completed_at");
+  if (typeof receipt.reason !== "string") throw new Error("implementer reason must be a string");
+  if (receipt.status === "completed") {
+    if (receipt.reason !== "") throw new Error("completed implementer must have an empty reason");
+    if (receipt.head === expected.previousHead) throw new Error("implementer did not create a new candidate commit");
+  } else if (!receipt.reason.trim()) {
+    throw new Error(`${receipt.status} implementer must explain the reason`);
+  }
   return receipt;
 }
 
@@ -288,6 +295,16 @@ export function successfulCandidates(summary) {
   return summary
     .filter((entry) => entry.outcome.status === "fulfilled")
     .map((entry) => entry.outcome.value);
+}
+
+export function unsuccessfulIssueNumbers(summary, mergerReceipt) {
+  const failed = summary
+    .filter((entry) => entry.outcome.status === "rejected")
+    .map((entry) => entry.issue.number);
+  for (const result of mergerReceipt?.results ?? []) {
+    if (result.status === "rejected") failed.push(result.issue_number);
+  }
+  return [...new Set(failed)].sort((a, b) => a - b);
 }
 
 function required(value, label) {

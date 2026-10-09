@@ -2,13 +2,14 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
   "additionalProperties": false,
-  "required": ["phase", "status", "issue_number", "session_id", "head", "completed_at"],
+  "required": ["phase", "status", "issue_number", "session_id", "head", "completed_at", "reason"],
   "properties": {
     "phase": { "type": "string", "enum": ["implementer"] },
-    "status": { "type": "string", "enum": ["completed"] },
+    "status": { "type": "string", "enum": ["completed", "blocked", "failed"] },
     "issue_number": { "type": "integer", "minimum": 1 },
     "session_id": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
     "head": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
-    "completed_at": { "type": "string", "minLength": 1 }
+    "completed_at": { "type": "string", "minLength": 1 },
+    "reason": { "type": "string" }
   }
 }

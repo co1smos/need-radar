@@ -222,10 +222,14 @@ __marimo__/
 
 # Need Radar credentials
 /credentials.env
+
+# Private reusable acquisition responses; never publish source recordings
 /artifacts/
 
-# Sandcastle generated state (keep runner source/config trackable)
+# Ralph and Sandcastle generated state
+/.ralph/
 /.sandcastle/worktrees/
+/.sandcastle/patches/
 /.sandcastle/logs/
 /.sandcastle/runs/
 /.sandcastle/orchestrator.lock/
