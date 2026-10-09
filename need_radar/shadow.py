@@ -286,6 +286,83 @@ def _write_summary(output, tracer, ids):
     (output / "observability.json").write_bytes(json_bytes(redact(summary)))
 
 
+def _persist_missing_serve_artifact_comparison(output, serve_dir, missing_artifacts, settings):
+    output.mkdir(parents=True, exist_ok=True)
+    run_id, trace_id = uuid.uuid4().hex, uuid.uuid4().hex
+    ids = {"run_id": run_id, "trace_id": trace_id}
+    tracer = Tracer(
+        run_id,
+        trace_id,
+        LangfuseBoundary(output / "trace.jsonl", redact),
+        JsonlSpanSink(output / "logs.jsonl"),
+        redact,
+    )
+    reasons = [f"required serve artifact is missing: {name}" for name in missing_artifacts]
+    assessment_comparison = {
+        "status": "inconclusive",
+        "reasons": reasons,
+        "matching": None,
+        "arms": None,
+        "qualification": "not comparable; not market truth or global recall",
+        "promotion_recommendation": "none",
+    }
+    report = comparison.render_markdown(assessment_comparison)
+    try:
+        with sqlite3.connect(output / "lineage.sqlite3") as database:
+            database.execute(
+                "CREATE TABLE stages (sequence INTEGER, run_id TEXT, stage TEXT, status TEXT, input_stage TEXT, input_sha256 TEXT, artifact_path TEXT, output_sha256 TEXT, details TEXT, trace_id TEXT, span_id TEXT, artifact_id TEXT, input_artifact_id TEXT, call_id TEXT, PRIMARY KEY (run_id, stage))"
+            )
+            with tracer.span(
+                "shadow_preflight",
+                inputs={
+                    "serve_directory": serve_dir.name,
+                    "missing_artifacts": missing_artifacts,
+                    "resolved_shared_settings": settings,
+                },
+                attributes={"result_status": "incomplete"},
+            ):
+                with tracer.span(
+                    "assessment_comparison_report",
+                    inputs={"assessment_comparison": assessment_comparison},
+                    attributes={"result_status": "inconclusive"},
+                ) as report_span:
+                    report_meta = persist_stage(
+                        output, database, run_id, trace_id, 1,
+                        "assessment_comparison_report", "inconclusive",
+                        Path("comparison.md"), report, report_span,
+                        details={"missing_serve_artifacts": missing_artifacts},
+                    )
+                result = {
+                    "status": "incomplete",
+                    "evidence_kind": "synthetic_offline",
+                    "verification_limit": "synthetic fixture only; no live source or provider verification",
+                    "arms": {
+                        "v0": {"status": "unavailable_missing_evidence"},
+                        "v1": {"status": "not_run_missing_evidence"},
+                    },
+                    "incomplete_reasons": reasons,
+                    "assessment_comparison": assessment_comparison,
+                    "assessment_comparison_report_sha256": report_meta["sha256"],
+                    "missing_serve_artifacts": missing_artifacts,
+                    "resource_ceilings": settings,
+                    "publication": "disabled",
+                    "serve_substitution": False,
+                }
+                with tracer.span(
+                    "comparison",
+                    inputs={"missing_serve_artifacts": missing_artifacts},
+                    attributes={"result_status": "incomplete"},
+                ) as comparison_span:
+                    persist_stage(
+                        output, database, run_id, trace_id, 2, "comparison", "incomplete",
+                        Path("comparison.json"), result, comparison_span, report_meta,
+                        details={"missing_serve_artifacts": missing_artifacts},
+                    )
+    finally:
+        _write_summary(output, tracer, ids)
+    return "incomplete"
+
+
 def _run_v1(
     model_fixture, context, settings, truncation_meta, output, database, tracer, run_id, trace_id,
     not_run_reason=None,
@@ -411,6 +488,15 @@ def run(serve_dir, fixture_path, output):
             "report": "report.md",
         }.items()
     }
+    required_serve_artifacts = (
+        "snapshot", "selection", "context", "truncation", "v0_prompt",
+        "v0_response", "v0_candidates", "report",
+    )
+    missing_artifacts = [
+        paths[name].name for name in required_serve_artifacts if not paths[name].is_file()
+    ]
+    if missing_artifacts:
+        return _persist_missing_serve_artifact_comparison(output, serve_dir, missing_artifacts, settings)
     artifacts = {name: _read_artifact(path) for name, path in paths.items() if path.suffix == ".json" and path.is_file()}
     for name in ("v0_consolidation", "v0_judge_prompt", "v0_judge_response", "v0_assessment"):
         artifacts.setdefault(name, ({}, {}))

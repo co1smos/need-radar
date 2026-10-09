@@ -213,6 +213,41 @@ class ShadowRunnerTests(unittest.TestCase):
         self.assertIsNone(assessed["matching"])
         self.assertTrue(any("judging failed or is incomplete" in reason for reason in assessed["reasons"]))
 
+    def test_missing_serve_snapshot_persists_inconclusive_comparison(self):
+        serve_result, serve = self.run_serve(settings())
+        self.assertEqual(serve_result.returncode, 0, serve_result.stderr)
+        (serve / "snapshot.json").unlink()
+        fixture = self.fixture_path(outcome([]))
+        output = self.root / "missing-serve-snapshot"
+
+        result = self.run_shadow(serve, fixture, output)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("status=incomplete", result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
+        comparison_result = json.loads((output / "comparison.json").read_text(encoding="utf-8"))
+        self.assertEqual(comparison_result["status"], "incomplete")
+        assessed = comparison_result["assessment_comparison"]
+        self.assertEqual(assessed["status"], "inconclusive")
+        self.assertIn("required serve artifact is missing: snapshot.json", assessed["reasons"])
+        report = output / "comparison.md"
+        self.assertIn("required serve artifact is missing: snapshot.json", report.read_text(encoding="utf-8"))
+        self.assertEqual(
+            comparison_result["assessment_comparison_report_sha256"],
+            hashlib.sha256(report.read_bytes()).hexdigest(),
+        )
+        with sqlite3.connect(output / "lineage.sqlite3") as database:
+            stages = {
+                row[0]: row[1]
+                for row in database.execute("SELECT stage, artifact_id FROM stages")
+            }
+            comparison_input = database.execute(
+                "SELECT input_artifact_id FROM stages WHERE stage = 'comparison'"
+            ).fetchone()[0]
+        self.assertEqual(comparison_input, stages["assessment_comparison_report"])
+        self.assertFalse((output / "v1").exists())
+        self.assertTrue((output / "observability.json").is_file())
+
     def test_empty_common_snapshot_is_inconclusive(self):
         fixture = json.loads((ROOT / "fixtures" / "synthetic_demo.json").read_text())
         fixture["items"] = []
