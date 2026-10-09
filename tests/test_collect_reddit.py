@@ -205,6 +205,13 @@ class CollectRedditCliTests(unittest.TestCase):
         self.approval_path.write_text(json.dumps(value or approval_manifest()))
         self.approval_path.chmod(0o600)
 
+    def approved_incident_disposition(self):
+        return {
+            "classification": "synthetic_credentials_not_owner_account",
+            "evidence_ref": "/home/ubuntu/.codex/sessions/2026/10/06/rollout-2026-10-06T22-06-05-01a114c1-2985-71a1-8b46-c7bf9cc352f1.jsonl#lines=47,51,1013,1034,1094,1097,1135",
+            "evidence_sha256": "633d9ea74916aacdb1238db9650ee6ee9e637842d8a8cc60c9688c474122a5e4",
+        }
+
     def args(self, *extra, command="collect"):
         if command == "collect":
             return [
@@ -223,6 +230,16 @@ class CollectRedditCliTests(unittest.TestCase):
             ]
         return [command, *extra]
 
+    def smoke_args(self, window_start, window_end, *extra):
+        return [
+            "collect", "--subreddit", "AI_Agents",
+            "--window-start", window_start, "--window-end", window_end,
+            "--max-feed-pages", "1", "--max-comment-pages", "0", "--max-posts", "10",
+            "--approval", str(self.approval_path), "--state-dir", str(self.state_dir),
+            "--recordings-dir", str(self.recordings_dir), "--allow-live-acquisition", ACK,
+            "--smoke-phase2", *extra,
+        ]
+
     def run_cli(self, argv, transport=None, credentials=None, sleeper=None):
         if argv and argv[0] == "collect" and transport is None:
             raise AssertionError("collect tests must inject a synthetic transport")
@@ -238,6 +255,24 @@ class CollectRedditCliTests(unittest.TestCase):
                 sleeper=sleeper or (lambda _: None),
             )
         return result, stdout.getvalue(), stderr.getvalue()
+
+    def run_live_collect_with_state(self, state, transport):
+        state_dir = collect_reddit.STATE_DEFAULT
+        state_dir.mkdir(mode=0o700, exist_ok=True)
+        state_dir.chmod(0o700)
+        state_path = state_dir / "state.json"
+        state_path.write_text(json.dumps(state))
+        state_path.chmod(0o600)
+        args = collect_reddit.parse_args(self.args("--max-feed-pages", "1", "--max-posts", "0"))
+        args.state_dir = str(state_dir)
+        args.recordings_dir = str(state_dir / "recordings")
+        credentials = FakeCredentials()
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = collect_reddit.run_collect(
+                args, transport, credentials.load, lambda: NOW, lambda _: None, False
+            )
+        return code, json.loads(stdout.getvalue()), credentials
 
     def collect_text_recording(self, text):
         page = fixture_body("feed-page-1.json")
@@ -367,6 +402,88 @@ if os.environ.get("NEED_RADAR_OFFLINE_TESTS") == "1":
         state = json.loads((pathlib.Path(args.state_dir) / "state.json").read_text())
         self.assertEqual(state["incident_hold"]["reference"], collect_reddit.INCIDENT_REF)
         self.assertEqual(state["incident_hold"]["status"], "unresolved")
+
+    def test_approved_synthetic_incident_classification_allows_offline_run_without_reconciling_charge(self):
+        state = collect_reddit.default_state()
+        state["incident_hold"]["disposition"] = self.approved_incident_disposition()
+        transport = FixtureTransport([response(200, fixture_body("feed-page-1.json"))])
+
+        code, report, credentials = self.run_live_collect_with_state(state, transport)
+
+        self.assertEqual(code, 0, report)
+        self.assertEqual(credentials.loads, 1)
+        self.assertEqual(len(transport.requests), 1)
+        persisted = json.loads((collect_reddit.STATE_DEFAULT / "state.json").read_text())
+        self.assertEqual(persisted["incident_hold"]["outcome"], "unknown")
+        self.assertIsNone(persisted["incident_hold"]["charge_micro_usd"])
+        self.assertEqual(persisted["incident_hold"]["status"], "unresolved")
+
+    def test_invalid_synthetic_incident_evidence_blocks_before_credentials_and_dispatch(self):
+        invalid_dispositions = (
+            {"classification": "unknown"},
+            {"evidence_sha256": "0" * 64},
+            {"evidence_ref": "unreviewed evidence"},
+        )
+        for changes in invalid_dispositions:
+            with self.subTest(changes=changes):
+                state = collect_reddit.default_state()
+                state["incident_hold"]["disposition"] = self.approved_incident_disposition()
+                state["incident_hold"]["disposition"].update(changes)
+                transport = FixtureTransport([])
+
+                code, report, credentials = self.run_live_collect_with_state(state, transport)
+
+                self.assertEqual(code, 2)
+                self.assertEqual(report["errors"], ["historical_unknown_outcome_hold"])
+                self.assertEqual(credentials.loads, 0)
+                self.assertEqual(transport.requests, [])
+                self.assertEqual(report["incident"]["outcome"], "unknown")
+                self.assertIsNone(report["incident"]["charge_micro_usd"])
+
+    def test_approved_synthetic_incident_does_not_bypass_pending_or_exhausted_budget(self):
+        scenarios = (
+            (
+                "pending",
+                {"reserved_micro_usd": 1000, "reserved_success_slots": 1},
+                {
+                    "route": "feed", "reserved_micro_usd": 1000,
+                    "success_slot_reserved": True,
+                },
+                "unreconciled_request_pauses_acquisition",
+            ),
+            (
+                "limit_breach",
+                {"limit_breach": True},
+                None,
+                "persistent_budget_limit_breach",
+            ),
+            (
+                "exhausted_success_cap",
+                {"successful_requests": collect_reddit.MAX_SUCCESSFUL_REQUESTS},
+                None,
+                "successful_request_limit_reached",
+            ),
+            (
+                "exhausted_spend_cap",
+                {"spent_micro_usd": collect_reddit.MAX_SPEND_MICRO_USD},
+                None,
+                "spend_limit_reached",
+            ),
+        )
+        for name, counters, pending, expected_error in scenarios:
+            with self.subTest(name=name):
+                state = collect_reddit.default_state()
+                state.update(counters)
+                state["incident_hold"]["disposition"] = self.approved_incident_disposition()
+                state["pending"] = pending
+                transport = FixtureTransport([])
+
+                code, report, credentials = self.run_live_collect_with_state(state, transport)
+
+                self.assertEqual(code, 2)
+                self.assertEqual(report["errors"], [expected_error])
+                self.assertEqual(credentials.loads, 0)
+                self.assertEqual(transport.requests, [])
 
     def test_synthetic_transport_requires_explicit_test_credentials(self):
         transport = FixtureTransport([])
@@ -3798,6 +3915,145 @@ print(safe_string({payload!r}))
         replay_artifact = self.recordings_dir / json.loads(stdout)["artifact"]
         replay = json.loads(replay_artifact.read_text())
         self.assertEqual(replay["retention_days"], 3)
+
+    def smoke_approval(self, start, end):
+        approval = approval_manifest(("AI_Agents",), start, end)
+        approval["routes"].pop("comments")
+        approval["retention"] = {
+            "recording_permitted": True,
+            "owner_authorized_until_revoked": True,
+            "private_access_owner_only": True,
+            "downstream_rights": "unverified",
+            "evidence": "synthetic smoke approval fixture",
+        }
+        return approval
+
+    def test_phase2_smoke_enforces_feed_only_limits_and_persists_full_response(self):
+        start = collect_reddit.timestamp(NOW - collect_reddit.dt.timedelta(days=7))
+        end = collect_reddit.timestamp(NOW)
+        self.write_approval(self.smoke_approval(start, end))
+        page = fixture_body("feed-page-1.json")
+        edges = page["data"]["subredditV3"]["elements"]["edges"]
+        first = edges[0]["node"]
+        first["url"] = first["url"].replace("/r/example/", "/r/AI_Agents/")
+        for index in range(2, 13):
+            post = dict(first)
+            post["groupId"] = f"t3_demo{index}"
+            post["url"] = post["url"].replace("/r/example/", "/r/AI_Agents/").replace("demo1", f"demo{index}")
+            post["title"] = f"Synthetic post {index}"
+            edges.append({"node": post})
+        transport = FixtureTransport([response(200, page)])
+        args = self.smoke_args(start, end)
+
+        with patch.object(collect_reddit, "TICKET19_ARTIFACTS_DIR", self.recordings_dir):
+            code, stdout, stderr = self.run_cli(args, transport, FakeCredentials())
+
+        self.assertEqual(code, 0, stderr)
+        report = json.loads(stdout)
+        self.assertEqual(len(transport.requests), 1)
+        self.assertEqual(
+            parse_qs(urlsplit(transport.requests[0][0]).query),
+            {"subreddit_name": ["AI_Agents"], "sort": ["NEW"], "need_format": ["false"]},
+        )
+        self.assertEqual(report["requested"]["max_retries"], 0)
+        self.assertEqual(report["requested"]["routes"], {"feed": collect_reddit.FEED_ID})
+        self.assertEqual(report["counts"]["comment_requests"], 0)
+        self.assertEqual(report["counts"]["posts_seen"], 12)
+        self.assertEqual(report["counts"]["posts_in_window"], 12)
+        self.assertEqual(report["counts"]["posts_selected"], 10)
+        self.assertEqual(report["artifact_policy"]["downstream_source_rights"], "unverified")
+        record_path = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(record_path.read_text())
+        recorded_posts = record["response"]["body"]["data"]["subredditV3"]["elements"]["edges"]
+        self.assertEqual(len(recorded_posts), 12)
+        self.assertEqual(record["retention_mode"], "owner_revocable")
+        self.assertEqual(record["retention"]["downstream_rights"], "unverified")
+        self.assertIsNone(record["expires_at"])
+        with self.assertRaises(collect_reddit.CollectorError):
+            collect_reddit.expire_recordings(self.recordings_dir, NOW)
+        self.assertTrue(record_path.exists())
+
+        legacy_recordings = self.root / "legacy-recordings"
+        legacy_recordings.mkdir(mode=0o700)
+        expired_legacy = self.recordings_dir / "legacy-expired.json"
+        legacy_record = dict(record)
+        legacy_record.pop("retention_mode")
+        legacy_record.pop("retention")
+        legacy_record["recorded_at"] = collect_reddit.timestamp(NOW - collect_reddit.dt.timedelta(days=8))
+        legacy_record["expires_at"] = collect_reddit.timestamp(NOW - collect_reddit.dt.timedelta(days=1))
+        legacy_record["retention_days"] = 7
+        expired_legacy = legacy_recordings / expired_legacy.name
+        expired_legacy.write_text(json.dumps(legacy_record))
+        expired_legacy.chmod(0o600)
+        self.assertEqual(collect_reddit.expire_recordings(legacy_recordings, NOW), 1)
+        self.assertFalse(expired_legacy.exists())
+
+    def test_phase2_smoke_disables_retries_and_keeps_persistent_replay_read_only(self):
+        start = collect_reddit.timestamp(NOW - collect_reddit.dt.timedelta(days=7))
+        end = collect_reddit.timestamp(NOW)
+        self.write_approval(self.smoke_approval(start, end))
+        args = self.smoke_args(start, end)
+        transport = FixtureTransport([response(503, {"error": "synthetic temporary failure"})])
+        with patch.object(collect_reddit, "TICKET19_ARTIFACTS_DIR", self.recordings_dir):
+            code, stdout, _ = self.run_cli(args, transport, FakeCredentials())
+        self.assertEqual(code, 2)
+        self.assertEqual(len(transport.requests), 1)
+        self.assertIn("transient_retry_limit_exhausted", json.loads(stdout)["errors"])
+
+        shutil.rmtree(self.recordings_dir)
+        successful_transport = FixtureTransport([response(200, fixture_body("feed-page-1.json"))])
+        with patch.object(collect_reddit, "TICKET19_ARTIFACTS_DIR", self.recordings_dir):
+            success_code, success_stdout, success_stderr = self.run_cli(
+                args, successful_transport, FakeCredentials()
+            )
+        self.assertEqual(success_code, 0, success_stderr)
+        self.assertEqual(len(successful_transport.requests), 1)
+        record_path = next(self.recordings_dir.glob("record-*.json"))
+        record = json.loads(record_path.read_text())
+        record["response"]["body"]["api_key"] = "synthetic-replay-secret"
+        record_path.write_text(json.dumps(record))
+        record_path.chmod(0o600)
+        before = record_path.read_bytes()
+        replay_args = [
+            "replay", "--smoke-phase2", "--recordings-dir", str(self.recordings_dir),
+        ]
+        with patch.object(collect_reddit, "TICKET19_ARTIFACTS_DIR", self.recordings_dir):
+            replay_code, replay_stdout, replay_stderr = self.run_cli(replay_args)
+        self.assertEqual(replay_code, 0, replay_stderr)
+        replay = json.loads(replay_stdout)
+        self.assertEqual(replay["network_requests"], 0)
+        self.assertEqual(replay["artifact_policy"]["replay"], "read_only")
+        self.assertEqual(record_path.read_bytes(), before)
+        self.assertEqual(list(self.recordings_dir.glob("replay-*.json")), [])
+
+    def test_phase2_smoke_requires_exact_window_and_owner_retention_contract(self):
+        start = collect_reddit.timestamp(NOW - collect_reddit.dt.timedelta(days=7))
+        end = collect_reddit.timestamp(NOW)
+        approval = self.smoke_approval(start, end)
+        self.assertEqual(
+            collect_reddit.validate_approval(approval, ["AI_Agents"], start, end, True),
+            [],
+        )
+        approval["retention"]["downstream_rights"] = "verified"
+        self.assertIn(
+            "recording_retention_access_or_rights_status_invalid",
+            collect_reddit.validate_approval(approval, ["AI_Agents"], start, end, True),
+        )
+        invalid_args = self.smoke_args(start, end)
+        invalid_args.extend(["--max-feed-pages", "2"])
+        parsed = collect_reddit.parse_args(invalid_args)
+        self.assertIn("smoke_requires_one_feed_page", collect_reddit.read_run_args(parsed))
+
+    def test_ticket19_artifact_path_rejects_noncanonical_and_symlink_paths(self):
+        target = self.root / "ticket19"
+        link = self.root / "ticket19-link"
+        link.symlink_to(self.root, target_is_directory=True)
+        with patch.object(collect_reddit, "TICKET19_ARTIFACTS_DIR", target):
+            self.assertTrue(collect_reddit.ticket19_artifacts_path(target))
+            self.assertFalse(collect_reddit.ticket19_artifacts_path(target / "other"))
+        linked_target = link / "ticket19"
+        with patch.object(collect_reddit, "TICKET19_ARTIFACTS_DIR", linked_target):
+            self.assertFalse(collect_reddit.ticket19_artifacts_path(linked_target))
 
 
 if __name__ == "__main__":

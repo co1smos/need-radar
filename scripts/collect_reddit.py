@@ -25,7 +25,11 @@ from dataclasses import dataclass
 
 
 TICKET = "3"
+TICKET19_ARTIFACTS_DIR = pathlib.Path("/home/ubuntu/projects/need-radar/artifacts/ticket-19")
 INCIDENT_REF = "need-radar-issue-3:unknown-outcome-request"
+INCIDENT_EVIDENCE_REF = "/home/ubuntu/.codex/sessions/2026/10/06/rollout-2026-10-06T22-06-05-01a114c1-2985-71a1-8b46-c7bf9cc352f1.jsonl#lines=47,51,1013,1034,1094,1097,1135"
+INCIDENT_EVIDENCE_SHA256 = "633d9ea74916aacdb1238db9650ee6ee9e637842d8a8cc60c9688c474122a5e4"
+INCIDENT_CLASSIFICATION = "synthetic_credentials_not_owner_account"
 STATE_DEFAULT = pathlib.Path("/home/ubuntu/.local/state/need-radar/ticket-3")
 APPROVAL_DEFAULT = STATE_DEFAULT / "approval.json"
 CREDENTIALS_PATH = pathlib.Path("/home/ubuntu/projects/need-radar/credentials.env")
@@ -286,6 +290,32 @@ def repository_path(path):
                     continue
                 roots.add(gitfile.parent)
     return any(resolved == candidate or candidate in resolved.parents for candidate in roots)
+
+
+def path_has_symlink(path):
+    candidate = pathlib.Path(os.path.abspath(path))
+    current = pathlib.Path(candidate.anchor)
+    for part in candidate.parts[1:]:
+        current /= part
+        try:
+            if stat.S_ISLNK(current.lstat().st_mode):
+                return True
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return True
+    return False
+
+
+def ticket19_artifacts_path(path):
+    return (
+        pathlib.Path(os.path.abspath(path)) == TICKET19_ARTIFACTS_DIR
+        and not path_has_symlink(path)
+    )
+
+
+def ticket19_artifacts_location(path):
+    return pathlib.Path(path).resolve() == TICKET19_ARTIFACTS_DIR
 
 
 def atomic_json(path, value):
@@ -882,7 +912,7 @@ def verify_item(value, verified_key="verified", evidence_key="evidence"):
     return isinstance(value, dict) and value.get(verified_key) is True and evidence_present(value.get(evidence_key))
 
 
-def validate_approval(approval, subreddits, start, end):
+def validate_approval(approval, subreddits, start, end, smoke_phase2=False):
     errors = []
     if not isinstance(approval, dict):
         return ["approval_manifest_invalid"]
@@ -903,7 +933,8 @@ def validate_approval(approval, subreddits, start, end):
     routes = approval.get("routes")
     if not isinstance(routes, dict):
         routes = {}
-    for name, expected in ROUTES.items():
+    approved_routes = {"feed": ROUTES["feed"]} if smoke_phase2 else ROUTES
+    for name, expected in approved_routes.items():
         route = routes.get(name)
         if not isinstance(route, dict):
             errors.append(name + "_route_approval_missing")
@@ -944,7 +975,17 @@ def validate_approval(approval, subreddits, start, end):
     ):
         errors.append("approved_ticket_limits_mismatch_or_unverified")
     retention = approval.get("retention")
-    if (
+    if smoke_phase2:
+        if (
+            not isinstance(retention, dict)
+            or retention.get("recording_permitted") is not True
+            or retention.get("owner_authorized_until_revoked") is not True
+            or retention.get("private_access_owner_only") is not True
+            or retention.get("downstream_rights") != "unverified"
+            or not evidence_present(retention.get("evidence"))
+        ):
+            errors.append("recording_retention_access_or_rights_status_invalid")
+    elif (
         not isinstance(retention, dict)
         or retention.get("recording_permitted") is not True
         or type(retention.get("days")) is not int
@@ -1105,6 +1146,20 @@ def locked_state(directory, now=None):
 
 def require_incident_reconciled(state):
     incident = state.get("incident_hold")
+    disposition = incident.get("disposition") if isinstance(incident, dict) else None
+    if (
+        isinstance(incident, dict)
+        and incident.get("reference") == INCIDENT_REF
+        and incident.get("status") == "unresolved"
+        and incident.get("outcome") == "unknown"
+        and incident.get("charge_micro_usd") is None
+        and disposition == {
+            "classification": INCIDENT_CLASSIFICATION,
+            "evidence_ref": INCIDENT_EVIDENCE_REF,
+            "evidence_sha256": INCIDENT_EVIDENCE_SHA256,
+        }
+    ):
+        return
     try:
         parse_datetime(incident.get("reconciled_at"))
     except (AttributeError, TypeError, ValueError):
@@ -1444,6 +1499,19 @@ def valid_recording_envelope(record, filename):
     )
 
 
+def persistent_retention(record):
+    if not isinstance(record, dict) or record.get("retention_mode") != "owner_revocable":
+        return False
+    policy = record.get("retention")
+    return (
+        isinstance(policy, dict)
+        and policy.get("owner_authorized_until_revoked") is True
+        and policy.get("private_access_owner_only") is True
+        and policy.get("downstream_rights") == "unverified"
+        and evidence_present(policy.get("evidence"))
+    )
+
+
 def recording_file(recordings_dir, record):
     record_id = "record-" + record["record_id"] + ".json"
     atomic_json(recordings_dir / record_id, record)
@@ -1519,6 +1587,8 @@ def expire_recordings(recordings_dir, now):
                 record = json.load(source)
         except (OSError, UnicodeError, ValueError, RecursionError):
             record = {}
+        if record.get("retention_mode") == "owner_revocable":
+            raise CollectorError("owner_revocable_recording_requires_smoke_replay", "blocked")
         expires = record_expiry(record)
         if expires is None or expires <= now:
             path.unlink()
@@ -1535,7 +1605,15 @@ class Collector:
         self.clock = clock
         self.sleeper = sleeper
         self.synthetic = synthetic
-        self.retention_days = approval["retention"]["days"]
+        self.persistent_retention = bool(getattr(args, "smoke_phase2", False))
+        self.retention_days = RETENTION_DAYS if self.persistent_retention else approval["retention"]["days"]
+        self.max_retries = 0 if self.persistent_retention else MAX_RETRIES
+        self.retention_metadata = sanitize({
+            "owner_authorized_until_revoked": approval["retention"]["owner_authorized_until_revoked"],
+            "private_access_owner_only": approval["retention"]["private_access_owner_only"],
+            "downstream_rights": approval["retention"]["downstream_rights"],
+            "evidence": approval["retention"]["evidence"],
+        }, [credentials.token, credentials.org]) if self.persistent_retention else None
         self.approval_sha256 = hashlib.sha256(
             json.dumps(approval, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
@@ -1552,6 +1630,7 @@ class Collector:
             "comment_pages": 0,
             "posts_seen": 0,
             "posts_in_window": 0,
+            "posts_selected": 0,
             "posts_missing_timestamp": 0,
             "comments_seen": 0,
             "duplicate_posts": 0,
@@ -1588,15 +1667,21 @@ class Collector:
                     "value": FEED_LANGUAGE_DEFAULT,
                     "owner_approved": False,
                 },
-                "routes": {name: route["id"] for name, route in ROUTES.items()},
+                "routes": {
+                    name: route["id"] for name, route in ROUTES.items()
+                    if not self.persistent_retention or name == "feed"
+                },
                 "max_feed_pages_per_subreddit": self.args.max_feed_pages,
                 "max_comment_pages_per_post": self.args.max_comment_pages,
                 "max_posts": self.args.max_posts,
-                "max_retries": MAX_RETRIES,
+                "max_retries": self.max_retries,
                 "credential_mode": self.approval["provider_account"]["credential_mode"],
                 "token_type": self.approval["provider_account"]["token_type"],
             },
-            "counts": {key: value for key, value in self.counts.items() if key != "record_ids"},
+            "counts": {
+                key: value for key, value in self.counts.items()
+                if key != "record_ids" and (self.persistent_retention or key != "posts_selected")
+            },
             "record_ids": self.counts["record_ids"],
             "observed_timestamp_range": {
                 "minimum": min(timestamps) if timestamps else None,
@@ -1629,10 +1714,16 @@ class Collector:
                 "spend_limit_micro_usd": MAX_SPEND_MICRO_USD,
             }
         report = sanitize(report, [self.credentials.token])
+        if self.persistent_retention:
+            report["artifact_policy"] = {
+                "retention": "owner_authorized_until_revoked",
+                "access": "private_owner_only",
+                "downstream_source_rights": "unverified",
+            }
         artifact_name = "run-" + self.run_id + ".json"
         report["artifact"] = artifact_name
         now = self.clock()
-        expires = min(
+        expires = None if self.persistent_retention else min(
             now + dt.timedelta(days=self.retention_days),
             self.earliest_source_expiry or now + dt.timedelta(days=self.retention_days),
         )
@@ -1640,10 +1731,13 @@ class Collector:
             **report,
             "stage": "reddit_acquisition_output",
             "recorded_at": timestamp(now),
-            "expires_at": timestamp(expires),
-            "retention_days": self.retention_days,
+            "expires_at": timestamp(expires) if expires else None,
+            "retention_days": None if self.persistent_retention else self.retention_days,
         }
-        if self.earliest_source_expiry is not None:
+        if self.persistent_retention:
+            persisted["retention_mode"] = "owner_revocable"
+            persisted["retention"] = self.retention_metadata
+        elif self.earliest_source_expiry is not None:
             persisted["source_expires_at"] = timestamp(self.earliest_source_expiry)
         try:
             atomic_json(self.recordings_dir / artifact_name, persisted)
@@ -1654,8 +1748,9 @@ class Collector:
     def save_record(self, route_name, params, response=None, error=None, reservation=None, api_counts=None, request_headers=None, sanitized_body=None):
         route = ROUTES[route_name]
         now = self.clock()
-        expires = now + dt.timedelta(days=self.retention_days)
-        self.earliest_source_expiry = min(self.earliest_source_expiry or expires, expires)
+        expires = None if self.persistent_retention else now + dt.timedelta(days=self.retention_days)
+        if expires is not None:
+            self.earliest_source_expiry = min(self.earliest_source_expiry or expires, expires)
         body = (
             sanitized_body
             if sanitized_body is not None
@@ -1677,8 +1772,8 @@ class Collector:
             "provider": route["provider"],
             "endpoint": route["id"],
             "recorded_at": timestamp(now),
-            "expires_at": timestamp(expires),
-            "retention_days": self.retention_days,
+            "expires_at": timestamp(expires) if expires else None,
+            "retention_days": None if self.persistent_retention else self.retention_days,
             "configuration": {
                 "subreddits": self.args.subreddit,
                 "window_start": self.args.window_start,
@@ -1692,7 +1787,7 @@ class Collector:
                 "max_feed_pages_per_subreddit": self.args.max_feed_pages,
                 "max_comment_pages_per_post": self.args.max_comment_pages,
                 "max_posts": self.args.max_posts,
-                "max_retries": MAX_RETRIES,
+                "max_retries": self.max_retries,
                 "credential_mode": self.approval["provider_account"]["credential_mode"],
                 "token_type": self.approval["provider_account"]["token_type"],
                 "successful_request_limit": MAX_SUCCESSFUL_REQUESTS,
@@ -1727,10 +1822,13 @@ class Collector:
             },
             "counts": sanitize(api_counts or {}),
             "error": error,
-        "request_parameters_sha256": hashlib.sha256(
-            json.dumps(sanitize(params, [self.credentials.token]), sort_keys=True).encode("utf-8")
-        ).hexdigest(),
+            "request_parameters_sha256": hashlib.sha256(
+                json.dumps(sanitize(params, [self.credentials.token]), sort_keys=True).encode("utf-8")
+            ).hexdigest(),
         }
+        if self.persistent_retention:
+            record["retention_mode"] = "owner_revocable"
+            record["retention"] = self.retention_metadata
         record_id = recording_file(self.recordings_dir, record)
         self.counts["record_ids"].append(record_id)
         self.previous_record = record_id
@@ -1883,6 +1981,11 @@ class Collector:
 
     def dispatch(self, state_path, state, route_name, params):
         route = ROUTES[route_name]
+        if self.persistent_retention:
+            end = parse_datetime(self.args.window_end)
+            now = parse_datetime(timestamp(self.clock()))
+            if end > now or now - end > dt.timedelta(minutes=1):
+                raise CollectorError("smoke_window_must_end_at_dispatch", "blocked")
         cursor = params.get("after", params.get("cursor"))
         if cursor is not None:
             self.validate_cursors([cursor])
@@ -1956,7 +2059,7 @@ class Collector:
                 self.fail_record("provider_authentication_or_permission_failure", incomplete=bool(sanitization_error))
             if sanitization_error:
                 self.fail_record(sanitization_error, incomplete=True)
-            if result.status in (408, 425, 429, 500, 502, 503, 504) and local_retries < MAX_RETRIES:
+            if result.status in (408, 425, 429, 500, 502, 503, 504) and local_retries < self.max_retries:
                 local_retries += 1
                 try:
                     delay = retry_delay(
@@ -2036,8 +2139,13 @@ class Collector:
                         self.posts = []
                     if len(self.posts) < self.args.max_posts:
                         self.posts.append({"url": url, "created_at": observed_text})
+                        self.counts["posts_selected"] += 1
                     else:
-                        self.coverage_reasons.append("comment post limit reached; additional in-window posts were not comment-enriched")
+                        self.coverage_reasons.append(
+                            "selected post limit reached; additional in-window posts were not selected"
+                            if self.persistent_retention
+                            else "comment post limit reached; additional in-window posts were not comment-enriched"
+                        )
                 if has_next is False:
                     break
                 if has_next is not True or not isinstance(next_cursor, str) or not next_cursor:
@@ -2110,8 +2218,11 @@ class Collector:
                 self.coverage_reasons.append("comment page limit reached with a continuation cursor")
 
     def run(self, state_path, state):
+        if self.persistent_retention and path_has_symlink(self.recordings_dir):
+            raise CollectorError("private_recording_directory_required", "blocked")
         private_directory(self.recordings_dir)
-        expire_recordings(self.recordings_dir, self.clock())
+        if not self.persistent_retention:
+            expire_recordings(self.recordings_dir, self.clock())
         try:
             self.feed(state_path, state)
             if self.args.max_comment_pages:
@@ -2145,6 +2256,7 @@ def read_run_args(args):
         errors.append("comment_page_limit_out_of_bounds")
     if not 0 <= args.max_posts <= MAX_SUCCESSFUL_REQUESTS:
         errors.append("post_limit_out_of_bounds")
+    start = end = None
     try:
         start = parse_datetime(args.window_start)
         end = parse_datetime(args.window_end)
@@ -2152,6 +2264,17 @@ def read_run_args(args):
             errors.append("invalid_time_window")
     except (TypeError, ValueError, OverflowError, OSError):
         errors.append("invalid_time_window")
+    if getattr(args, "smoke_phase2", False):
+        if args.subreddit != ["AI_Agents"]:
+            errors.append("smoke_requires_ai_agents_subreddit")
+        if args.max_feed_pages != 1:
+            errors.append("smoke_requires_one_feed_page")
+        if args.max_comment_pages != 0:
+            errors.append("smoke_comments_must_be_disabled")
+        if not 1 <= args.max_posts <= 10:
+            errors.append("smoke_post_selection_limit_out_of_bounds")
+        if start is not None and end is not None and end - start != dt.timedelta(days=7):
+            errors.append("smoke_requires_seven_day_window")
     return errors
 
 
@@ -2169,10 +2292,12 @@ def parse_args(argv):
     collect.add_argument("--state-dir", default=str(STATE_DEFAULT))
     collect.add_argument("--recordings-dir")
     collect.add_argument("--allow-live-acquisition", default="")
+    collect.add_argument("--smoke-phase2", action="store_true")
     collect.add_argument("--plan", action="store_true", help="verify gates without credentials or network")
     replay = commands.add_parser("replay", help="replay private recordings offline")
     replay.add_argument("--recordings-dir", default=str(STATE_DEFAULT / "recordings"))
     replay.add_argument("--state-dir", default=str(STATE_DEFAULT))
+    replay.add_argument("--smoke-phase2", action="store_true")
     reconcile = commands.add_parser("reconcile", help="settle a persisted unknown request outcome")
     reconcile.add_argument("--state-dir", default=str(STATE_DEFAULT))
     reconcile.add_argument("--call-id", required=True)
@@ -2187,7 +2312,16 @@ def print_json(value):
 
 
 def run_collect(args, transport, credentials_loader, clock, sleeper, synthetic):
+    smoke_phase2 = bool(getattr(args, "smoke_phase2", False))
     errors = read_run_args(args)
+    if smoke_phase2:
+        try:
+            end = parse_datetime(args.window_end)
+            now = parse_datetime(timestamp(clock()))
+            if end > now or now - end > dt.timedelta(minutes=1):
+                errors.append("smoke_window_must_end_at_dispatch")
+        except (TypeError, ValueError, OverflowError, OSError):
+            errors.append("smoke_window_must_end_at_dispatch")
     try:
         approval = load_approval(pathlib.Path(args.approval))
     except CollectorError as error:
@@ -2201,7 +2335,7 @@ def run_collect(args, transport, credentials_loader, clock, sleeper, synthetic):
         }
         print_json(report)
         return 2
-    errors.extend(validate_approval(approval, args.subreddit, args.window_start, args.window_end))
+    errors.extend(validate_approval(approval, args.subreddit, args.window_start, args.window_end, smoke_phase2))
     if errors:
         report = {
             "ticket": TICKET,
@@ -2215,11 +2349,19 @@ def run_collect(args, transport, credentials_loader, clock, sleeper, synthetic):
         return 2
     state_dir = pathlib.Path(args.state_dir)
     recordings_dir = pathlib.Path(args.recordings_dir or state_dir / "recordings")
-    if any(repository_path(path) for path in (args.approval, state_dir, recordings_dir)):
+    approved_smoke_artifacts = smoke_phase2 and ticket19_artifacts_path(recordings_dir)
+    if (
+        repository_path(args.approval)
+        or repository_path(state_dir)
+        or (repository_path(recordings_dir) and not approved_smoke_artifacts)
+        or (ticket19_artifacts_location(recordings_dir) and not approved_smoke_artifacts)
+        or (ticket19_artifacts_path(recordings_dir) and not smoke_phase2)
+        or (smoke_phase2 and not approved_smoke_artifacts)
+    ):
         print_json({"ticket": TICKET, "source": "reddit", "status": "blocked", "errors": ["private_artifacts_must_be_outside_repository"]})
         return 2
     if args.plan:
-        print_json({
+        plan_report = {
             "ticket": TICKET,
             "source": "reddit",
             "status": "ready_for_operator_review",
@@ -2237,13 +2379,23 @@ def run_collect(args, transport, credentials_loader, clock, sleeper, synthetic):
                 "owner_approved": False,
             },
             "limits": {"successful_requests": MAX_SUCCESSFUL_REQUESTS, "spend_usd": "0.25"},
-            "retry_bound_per_request": MAX_RETRIES,
+            "retry_bound_per_request": 0 if smoke_phase2 else MAX_RETRIES,
             "note": "manifest evidence is an operator assertion; account permission and source rights require external verification",
-        })
+        }
+        if smoke_phase2:
+            plan_report["artifact_policy"] = {
+                "retention": "owner_authorized_until_revoked",
+                "access": "private_owner_only",
+                "downstream_source_rights": "unverified",
+            }
+        print_json(plan_report)
         return 0
     if not synthetic and (
         state_dir.resolve() != STATE_DEFAULT.resolve()
-        or recordings_dir.resolve() != (STATE_DEFAULT / "recordings").resolve()
+        or (
+            recordings_dir.resolve() != (STATE_DEFAULT / "recordings").resolve()
+            and not approved_smoke_artifacts
+        )
     ):
         print_json({
             "ticket": TICKET,
@@ -2268,6 +2420,7 @@ def run_collect(args, transport, credentials_loader, clock, sleeper, synthetic):
         print_json({"ticket": TICKET, "source": "reddit", "status": "blocked", "errors": ["synthetic_transport_requires_test_credentials"], "network_requests": 0})
         return 2
     collector = None
+    state = None
     try:
         with locked_state(state_dir, clock()) as (state_path, state):
             if not synthetic:
@@ -2305,18 +2458,35 @@ def run_collect(args, transport, credentials_loader, clock, sleeper, synthetic):
                 "acquisition_attempts": collector.request_attempts,
             })
         if error.code in {"historical_unknown_outcome_hold", "historical_incident_not_in_budget_ledger"}:
-            report["incident"] = default_state()["incident_hold"]
+            incident_state = state if isinstance(state, dict) else default_state()
+            report["incident"] = incident_state.get("incident_hold")
     print_json(report)
     return 0 if report["status"] in {"supported", "partial"} else 2
 
 
 def run_replay(args, clock):
     recordings_dir = pathlib.Path(args.recordings_dir)
-    if repository_path(recordings_dir):
+    smoke_phase2 = bool(getattr(args, "smoke_phase2", False))
+    persistent_artifacts = smoke_phase2 and ticket19_artifacts_path(recordings_dir)
+    if (
+        repository_path(recordings_dir) and not persistent_artifacts
+    ) or (
+        ticket19_artifacts_location(recordings_dir) and not persistent_artifacts
+    ) or (smoke_phase2 and not persistent_artifacts):
         print_json({"ticket": TICKET, "source": "reddit", "status": "blocked", "network_requests": 0, "errors": ["private_artifacts_must_be_outside_repository"]})
         return 2
     try:
-        removed = expire_recordings(recordings_dir, clock())
+        if persistent_artifacts:
+            info = recordings_dir.lstat()
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_mode & 0o077
+                or info.st_uid != os.getuid()
+            ):
+                raise CollectorError("private_directory_permissions_required", "blocked")
+            removed = 0
+        else:
+            removed = expire_recordings(recordings_dir, clock())
         source_records = []
         records = []
         replay_errors = []
@@ -2327,7 +2497,15 @@ def run_replay(args, clock):
                 raise CollectorError("private_recording_permissions_required", "blocked")
             with path.open(encoding="utf-8") as source:
                 record = json.load(source)
-            if record_expiry(record) is None:
+            if (
+                isinstance(record, dict)
+                and record.get("retention_mode") == "owner_revocable"
+                and not persistent_retention(record)
+            ) or (
+                not isinstance(record, dict)
+                or record.get("retention_mode") != "owner_revocable"
+                and record_expiry(record) is None
+            ):
                 raise CollectorError("recording_retention_metadata_invalid", "blocked")
             source_records.append(record)
             try:
@@ -2353,7 +2531,8 @@ def run_replay(args, clock):
                     record["request_parameters_sha256"] = hashlib.sha256(
                         json.dumps(request["parameters"], sort_keys=True).encode("utf-8")
                     ).hexdigest()
-                atomic_json(path, record)
+                if not persistent_artifacts:
+                    atomic_json(path, record)
                 replay_sanitized_recordings += 1
             if not valid_recording_envelope(record, path.name):
                 invalid_recordings += 1
@@ -2553,6 +2732,15 @@ def run_replay(args, clock):
             "billing_unknown_record_ids": billing_unknown_record_ids,
             "billing_ceiling_breach_record_ids": billing_ceiling_breach_record_ids,
         }
+        if persistent_artifacts:
+            report["artifact_policy"] = {
+                "replay": "read_only",
+                "retention": "owner_authorized_until_revoked",
+                "access": "private_owner_only",
+                "downstream_source_rights": "unverified",
+            }
+            print_json(report)
+            return 2 if status == "failed" else 0
         report_path = recordings_dir / ("replay-" + uuid.uuid4().hex + ".json")
         now = clock()
         replay_retention_days = min(record["retention_days"] for record in source_records)

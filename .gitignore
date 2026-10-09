@@ -222,6 +222,7 @@ __marimo__/
 
 # Need Radar credentials
 /credentials.env
+/artifacts/
 
 # Sandcastle generated state (keep runner source/config trackable)
 /.sandcastle/worktrees/
