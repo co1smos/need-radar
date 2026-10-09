@@ -200,7 +200,39 @@ def make_prompt(items):
 
 
 def select_items(items):
-    return list(items)
+    def identity_reference(item):
+        return {
+            **{key: item[key] for key in ("id", "source", "native_id", "content_version") if key in item},
+            "discovery_origins": list(item.get("discovery_origins", [])),
+        }
+
+    selected = []
+    by_text = {}
+    for item in items:
+        index = by_text.get(item["text"])
+        if index is None:
+            by_text[item["text"]] = len(selected)
+            selected.append(dict(item))
+            continue
+
+        existing = selected[index]
+        merged = {}
+        existing_references = existing.get("identity_versions") or [identity_reference(existing)]
+        incoming_references = item.get("identity_versions") or [identity_reference(item)]
+        for reference in [*existing_references, *incoming_references]:
+            key = (reference["id"], reference.get("content_version"))
+            previous = merged.get(key)
+            origins = set(reference.get("discovery_origins", []))
+            if previous is not None:
+                origins.update(previous.get("discovery_origins", []))
+            merged[key] = {**reference, "discovery_origins": sorted(origins)}
+        existing["identity_versions"] = [
+            merged[key] for key in sorted(merged, key=lambda key: (key[0], key[1] or ""))
+        ]
+        existing["discovery_origins"] = sorted(
+            set(existing.get("discovery_origins", [])) | set(item.get("discovery_origins", []))
+        )
+    return selected
 
 
 def assemble_context(items):
@@ -562,11 +594,11 @@ def run(fixture_path, output):
                 with tracer.span(
                     "selection",
                     inputs={"snapshot_id": ids["snapshot_id"], "items": snapshot["items"]},
-                    attributes={"policy": "all_fixture_items"},
+                    attributes={"policy": "exact_content_deduplication"},
                 ) as span:
                     selected_items = select_items(snapshot["items"])
                     selection = {
-                        "policy": "all_fixture_items",
+                        "policy": "exact_content_deduplication",
                         "item_ids": [item["id"] for item in selected_items],
                         "items": selected_items,
                     }

@@ -1,0 +1,37 @@
+{
+  "notice": "Synthetic normalized evidence only. No source or model is contacted.",
+  "initial_import": [
+    {
+      "source": "reddit",
+      "native_id": "shared-42",
+      "text": "Synthetic Reddit evidence: builders rebuild agent context after session resets. api_key=sk-REPLAYFIXTURESECRET1234567890",
+      "discovery_origin": "query:context-handoff"
+    },
+    {
+      "source": "reddit",
+      "native_id": "shared-42",
+      "text": "Synthetic Reddit evidence: builders rebuild agent context after session resets. api_key=sk-REPLAYFIXTURESECRET1234567890",
+      "discovery_origin": "query:agent-session-reset"
+    },
+    {
+      "source": "reddit",
+      "native_id": "alias-42",
+      "text": "Synthetic Reddit evidence: builders rebuild agent context after session resets. api_key=sk-REPLAYFIXTURESECRET1234567890",
+      "discovery_origin": "query:context-handoff-followup"
+    },
+    {
+      "source": "x",
+      "native_id": "shared-42",
+      "text": "Synthetic Reddit evidence: builders rebuild agent context after session resets. api_key=sk-REPLAYFIXTURESECRET1234567890",
+      "discovery_origin": "query:context-handoff"
+    }
+  ],
+  "edited_import": [
+    {
+      "source": "reddit",
+      "native_id": "shared-42",
+      "text": "Synthetic edited Reddit evidence: builders manually rebuild shared agent context after session resets.",
+      "discovery_origin": "query:context-handoff-followup"
+    }
+  ]
+}
