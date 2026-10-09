@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 
 from need_radar.observability import JsonlSpanSink, LangfuseBoundary, Tracer
+from need_radar.report_html import render_file
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -270,15 +271,36 @@ def render_report(status, candidates, errors):
         "The model response is predetermined synthetic fixture data.",
         "Citation validation checks exact excerpt substrings only; it does not assess semantic support.",
         "",
+        "## Summary",
+        f"- Status: {status}",
+        f"- Validated findings: {len(candidates)}",
+        "- Coverage: synthetic fixture inputs only; live-source coverage is unverified.",
+        "- Evaluation: not run; this offline serve tracer has no judge.",
     ]
+    for candidate_index, candidate in enumerate(candidates, start=1):
+        lines.append(f"- [Finding {candidate_index}](#finding-{candidate_index}): {markdown_literal(candidate['title'])}")
+        for citation_index, citation in enumerate(candidate["evidence"], start=1):
+            lines.append(
+                f"- [Evidence {candidate_index}-{citation_index}](#evidence-{candidate_index}-{citation_index}): "
+                f"{markdown_literal(citation['source'])}"
+            )
     if status == "no_findings":
         lines.append("No findings.")
     elif candidates:
         lines.append("## Findings")
-        for candidate in candidates:
-            lines.extend(["", f"### {markdown_literal(candidate['title'])}", "", markdown_literal(candidate["friction"])])
-            for citation in candidate["evidence"]:
+        for candidate_index, candidate in enumerate(candidates, start=1):
+            lines.extend([
+                "",
+                f"### Finding {candidate_index}",
+                "",
+                markdown_literal(candidate["title"]),
+                "",
+                markdown_literal(candidate["friction"]),
+            ])
+            for citation_index, citation in enumerate(candidate["evidence"], start=1):
                 lines.extend([
+                    "",
+                    f"#### Evidence {candidate_index}-{citation_index}",
                     "",
                     f"> {markdown_literal(citation['excerpt'])}",
                     f"> — {markdown_literal(citation['item_id'])} ({markdown_literal(citation['source'])})",
@@ -616,8 +638,25 @@ def run(fixture_path, output):
                         {"canonical": True},
                     )
                 ids["report_id"] = report_meta["artifact_id"]
+                try:
+                    presentation_status = render_file(
+                        output / "report.md",
+                        output / "report.html",
+                        redact,
+                        parent_artifact_id=report_meta["artifact_id"],
+                    )
+                except Exception as error:
+                    presentation_status = "failed"
+                    with tracer.span(
+                        "html_render_failure",
+                        inputs={"report_sha256": report_meta["sha256"]},
+                        attributes={"result_status": presentation_status},
+                    ) as span:
+                        span["status"] = "failed"
+                        span["error"] = {"type": type(error).__name__, "message": "renderer unavailable"}
+                run_span["attributes"]["presentation_status"] = presentation_status
                 run_span["attributes"]["result_status"] = status
-                run_span["output"] = {"status": status, "ids": ids}
+                run_span["output"] = {"status": status, "presentation_status": presentation_status, "ids": ids}
                 return status
         finally:
             summary = {

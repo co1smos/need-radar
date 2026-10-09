@@ -1,5 +1,5 @@
 # Need Radar design
-Status: finalized documentation design; no implementation or live activation authorization.
+Status: finalized design; offline serve and deterministic HTML projection implemented; no live activation authorization.
 Interview session: `20261006_114451_8a8410`.
 Visual overview: [architecture.md](architecture.md) and [browser diagram](architecture.html).
 Owner update on 2026-10-06: selected DeepSeek V4.1 Flash and Discord channel `1557157266824634469`. See [runtime-selections.md](runtime-selections.md) for the project-only mapping and credential handoff. No runtime configuration was changed.
@@ -148,7 +148,8 @@ No extra LLM beautification, summary, or independent authoring pass is permitted
 A report revision receives a distinct ID and hash.
 Late evaluation never silently changes an already sent report.
 HTML is the initial visual projection; PDF is optional and cannot block Markdown.
-Quarto and Chromium remain provisional until an offline VPS fixture verifies assets, Chinese fonts, links, and pagination.
+The offline implementation uses a deterministic canonical-Markdown subset, embedded CSS, escaped untrusted text, and report-hash lineage; its synthetic fixture does not verify target-VPS browser fonts or visual pagination.
+PDF remains deferred until a renderer already available in the target environment verifies fonts, links, and page breaks; no renderer installation is authorized by this implementation.
 Shadow initially archives candidates, Markdown, and evaluation artifacts without visual rendering or delivery.
 Delivery retry reuses the same report and payload.
 Ambiguous send outcomes require reconciliation rather than exactly-once claims.
