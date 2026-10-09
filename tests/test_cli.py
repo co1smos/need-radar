@@ -13,6 +13,7 @@ import need_radar.__main__ as tracer_cli
 
 
 ROOT = Path(__file__).resolve().parents[1]
+HERMES_TMPDIR = Path.home() / ".hermes" / "cache" / "scratch"
 
 
 class OfflineServeDemoTests(unittest.TestCase):
@@ -20,7 +21,7 @@ class OfflineServeDemoTests(unittest.TestCase):
         environment = {
             "PYTHONPATH": os.pathsep.join([str(ROOT / "tests"), str(ROOT)]),
             "PYTHONDONTWRITEBYTECODE": "1",
-            "TMPDIR": tempfile.gettempdir(),
+            "TMPDIR": str(HERMES_TMPDIR),
         }
         return subprocess.run(command, env=environment, **options)
 

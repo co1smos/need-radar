@@ -2,7 +2,7 @@
 
 独立项目：持续发现 AI 开发/学习中具体、有价值、可解决、有合理规模切入口的 friction。
 
-**当前状态：设计讨论已完成；ticket #1 的离线 serve tracer 已实现。未连接实时来源、模型、定时任务或 Discord。**
+**当前状态：设计讨论已完成；ticket #1 的离线 serve tracer 和 ticket #14 的 fake-only Discord delivery boundary 已实现。未连接实时来源、模型、定时任务或 Discord。**
 
 项目路径：`/home/ubuntu/projects/need-radar`
 
@@ -87,6 +87,27 @@ PYTHONPATH=tests python3 -m unittest discover -s tests -p 'test_cli.py' -v
 
 2026-10-08 实测：CLI 返回 `status=success`，本地写入 10 个 span 和 10 条结构化阶段日志；`remote_export.status=unverified`、`enabled=false`，未尝试远端验证。
 
+## Ticket #14：离线 Discord delivery boundary
+
+Delivery 只读取已有成功 run 的冻结 `report.md`，校验其 lineage hash，并生成确定性 payload；不超过 2,000 字符时消息正文逐字保持 Markdown，超限时作为同内容 `.md` 附件并用稳定 identity 作正文。Identity 是目标 channel 与 report hash 的确定性摘要；fake transport 可据此 reconcile，但真实 Discord 消息中的可搜索性未验证。目标 channel ID 保持字符串。Hermes CLI 的只读 help 显示 `hermes send --to ...`、`--file` 和 `MEDIA:<path>` 形状；本项目 adapter 兼容性仍为 `unverified`。离线 run 仅注入 fake transport，不调用 Hermes，也不访问 Discord。附件上限未由离线测试确定，实际目标附件权限/限制仍待 #16 核实。
+
+端到端 synthetic check（需 `TMPDIR` 指向 Hermes scratch）：
+
+```sh
+export TMPDIR="$HOME/.hermes/cache/scratch"
+demo_dir="$(mktemp -d)"
+python3 -m need_radar --output "$demo_dir/run"
+python3 -m need_radar.discord_delivery --run-dir "$demo_dir/run"
+```
+
+Fake transport 在发送后模拟 timeout，随后 read-back 按相同 payload identity 找到 synthetic message，因此该执行只做一次 send。`discord-delivery.json`、`lineage.sqlite3`、`trace.jsonl` 和 `logs.jsonl` 保存脱敏后的 payload、尝试/结果、fake message ID 和 report lineage；不包含公共 URL 或声称 exactly-once。离线成功不证明真实 Discord send/read-back；二者均记录为 `not_performed`，实际授权验证属于 #16。HTML/PDF 与 schedule 均不在此 slice。
+
+2026-10-08 实测：serve CLI 返回 `status=success`；fake delivery 返回 `status=delivered_reconciled attempts=1 message_id=fake-message-000001`，`discord-delivery.json` 将 send 后 timeout 通过 fake read-back reconciled 为 `found`。真实 Discord send/read-back 均未执行，Hermes adapter 兼容性未验证。Focused 回归：
+
+```sh
+TMPDIR="$HOME/.hermes/cache/scratch" PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tests python3 -m unittest discover -s tests -p 'test_discord_delivery.py' -v
+```
+
 已运行的离线检查命令：
 
 ```sh
@@ -98,4 +119,4 @@ python3 -m compileall -q need_radar tests
 
 Hermes session：`20261006_114451_8a8410`，全程保留，详见 [session record](docs/grill/session.md)。
 
-后续 agent 先读 [AGENTS.md](AGENTS.md)。ticket #1 仅实现离线 tracer；未做 Git 初始化、依赖安装、付费数据接入、cron 或 Discord 发布。任何实时接入与上线均需另行授权。
+后续 agent 先读 [AGENTS.md](AGENTS.md)。tickets #1/#2/#14 的实现均为离线/synthetic；未做实时来源调用、付费模型调用、cron 或真实 Discord 发布。任何实时接入与上线均需另行授权。
