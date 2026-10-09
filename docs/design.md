@@ -112,6 +112,7 @@ Meaningful size means consequential burden, recurrence, blocking impact, costly 
 Judge uncertainty and disagreement remain visible.
 A small fixed arm-blind subset may be rerun in swapped anonymous order as a bias check.
 The judge is not ground truth and does not create an owner-labeling loop.
+The offline fixture path uses one allowlisted prompt per consolidated candidate and the same rubric/context policy for either arm. Its predetermined judge response does not invoke the selected provider. Assessment artifacts follow the canonical report and link its frozen hash; failure cannot change the serve status or rewrite Markdown.
 ## Metrics and inconclusive comparisons
 The primary descriptive metric is unique judge-eligible frictions per common frozen input count under equal budgets.
 Also report:

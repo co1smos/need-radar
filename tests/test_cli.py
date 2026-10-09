@@ -90,6 +90,33 @@ class OfflineServeDemoTests(unittest.TestCase):
             self.assertIn("# Need Radar", report)
             self.assertIn("Agent context handoff is manual", report)
             self.assertIn(r"reddit\:fixture\-1", report)
+            report_hash = hashlib.sha256((output / "report.md").read_bytes()).hexdigest()
+
+            consolidation = json.loads((output / "consolidation.json").read_text())
+            self.assertEqual(consolidation["arm"], "serve")
+            self.assertEqual(consolidation["raw_candidates"], candidates["candidates"])
+            self.assertEqual(consolidation["clusters"][0]["member_indices"], [0])
+            judge_prompt = json.loads((output / "judge-prompt.json").read_text())
+            self.assertEqual(len(judge_prompt["prompts"]), 1)
+            isolated_prompt = judge_prompt["prompts"][0]["prompt"]
+            judge_messages = json.dumps(isolated_prompt["messages"])
+            judge_candidate_data = json.loads(isolated_prompt["messages"][1]["content"].split("\n", 1)[1])
+            self.assertEqual(set(judge_candidate_data[0]), {"title", "friction", "evidence"})
+            self.assertNotIn("extractor", judge_messages.casefold())
+            self.assertEqual(isolated_prompt["config"]["rubric_version"], "fixed-rubric-v1")
+            assessment_result = json.loads((output / "assessment.json").read_text())
+            self.assertEqual(assessment_result["status"], "success")
+            self.assertEqual(assessment_result["assessments"][0]["verdict"], "NEEDS_EVIDENCE")
+            self.assertEqual(assessment_result["frozen_report"]["sha256"], report_hash)
+            self.assertEqual(
+                assessment_result["source_artifacts"]["snapshot"]["artifact_id"],
+                json.loads((output / "snapshot.json").read_text())["lineage"]["artifact_id"],
+            )
+            self.assertEqual(
+                json.loads((output / "judge-prompt.json").read_text())["source_artifacts"]["frozen_report"]["sha256"],
+                report_hash,
+            )
+            self.assertEqual(hashlib.sha256((output / "report.md").read_bytes()).hexdigest(), report_hash)
 
             with sqlite3.connect(output / "lineage.sqlite3") as database:
                 stages = database.execute(
@@ -108,6 +135,10 @@ class OfflineServeDemoTests(unittest.TestCase):
                     ("model_call", "success", "prompt_render"),
                     ("validation", "success", "model_call"),
                     ("report", "success", "validation"),
+                    ("consolidation", "success", "validation"),
+                    ("judge_prompt", "success", "consolidation"),
+                    ("judge_call", "success", "judge_prompt"),
+                    ("assessment", "success", "judge_call"),
                 ],
             )
             trace_events = [json.loads(line) for line in (output / "trace.jsonl").read_text().splitlines()]
@@ -124,15 +155,33 @@ class OfflineServeDemoTests(unittest.TestCase):
             self.assertTrue(all(event["run_id"] == observations["ids"]["run_id"] for event in log_events))
             self.assertTrue(all(event["trace_id"] == observations["ids"]["trace_id"] for event in log_events))
             logged_stages = {event["stage"] for event in log_events}
-            self.assertTrue({"selection", "context_assembly", "truncation", "prompt_render", "model_call", "validation", "report"} <= logged_stages)
+            self.assertTrue({
+                "selection", "context_assembly", "truncation", "prompt_render", "model_call",
+                "validation", "report", "consolidation", "judge_prompt", "judge_call", "assessment",
+            } <= logged_stages)
             spans_by_id = {event["id"]: event for event in trace_events}
             self.assertTrue(all(event["parent_span_id"] == spans_by_id[event["span_id"]]["parent_span_id"] for event in log_events))
             self.assertEqual(observations["remote_export"]["status"], "unverified")
             self.assertFalse(observations["remote_export"]["enabled"])
             self.assertFalse(observations["coverage"]["redaction"]["complete"])
             self.assertEqual(observations["ids"]["snapshot_id"], stages[0][8])
-            self.assertEqual(observations["ids"]["report_id"], stages[-1][8])
+            stage_by_name = {stage[0]: stage for stage in stages}
+            self.assertEqual(observations["ids"]["report_id"], stage_by_name["report"][8])
+            self.assertEqual(observations["ids"]["assessment_id"], stages[-1][8])
             self.assertEqual(observations["ids"]["call_id"], stages[5][10])
+            parent_stages = {
+                "selection": "snapshot",
+                "context_assembly": "selection",
+                "truncation": "context_assembly",
+                "prompt_render": "truncation",
+                "model_call": "prompt_render",
+                "validation": "model_call",
+                "report": "validation",
+                "consolidation": "validation",
+                "judge_prompt": "consolidation",
+                "judge_call": "judge_prompt",
+                "assessment": "judge_call",
+            }
             for index, stage in enumerate(stages):
                 with self.subTest(stage=stage[0]):
                     artifact = (output / stage[4]).read_bytes()
@@ -140,9 +189,100 @@ class OfflineServeDemoTests(unittest.TestCase):
                     self.assertEqual(stage[6], observations["ids"]["trace_id"])
                     self.assertTrue(stage[7])
                     self.assertTrue(stage[8])
-                    if index:
-                        self.assertEqual(stage[3], stages[index - 1][5])
-                        self.assertEqual(stage[9], stages[index - 1][8])
+                    if stage[0] in parent_stages:
+                        parent = stage_by_name[parent_stages[stage[0]]]
+                        self.assertEqual(stage[2], parent[0])
+                        self.assertEqual(stage[3], parent[5])
+                        self.assertEqual(stage[9], parent[8])
+
+    def test_judge_failure_preserves_a_valid_frozen_serve_report(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            (Path(temporary_directory) / "successful").mkdir()
+            (Path(temporary_directory) / "failed-judge").mkdir()
+            successful_fixture = json.loads((ROOT / "fixtures" / "synthetic_demo.json").read_text())
+            successful_result, successful_output = self.invoke_fixture(
+                Path(temporary_directory) / "successful",
+                successful_fixture,
+            )
+            failed_fixture = json.loads(json.dumps(successful_fixture))
+            failed_fixture["judge"] = {"status": "failure", "error": "synthetic judge failure"}
+            failed_result, failed_output = self.invoke_fixture(
+                Path(temporary_directory) / "failed-judge",
+                failed_fixture,
+            )
+
+            self.assertEqual(successful_result.returncode, 0, successful_result.stderr)
+            self.assertEqual(failed_result.returncode, 0, failed_result.stderr)
+            self.assertIn("status=success", failed_result.stdout)
+            successful_report = (successful_output / "report.md").read_bytes()
+            failed_report = (failed_output / "report.md").read_bytes()
+            self.assertEqual(failed_report, successful_report)
+            assessment_result = json.loads((failed_output / "assessment.json").read_text())
+            self.assertEqual(assessment_result["status"], "unavailable")
+            self.assertEqual(
+                assessment_result["frozen_report"]["sha256"],
+                hashlib.sha256(failed_report).hexdigest(),
+            )
+            judge_result = json.loads((failed_output / "judge-response.json").read_text())
+            self.assertEqual(judge_result["status"], "failure")
+            self.assertEqual(judge_result["error"], "synthetic judge failure")
+            self.assertFalse(assessment_result["coverage"]["fixture_assessment_complete"])
+            trace_events = [
+                json.loads(line) for line in (failed_output / "trace.jsonl").read_text().splitlines()
+            ]
+            judge_span = next(event for event in trace_events if event["name"] == "judge_call")
+            self.assertEqual(judge_span["status"], "failed")
+
+    def test_broken_judge_grounding_does_not_change_serve_report(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            (Path(temporary_directory) / "broken").mkdir()
+            fixture = json.loads((ROOT / "fixtures" / "synthetic_demo.json").read_text())
+            fixture["judge"]["response"][0]["evidence_ids"] = ["x:borrowed-evidence"]
+            fixture["judge"]["response"][0]["dimensions"]["pain_value"]["evidence_ids"] = [
+                "x:borrowed-evidence",
+            ]
+            result, output = self.invoke_fixture(Path(temporary_directory) / "broken", fixture)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("status=success", result.stdout)
+            self.assertIn("Agent context handoff is manual", (output / "report.md").read_text())
+            assessment_result = json.loads((output / "assessment.json").read_text())
+            self.assertEqual(assessment_result["status"], "invalid_output")
+            self.assertTrue(any(
+                "outside the frozen candidate context" in error
+                for error in assessment_result["errors"]
+            ))
+
+    def test_assessment_runs_after_and_cannot_rewrite_frozen_report(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            (Path(temporary_directory) / "run").mkdir()
+            fixture_path = ROOT / "fixtures" / "synthetic_demo.json"
+            output = Path(temporary_directory) / "run"
+            self.assertEqual(tracer_cli.run(fixture_path, output), "success")
+            report_before = (output / "report.md").read_bytes()
+            report_hash = hashlib.sha256(report_before).hexdigest()
+            assessment_result = json.loads((output / "assessment.json").read_text())
+            self.assertEqual(assessment_result["frozen_report"]["sha256"], report_hash)
+            with self.assertRaises(ValueError):
+                tracer_cli.run(fixture_path, output)
+            self.assertEqual((output / "report.md").read_bytes(), report_before)
+
+    def test_consolidation_failure_does_not_block_serve_report(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "run"
+            with mock.patch.object(
+                tracer_cli.assessment,
+                "consolidate_within_arm",
+                side_effect=RuntimeError("synthetic consolidation failure"),
+            ):
+                status = tracer_cli.run(tracer_cli.DEFAULT_FIXTURE, output)
+
+            self.assertEqual(status, "success")
+            self.assertIn("Agent context handoff is manual", (output / "report.md").read_text())
+            assessment_result = json.loads((output / "assessment.json").read_text())
+            self.assertEqual(assessment_result["status"], "unavailable")
+            self.assertIn("assessment failed", assessment_result["errors"][0])
+            self.assertIn("snapshot", assessment_result["source_artifacts"])
 
     def test_successful_fake_model_call_exposes_upstream_context_truncation(self):
         def faulty_truncation(context):

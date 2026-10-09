@@ -107,7 +107,7 @@ for name, path in (
             self.assertEqual(hashlib.sha256((output / "report.md").read_bytes()).hexdigest(), source_hash)
             self.assertEqual(rendered.decode(), presentation.render_markdown_html(markdown.decode()))
             self.assertIn(b"Coverage: synthetic fixture inputs only", rendered)
-            self.assertIn(b"Evaluation: not run", rendered)
+            self.assertIn(b"Assessment: unevaluated in this frozen report", rendered)
             self.assertIn(b"Evidence 1-1", rendered)
             self.assertIn(b'href="#finding-1"', rendered)
             self.assertIn(b'href="#evidence-1-1"', rendered)

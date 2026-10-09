@@ -2,7 +2,7 @@
 
 独立项目：持续发现 AI 开发/学习中具体、有价值、可解决、有合理规模切入口的 friction。
 
-**当前状态：设计讨论已完成；ticket #1 离线 serve tracer 与 ticket #13 HTML 投影已实现。未连接实时来源、模型、定时任务或 Discord。**
+**当前状态：设计讨论已完成；ticket #1 离线 serve tracer、ticket #7 合成离线 assessment 与 ticket #13 HTML 投影已实现。未连接实时来源、模型、定时任务或 Discord。**
 
 项目路径：`/home/ubuntu/projects/need-radar`
 
@@ -25,6 +25,7 @@
 | [具体问题与实际回答全文](docs/grill/qa-transcript.md) | Q1–Q30 原始提问、Hermes 建议、对应的代理回答及实际结束消息，已核对原会话 |
 | [ChatGPT × Hermes 讨论摘要](docs/grill/discussion.md) | 中文结论、原始记录导航和后续实验例子；不是问答全文 |
 | [Design](docs/design.md) | 系统边界、extraction-only 实验、固定 judge、报告和完整 observability |
+| [Offline assessment](docs/assessment.md) | 固定 rubric、arm-blind evidence、failure isolation 与合成离线验证 |
 | [Decisions](docs/decisions.md) | 区分用户已定要求、可逆代理默认值与未来启用审批 |
 | [Extraction shadow runner](docs/shadow-runner.md) | #6 离线 v0/v1 parity、资源上限、failure isolation 与实测结果 |
 | [Activation checklist](docs/activation-checklist.md) | 真实接入前的预算、数据处理、频道配置和技术核查；目前全部未启用 |

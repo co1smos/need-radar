@@ -146,6 +146,68 @@ class SourceAdapterTests(unittest.TestCase):
             self.assertEqual(replay_snapshot["items"], items)
             self.assertEqual((replay_output / "report.md").read_bytes(), (output / "report.md").read_bytes())
 
+    def test_source_results_preserve_synthetic_judge_for_assessment(self):
+        fixture = json.loads(json.dumps(self.fixture))
+        evidence_id = "reddit:reddit-comment-001"
+        fixture["judge"] = {
+            "status": "synthetic_response",
+            "response": [{
+                "verdict": "NEEDS_EVIDENCE",
+                "reason": "The cited report grounds repeated context rebuilding, but its practical impact is not established.",
+                "evidence_ids": [evidence_id],
+                "dimensions": {
+                    "friction_clarity": {
+                        "status": "supported",
+                        "reason": "The author explicitly describes rebuilding tool context after resets.",
+                        "evidence_ids": [evidence_id],
+                    },
+                    "pain_value": {
+                        "status": "supported",
+                        "reason": "The report describes repeated setup effort.",
+                        "evidence_ids": [evidence_id],
+                    },
+                    "evidence_size": {
+                        "status": "unknown",
+                        "reason": "Frequency and practical consequences are not established.",
+                        "evidence_ids": [evidence_id],
+                    },
+                    "solvability": {
+                        "status": "unknown",
+                        "reason": "The report does not establish a bounded intervention.",
+                        "evidence_ids": [evidence_id],
+                    },
+                    "scope_fit": {
+                        "status": "supported",
+                        "reason": "The workflow concerns context use with coding agents.",
+                        "evidence_ids": [evidence_id],
+                    },
+                },
+                "uncertainties": [
+                    "The frequency and consequence of repeated setup are unknown.",
+                    "A bounded intervention is not established.",
+                ],
+            }],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            hermes_tmp = Path.home() / ".hermes" / "cache" / "scratch"
+            fixture_path = self.write_fixture(root, fixture)
+            output = root / "serve"
+            with mock.patch.dict(os.environ, self.safe_environment(hermes_tmp), clear=True):
+                result = self.run_cli(fixture_path, output, hermes_tmp)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("status=success", result.stdout)
+            consolidation = json.loads((output / "consolidation.json").read_text())
+            self.assertEqual(consolidation["arm"], "serve")
+            self.assertEqual(len(consolidation["clusters"]), 1)
+            assessment_result = json.loads((output / "assessment.json").read_text())
+            self.assertEqual(assessment_result["status"], "success")
+            self.assertEqual(assessment_result["assessments"][0]["verdict"], "NEEDS_EVIDENCE")
+            self.assertEqual(assessment_result["coverage"]["kind"], "synthetic_offline")
+            self.assertFalse(assessment_result["coverage"]["provider_invoked"])
+
     def test_invalid_normalizer_output_is_persisted_and_fails_closed(self):
         invalid = json.loads(json.dumps(self.fixture))
         invalid["normalization_model"]["response"]["results"][0]["authoritative_source_id"] = "invented"

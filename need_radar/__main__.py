@@ -8,6 +8,7 @@ import sys
 import uuid
 from pathlib import Path
 
+from need_radar import assessment
 from need_radar.observability import JsonlSpanSink, LangfuseBoundary, Tracer
 from need_radar.source_adapter import (
     normalize_prepared_results,
@@ -429,7 +430,7 @@ def render_report(status, candidates, errors):
         f"- Status: {status}",
         f"- Validated findings: {len(candidates)}",
         "- Coverage: synthetic fixture inputs only; live-source coverage is unverified.",
-        "- Evaluation: not run; this offline serve tracer has no judge.",
+        "- Assessment: unevaluated in this frozen report; any assessment is a separate artifact.",
     ]
     for candidate_index, candidate in enumerate(candidates, start=1):
         lines.append(f"- [Finding {candidate_index}](#finding-{candidate_index}): {markdown_literal(candidate['title'])}")
@@ -492,6 +493,197 @@ def fixture_errors(fixture):
         if not isinstance(item["text"], str):
             errors.append(f"fixture item[{index}] text must be a string")
     return errors
+
+
+def run_fixture_assessment(
+    arm,
+    raw_judge,
+    candidates,
+    snapshot_items,
+    output,
+    database,
+    run_id,
+    trace_id,
+    sequence,
+    tracer,
+    validation_meta,
+    snapshot_meta,
+    report_meta,
+):
+    with tracer.span(
+        "consolidation",
+        inputs={"validation_id": validation_meta["artifact_id"], "candidates": candidates},
+        attributes={"policy_version": assessment.CONSOLIDATION_VERSION, "arm": arm},
+    ) as span:
+        consolidation = assessment.consolidate_within_arm(arm, candidates)
+        consolidation_meta = persist_stage(
+            output,
+            database,
+            run_id,
+            trace_id,
+            sequence,
+            "consolidation",
+            "success",
+            Path("consolidation.json"),
+            consolidation,
+            span,
+            validation_meta,
+            details={"cluster_count": len(consolidation["clusters"])},
+        )
+    prompts = None
+    prompt_errors = []
+    try:
+        prompts = assessment.build_isolated_judge_prompts(
+            consolidation["clusters"],
+            snapshot_items,
+        )
+    except Exception as error:
+        prompt_errors = [f"{type(error).__name__}: judge prompt failed"]
+    source_artifacts = {
+        "candidate_validation": {
+            "artifact_id": validation_meta["artifact_id"],
+            "sha256": validation_meta["sha256"],
+        },
+        "snapshot": {
+            "artifact_id": snapshot_meta["artifact_id"],
+            "sha256": snapshot_meta["sha256"],
+        },
+        "consolidation": {
+            "artifact_id": consolidation_meta["artifact_id"],
+            "sha256": consolidation_meta["sha256"],
+        },
+        "frozen_report": {
+            "artifact_id": report_meta["artifact_id"],
+            "sha256": report_meta["sha256"],
+        },
+    }
+    with tracer.span(
+        "judge_prompt",
+        inputs={"source_artifacts": source_artifacts},
+        attributes={"prompt_version": assessment.PROMPT_VERSION},
+    ) as span:
+        span["attributes"]["result_status"] = "success" if prompts is not None else "failed"
+        if prompts is None:
+            span["status"] = "failed"
+        prompt_meta = persist_stage(
+            output,
+            database,
+            run_id,
+            trace_id,
+            sequence + 1,
+            "judge_prompt",
+            "success" if prompts is not None else "failed",
+            Path("judge-prompt.json"),
+            {"prompts": prompts, "source_artifacts": source_artifacts}
+            if prompts is not None
+            else {"status": "failed", "errors": prompt_errors, "source_artifacts": source_artifacts},
+            span,
+            consolidation_meta,
+            details={"prompt_version": assessment.PROMPT_VERSION, "prompt_count": len(prompts or [])},
+        )
+
+    reported_status = raw_judge.get("status") if isinstance(raw_judge, dict) else None
+    if prompts is None:
+        judge_status = "failure"
+        judge_error = "judge prompt could not be built from frozen evidence"
+    elif reported_status == "synthetic_response":
+        judge_status = "success"
+        judge_error = None
+    else:
+        judge_status = "failure"
+        if isinstance(raw_judge, dict) and reported_status == "failure":
+            judge_error = str(raw_judge.get("error") or "synthetic judge fixture failed")
+        elif raw_judge is None:
+            judge_error = "no synthetic judge fixture supplied"
+        else:
+            judge_error = f"unsupported synthetic judge status: {reported_status!r}"
+    judge_call_id = uuid.uuid4().hex
+    judge_artifact = {
+        "boundary": "synthetic_fixture",
+        "status": judge_status,
+        "reported_status": reported_status,
+        "response": raw_judge.get("response") if isinstance(raw_judge, dict) else None,
+        "error": judge_error,
+    }
+    with tracer.span(
+        "judge_call",
+        inputs={"call_id": judge_call_id, "prompts": prompts},
+        attributes={"call_id": judge_call_id, "boundary": "synthetic_fixture", "result_status": judge_status},
+    ) as span:
+        if judge_status != "success":
+            span["status"] = "failed"
+        judge_meta = persist_stage(
+            output,
+            database,
+            run_id,
+            trace_id,
+            sequence + 2,
+            "judge_call",
+            judge_status,
+            Path("judge-response.json"),
+            judge_artifact,
+            span,
+            prompt_meta,
+            judge_call_id,
+            {"boundary": "synthetic_fixture"},
+        )
+
+    if judge_status == "success":
+        assessment_result = assessment.validate_assessments(
+            raw_judge.get("response"), consolidation["clusters"],
+        )
+        result_status = assessment_result["status"]
+    else:
+        result_status = "unavailable"
+        assessment_result = {
+            "status": result_status,
+            "assessments": [],
+            "errors": [judge_error],
+        }
+    assessment_artifact = {
+        **assessment_result,
+        "rubric_version": assessment.RUBRIC_VERSION,
+        "prompt_version": assessment.PROMPT_VERSION,
+        "consolidation_id": consolidation_meta["artifact_id"],
+        "judge_call_id": judge_call_id,
+        "source_artifacts": source_artifacts,
+        "frozen_report": source_artifacts["frozen_report"],
+        "coverage": {
+            "kind": "synthetic_offline",
+            "fixture_assessment_complete": result_status == "success",
+            "candidate_count": len(consolidation["clusters"]),
+            "live_verification": "not performed",
+            "provider_invoked": False,
+        },
+    }
+    with tracer.span(
+        "assessment",
+        inputs={
+            "judge_call_id": judge_call_id,
+            "report_id": report_meta["artifact_id"],
+            "report_sha256": report_meta["sha256"],
+            "result": assessment_artifact,
+        },
+        attributes={"rubric_version": assessment.RUBRIC_VERSION, "result_status": result_status},
+    ) as span:
+        if result_status != "success":
+            span["status"] = "failed"
+        assessment_meta = persist_stage(
+            output,
+            database,
+            run_id,
+            trace_id,
+            sequence + 3,
+            "assessment",
+            result_status,
+            Path("assessment.json"),
+            assessment_artifact,
+            span,
+            judge_meta,
+            judge_call_id,
+            {"report_id": report_meta["artifact_id"], "report_sha256": report_meta["sha256"]},
+        )
+    return result_status, consolidation_meta, assessment_meta
 
 
 def run(fixture_path, output):
@@ -670,6 +862,7 @@ def run(fixture_path, output):
                         "notice": fixture.get("notice", "synthetic offline source-result fixture"),
                         "items": normalization["items"],
                         "model": fixture.get("model"),
+                        **({"judge": fixture["judge"]} if "judge" in fixture else {}),
                     }
                     if "experiment" in fixture:
                         normalized_fixture["experiment"] = fixture["experiment"]
@@ -944,6 +1137,79 @@ def run(fixture_path, output):
                         {"canonical": True},
                     )
                 ids["report_id"] = report_meta["artifact_id"]
+                if "judge" in fixture and candidates:
+                    try:
+                        assessment_status, consolidation_meta, assessment_meta = run_fixture_assessment(
+                            "serve",
+                            fixture["judge"],
+                            candidates,
+                            snapshot["items"],
+                            output,
+                            database,
+                            run_id,
+                            trace_id,
+                            9 + sequence_offset,
+                            tracer,
+                            validation_meta,
+                            snapshot_meta,
+                            report_meta,
+                        )
+                        ids["consolidation_id"] = consolidation_meta["artifact_id"]
+                    except Exception as error:
+                        assessment_status = "unavailable"
+                        assessment_sources = {
+                            "candidate_validation": {
+                                "artifact_id": validation_meta["artifact_id"],
+                                "sha256": validation_meta["sha256"],
+                            },
+                            "snapshot": {
+                                "artifact_id": snapshot_meta["artifact_id"],
+                                "sha256": snapshot_meta["sha256"],
+                            },
+                            "frozen_report": {
+                                "artifact_id": report_meta["artifact_id"],
+                                "sha256": report_meta["sha256"],
+                            },
+                        }
+                        failure = {
+                            "status": assessment_status,
+                            "assessments": [],
+                            "errors": [f"{type(error).__name__}: assessment failed"],
+                            "rubric_version": assessment.RUBRIC_VERSION,
+                            "frozen_report": {
+                                "artifact_id": report_meta["artifact_id"],
+                                "sha256": report_meta["sha256"],
+                            },
+                            "source_artifacts": assessment_sources,
+                            "coverage": {
+                                "kind": "synthetic_offline",
+                                "fixture_assessment_complete": False,
+                                "live_verification": "not performed",
+                                "provider_invoked": False,
+                            },
+                        }
+                        with tracer.span(
+                            "assessment_failure",
+                            inputs={"report_id": report_meta["artifact_id"]},
+                            attributes={"result_status": assessment_status},
+                        ) as span:
+                            span["status"] = "failed"
+                            assessment_meta = persist_stage(
+                                output,
+                                database,
+                                run_id,
+                                trace_id,
+                                12 + sequence_offset,
+                                "assessment",
+                                assessment_status,
+                                Path("assessment.json"),
+                                failure,
+                                span,
+                                report_meta,
+                                details={"failure_type": type(error).__name__},
+                            )
+                    ids["assessment_id"] = assessment_meta["artifact_id"]
+                    run_span["attributes"]["assessment_status"] = assessment_status
                 try:
                     presentation_status = render_file(
                         output / "report.md",
