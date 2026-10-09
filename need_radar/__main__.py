@@ -8,6 +8,8 @@ import sys
 import uuid
 from pathlib import Path
 
+from need_radar.observability import JsonlSpanSink, LangfuseBoundary, Tracer
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_FIXTURE = ROOT / "fixtures" / "synthetic_demo.json"
@@ -15,7 +17,7 @@ SECRET_PATTERNS = (
     re.compile(r"\b(?:sk-[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b"),
     re.compile(r"(?im)\b(cookie|set-cookie)\s*:\s*[^\r\n]*"),
     re.compile(r'''(?i)(?P<prefix>\bauthorization\s*[:=]\s*(?:bearer|basic)\s+|\bbearer\s+)(?:(?P<quote>["'])(?P<quoted>(?:\\.|(?!(?P=quote)).)*)(?P=quote)|(?P<bare>[^\s,;"'}]+))'''),
-    re.compile(r'''(?i)(?<![\w])(?P<prefix>["']?(?:api[_-]?key|access[_-]?token|private[_-]?key|token|secret|password|passwd|credential|authorization|auth|cookie|set[_-]?cookie)["']?\s*[:=]\s*)(?:(?P<quote>["'])(?P<quoted>(?:\\.|(?!(?P=quote)).)*)(?P=quote)|(?P<redacted>\[REDACTED\])|(?P<bare>[^\s,;}\]"']+))'''),
+    re.compile(r'''(?i)(?<![\w])(?P<prefix>["']?(?:api[_-]?key|access[_-]?token|private[_-]?key|token|secret|password|passwd|credential|authorization|auth|cookie|set[_-]?cookie)["']?\s*[:=]\s*)(?:(?P<quote>["'])(?P<quoted>(?:\\.|(?!(?P=quote)).)*)(?P=quote)|(?P<redacted>\\?\[REDACTED\\?\])|(?P<bare>[^\s,;}\]"']+))'''),
 )
 SECRET_FIELD = re.compile(r"(?i)(?:^|[_-])(?:api[_-]?key|access[_-]?token|private[_-]?key|key|token|secret|password|passwd|authorization|auth|cookie|credential)(?:$|[_-])")
 
@@ -64,13 +66,35 @@ def markdown_literal(value):
     return re.sub(r"([\\`*_{}\[\]()#+\-.!|~:])", lambda match: "\\" + match.group(1), value)
 
 
-def write_stage(output, database, run_id, sequence, stage, status, artifact, value, input_stage=None, input_hash=None, details=None):
+def write_stage(
+    output,
+    database,
+    run_id,
+    sequence,
+    stage,
+    status,
+    artifact,
+    value,
+    trace_id,
+    span_id,
+    artifact_id,
+    input_stage=None,
+    input_hash=None,
+    input_artifact_id=None,
+    call_id=None,
+    details=None,
+):
     if artifact.suffix == ".json":
         value["lineage"] = {
             "run_id": run_id,
+            "trace_id": trace_id,
             "stage": stage,
+            "span_id": span_id,
+            "artifact_id": artifact_id,
             "input_stage": input_stage,
+            "input_artifact_id": input_artifact_id,
             "input_sha256": input_hash,
+            "call_id": call_id,
         }
         content = json_bytes(value)
     else:
@@ -79,7 +103,7 @@ def write_stage(output, database, run_id, sequence, stage, status, artifact, val
     path.write_bytes(content)
     output_hash = digest(content)
     database.execute(
-        "INSERT INTO stages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO stages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             sequence,
             run_id,
@@ -89,11 +113,66 @@ def write_stage(output, database, run_id, sequence, stage, status, artifact, val
             input_hash,
             artifact.as_posix(),
             output_hash,
-            json.dumps(details or {}, ensure_ascii=False),
+            json.dumps(redact(details or {}), ensure_ascii=False),
+            trace_id,
+            span_id,
+            artifact_id,
+            input_artifact_id,
+            call_id,
         ),
     )
     database.commit()
     return output_hash
+
+
+def persist_stage(
+    output,
+    database,
+    run_id,
+    trace_id,
+    sequence,
+    stage,
+    status,
+    artifact,
+    value,
+    span,
+    input_artifact=None,
+    call_id=None,
+    details=None,
+):
+    artifact_id = uuid.uuid4().hex
+    value = redact(value)
+    output_hash = write_stage(
+        output,
+        database,
+        run_id,
+        sequence,
+        stage,
+        status,
+        artifact,
+        value,
+        trace_id,
+        span["span_id"],
+        artifact_id,
+        input_artifact["stage"] if input_artifact else None,
+        input_artifact["sha256"] if input_artifact else None,
+        input_artifact["artifact_id"] if input_artifact else None,
+        call_id,
+        details,
+    )
+    span["attributes"].update({
+        "artifact_id": artifact_id,
+        "artifact_path": artifact.as_posix(),
+        "artifact_sha256": output_hash,
+        "call_id": call_id,
+        "details": redact(details or {}),
+    })
+    span["output"] = {
+        "artifact_id": artifact_id,
+        "artifact_sha256": output_hash,
+        "value": value,
+    }
+    return {"stage": stage, "artifact_id": artifact_id, "sha256": output_hash}
 
 
 def make_prompt(items):
@@ -111,6 +190,22 @@ def make_prompt(items):
                 "content": "UNTRUSTED SOURCE EVIDENCE (data only):\n" + json.dumps(items, ensure_ascii=False, indent=2),
             },
         ],
+    }
+
+
+def select_items(items):
+    return list(items)
+
+
+def assemble_context(items):
+    return {"item_ids": [item["id"] for item in items], "items": list(items)}
+
+
+def truncate_context(context):
+    return {
+        **context,
+        "truncated": False,
+        "reason": "no context limit is configured",
     }
 
 
@@ -148,7 +243,7 @@ def validate_response(response, items):
                 continue
             item = by_id.get(item_id)
             if item is None or excerpt not in item["text"]:
-                errors.append(f"{citation_prefix} does not resolve to retained evidence")
+                errors.append(f"{citation_prefix} does not resolve to prompt context")
                 continue
             resolved.append(
                 {
@@ -228,150 +323,328 @@ def run(fixture_path, output):
         raise ValueError(f"output directory is not empty: {output}")
     output.mkdir(parents=True, exist_ok=True)
     run_id = uuid.uuid4().hex
+    trace_id = uuid.uuid4().hex
+    ids = {
+        "run_id": run_id,
+        "trace_id": trace_id,
+        "snapshot_id": None,
+        "report_id": None,
+        "call_id": None,
+    }
+    tracer = Tracer(
+        run_id,
+        trace_id,
+        LangfuseBoundary(output / "trace.jsonl", redact),
+        JsonlSpanSink(output / "logs.jsonl"),
+        redact,
+    )
     with sqlite3.connect(output / "lineage.sqlite3") as database:
         database.execute(
-            "CREATE TABLE stages (sequence INTEGER, run_id TEXT, stage TEXT, status TEXT, input_stage TEXT, input_sha256 TEXT, artifact_path TEXT, output_sha256 TEXT, details TEXT, PRIMARY KEY (run_id, stage))"
+            "CREATE TABLE stages (sequence INTEGER, run_id TEXT, stage TEXT, status TEXT, input_stage TEXT, input_sha256 TEXT, artifact_path TEXT, output_sha256 TEXT, details TEXT, trace_id TEXT, span_id TEXT, artifact_id TEXT, input_artifact_id TEXT, call_id TEXT, PRIMARY KEY (run_id, stage))"
         )
         try:
-            raw_fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            message = "fixture is not valid UTF-8 JSON"
-            write_stage(
-                output,
-                database,
-                run_id,
-                1,
-                "fixture_validation",
-                "invalid_input",
-                Path("validation.json"),
-                {"status": "invalid_input", "errors": [message]},
-                details={"error_count": 1},
-            )
-            return "invalid_input"
-        redaction_failed = False
-        try:
-            fixture = redact(raw_fixture)
-        except ValueError:
-            redaction_failed = True
-            fixture = None
-            errors = ["fixture cannot be safely redacted"]
-        else:
-            errors = fixture_errors(fixture)
-        if errors:
-            validation = {"status": "invalid_input", "errors": errors}
-            if not redaction_failed:
-                validation["input"] = fixture
-            write_stage(
-                output,
-                database,
-                run_id,
-                1,
-                "fixture_validation",
-                "invalid_input",
-                Path("validation.json"),
-                validation,
-                details={"error_count": len(errors)},
-            )
-            return "invalid_input"
-        previous_hash = write_stage(
-            output,
-            database,
-            run_id,
-            1,
-            "snapshot",
-            "success",
-            Path("snapshot.json"),
-            {"version": 1, "notice": fixture.get("notice", "synthetic offline fixture"), "items": fixture["items"]},
-        )
-        prompt = make_prompt(fixture["items"])
-        previous_hash = write_stage(
-            output,
-            database,
-            run_id,
-            2,
-            "prompt",
-            "success",
-            Path("prompt.json"),
-            prompt,
-            "snapshot",
-            previous_hash,
-            prompt["config"],
-        )
-
-        raw_model = raw_fixture["model"]
-        model = fixture["model"]
-        reported_model_status = model.get("status")
-        model_status = "success" if reported_model_status == "synthetic_response" else "failure"
-        model_error = model.get("error")
-        if model_status == "failure" and not model_error:
-            model_error = "synthetic model failure" if reported_model_status == "failure" else f"unsupported synthetic model status: {reported_model_status!r}"
-        model_error = str(model_error) if model_error is not None else None
-        model_artifact = {
-            "boundary": "synthetic_fixture",
-            "status": model_status,
-            "reported_status": reported_model_status,
-            "response": model.get("response"),
-            "error": model_error,
-        }
-        previous_hash = write_stage(
-            output,
-            database,
-            run_id,
-            3,
-            "model",
-            model_status,
-            Path("model-response.json"),
-            model_artifact,
-            "prompt",
-            previous_hash,
-            {"boundary": "synthetic_fixture"},
-        )
-
-        if model_status == "failure":
-            status, candidates, errors = "extraction_failure", [], [model_error]
-        else:
-            status, candidates, errors = validate_response(raw_model.get("response"), fixture["items"])
-        candidates, errors = redact(candidates), redact(errors)
-        if status == "success":
-            by_id = {item["id"]: item for item in fixture["items"]}
-            for candidate_index, candidate in enumerate(candidates):
-                for citation_index, citation in enumerate(candidate["evidence"]):
-                    item = by_id.get(citation["item_id"])
-                    if item is None or citation["excerpt"] not in item["text"]:
-                        errors.append(
-                            f"candidate[{candidate_index}].evidence[{citation_index}] does not resolve to retained evidence"
+            with tracer.span("run", inputs={"mode": "synthetic_offline"}, attributes={"run_id": run_id}) as run_span:
+                try:
+                    raw_fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    errors = ["fixture is not valid UTF-8 JSON"]
+                    with tracer.span("fixture_validation", inputs={"fixture": "unparseable"}) as span:
+                        span["attributes"]["result_status"] = "invalid_input"
+                        stage = persist_stage(
+                            output,
+                            database,
+                            run_id,
+                            trace_id,
+                            1,
+                            "fixture_validation",
+                            "invalid_input",
+                            Path("validation.json"),
+                            {"status": "invalid_input", "errors": errors},
+                            span,
+                            details={"error_count": len(errors)},
                         )
-            if errors:
-                status, candidates = "invalid_output", []
-        validation = {"status": status, "candidates": candidates, "errors": errors}
-        previous_hash = write_stage(
-            output,
-            database,
-            run_id,
-            4,
-            "validation",
-            status,
-            Path("candidates.json"),
-            validation,
-            "model",
-            previous_hash,
-            {"error_count": len(errors)},
-        )
-        report = render_report(status, candidates, errors)
-        write_stage(
-            output,
-            database,
-            run_id,
-            5,
-            "report",
-            "success",
-            Path("report.md"),
-            report,
-            "validation",
-            previous_hash,
-            {"canonical": True},
-        )
-    return status
+                    ids["validation_id"] = stage["artifact_id"]
+                    run_span["attributes"]["result_status"] = "invalid_input"
+                    run_span["output"] = {"status": "invalid_input", "ids": ids}
+                    return "invalid_input"
+
+                redaction_failed = False
+                try:
+                    fixture = redact(raw_fixture)
+                except ValueError:
+                    redaction_failed = True
+                    fixture = None
+                    errors = ["fixture cannot be safely redacted"]
+                else:
+                    errors = fixture_errors(fixture)
+                if errors:
+                    validation = {"status": "invalid_input", "errors": errors}
+                    if not redaction_failed:
+                        validation["input"] = fixture
+                    with tracer.span(
+                        "fixture_validation",
+                        inputs={"fixture": fixture if fixture is not None else {"status": "redaction_failed"}},
+                    ) as span:
+                        span["attributes"]["result_status"] = "invalid_input"
+                        stage = persist_stage(
+                            output,
+                            database,
+                            run_id,
+                            trace_id,
+                            1,
+                            "fixture_validation",
+                            "invalid_input",
+                            Path("validation.json"),
+                            validation,
+                            span,
+                            details={"error_count": len(errors)},
+                        )
+                    ids["validation_id"] = stage["artifact_id"]
+                    run_span["attributes"]["result_status"] = "invalid_input"
+                    run_span["output"] = {"status": "invalid_input", "ids": ids}
+                    return "invalid_input"
+
+                with tracer.span("fixture_validation", inputs={"fixture": fixture}) as span:
+                    span["attributes"]["result_status"] = "valid"
+                    span["output"] = {"status": "valid", "item_count": len(fixture["items"])}
+
+                with tracer.span("snapshot", inputs={"items": fixture["items"]}) as span:
+                    snapshot = {
+                        "version": 1,
+                        "notice": fixture.get("notice", "synthetic offline fixture"),
+                        "items": fixture["items"],
+                    }
+                    snapshot_meta = persist_stage(
+                        output,
+                        database,
+                        run_id,
+                        trace_id,
+                        1,
+                        "snapshot",
+                        "success",
+                        Path("snapshot.json"),
+                        snapshot,
+                        span,
+                    )
+                ids["snapshot_id"] = snapshot_meta["artifact_id"]
+
+                with tracer.span(
+                    "selection",
+                    inputs={"snapshot_id": ids["snapshot_id"], "items": snapshot["items"]},
+                    attributes={"policy": "all_fixture_items"},
+                ) as span:
+                    selected_items = select_items(snapshot["items"])
+                    selection = {
+                        "policy": "all_fixture_items",
+                        "item_ids": [item["id"] for item in selected_items],
+                        "items": selected_items,
+                    }
+                    selection_meta = persist_stage(
+                        output,
+                        database,
+                        run_id,
+                        trace_id,
+                        2,
+                        "selection",
+                        "success",
+                        Path("selection.json"),
+                        selection,
+                        span,
+                        snapshot_meta,
+                        details={"selected_count": len(selected_items)},
+                    )
+
+                with tracer.span(
+                    "context_assembly",
+                    inputs={"selection_id": selection_meta["artifact_id"], "items": selected_items},
+                ) as span:
+                    context = assemble_context(selected_items)
+                    context_meta = persist_stage(
+                        output,
+                        database,
+                        run_id,
+                        trace_id,
+                        3,
+                        "context_assembly",
+                        "success",
+                        Path("context.json"),
+                        context,
+                        span,
+                        selection_meta,
+                        details={"item_count": len(context["items"])},
+                    )
+
+                with tracer.span(
+                    "truncation",
+                    inputs={"context_id": context_meta["artifact_id"], "context": context},
+                ) as span:
+                    truncated_context = truncate_context(context)
+                    truncation_meta = persist_stage(
+                        output,
+                        database,
+                        run_id,
+                        trace_id,
+                        4,
+                        "truncation",
+                        "success",
+                        Path("truncation.json"),
+                        truncated_context,
+                        span,
+                        context_meta,
+                        details={"truncated": truncated_context["truncated"], "reason": truncated_context["reason"]},
+                    )
+
+                with tracer.span(
+                    "prompt_render",
+                    inputs={"truncation_id": truncation_meta["artifact_id"], "items": truncated_context["items"]},
+                ) as span:
+                    prompt = make_prompt(truncated_context["items"])
+                    prompt_meta = persist_stage(
+                        output,
+                        database,
+                        run_id,
+                        trace_id,
+                        5,
+                        "prompt_render",
+                        "success",
+                        Path("prompt.json"),
+                        prompt,
+                        span,
+                        truncation_meta,
+                        details=prompt["config"],
+                    )
+
+                raw_model = raw_fixture["model"]
+                model = fixture["model"]
+                reported_model_status = model.get("status")
+                model_status = "success" if reported_model_status == "synthetic_response" else "failure"
+                model_error = model.get("error")
+                if model_status == "failure" and not model_error:
+                    model_error = "synthetic model failure" if reported_model_status == "failure" else f"unsupported synthetic model status: {reported_model_status!r}"
+                model_error = str(model_error) if model_error is not None else None
+                call_id = uuid.uuid4().hex
+                ids["call_id"] = call_id
+                model_artifact = {
+                    "boundary": "synthetic_fixture",
+                    "status": model_status,
+                    "reported_status": reported_model_status,
+                    "response": model.get("response"),
+                    "error": model_error,
+                }
+                with tracer.span(
+                    "model_call",
+                    inputs={"call_id": call_id, "prompt": prompt},
+                    attributes={"call_id": call_id, "boundary": "synthetic_fixture", "result_status": model_status},
+                ) as span:
+                    model_meta = persist_stage(
+                        output,
+                        database,
+                        run_id,
+                        trace_id,
+                        6,
+                        "model_call",
+                        model_status,
+                        Path("model-response.json"),
+                        model_artifact,
+                        span,
+                        prompt_meta,
+                        call_id,
+                        {"boundary": "synthetic_fixture"},
+                    )
+
+                with tracer.span(
+                    "validation",
+                    inputs={
+                        "call_id": call_id,
+                        "response": raw_model.get("response"),
+                        "prompt_items": truncated_context["items"],
+                    },
+                ) as span:
+                    if model_status == "failure":
+                        status, candidates, errors = "extraction_failure", [], [model_error]
+                    else:
+                        status, candidates, errors = validate_response(raw_model.get("response"), truncated_context["items"])
+                    candidates, errors = redact(candidates), redact(errors)
+                    if status == "success":
+                        by_id = {item["id"]: item for item in truncated_context["items"]}
+                        for candidate_index, candidate in enumerate(candidates):
+                            for citation_index, citation in enumerate(candidate["evidence"]):
+                                item = by_id.get(citation["item_id"])
+                                if item is None or citation["excerpt"] not in item["text"]:
+                                    errors.append(
+                                        f"candidate[{candidate_index}].evidence[{citation_index}] does not resolve to prompt context"
+                                    )
+                        if errors:
+                            status, candidates = "invalid_output", []
+                    validation = {"status": status, "candidates": candidates, "errors": errors}
+                    span["attributes"]["result_status"] = status
+                    validation_meta = persist_stage(
+                        output,
+                        database,
+                        run_id,
+                        trace_id,
+                        7,
+                        "validation",
+                        status,
+                        Path("candidates.json"),
+                        validation,
+                        span,
+                        model_meta,
+                        call_id,
+                        {"error_count": len(errors)},
+                    )
+
+                with tracer.span(
+                    "report",
+                    inputs={"validation_id": validation_meta["artifact_id"], "validation": validation},
+                    attributes={"canonical": True, "result_status": status},
+                ) as span:
+                    report = render_report(status, candidates, errors)
+                    report_meta = persist_stage(
+                        output,
+                        database,
+                        run_id,
+                        trace_id,
+                        8,
+                        "report",
+                        "success",
+                        Path("report.md"),
+                        report,
+                        span,
+                        validation_meta,
+                        call_id,
+                        {"canonical": True},
+                    )
+                ids["report_id"] = report_meta["artifact_id"]
+                run_span["attributes"]["result_status"] = status
+                run_span["output"] = {"status": status, "ids": ids}
+                return status
+        finally:
+            summary = {
+                "ids": ids,
+                "local_export": {
+                    "status": "failed" if tracer.export_failures else "success",
+                    "span_count": tracer.span_count,
+                    "exported_span_count": tracer.exported_span_count,
+                    "failures": tracer.export_failures,
+                },
+                "remote_export": {
+                    "status": "unverified",
+                    "enabled": False,
+                    "destination_authorized": False,
+                    "data_policy_authorized": False,
+                    "verification": "not_attempted",
+                },
+                "coverage": {
+                    "complete": not tracer.export_failures,
+                    "redaction": {
+                        "applied_before_persistence_and_export": True,
+                        "coverage": "best_effort",
+                        "complete": False,
+                    },
+                },
+            }
+            (output / "observability.json").write_bytes(json_bytes(redact(summary)))
 
 
 def main():

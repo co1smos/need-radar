@@ -67,6 +67,26 @@ CLI 输出 `status=success`，并在目录中保存有序 `snapshot.json`、解�
 
 脱敏覆盖敏感字段名、常见 token 形式以及 `Authorization`、`Cookie` 等凭证文本，是尽力而为而非通用秘密检测；未知格式仍可能漏过，因此不要提供真实凭证。无法解析的 JSON 也会保存不含原始输入的 `invalid_input` 记录及 lineage。
 
+## Ticket #2：本地 observability
+
+同一个离线命令也会保存 `selection.json`、`context.json`、`truncation.json`、`trace.jsonl`、`logs.jsonl` 和 `observability.json`。Trace 使用本地 trace/span/parent ID，保留脱敏后的阶段输入输出、prompt、合成模型调用、验证结果和报告；结构化阶段日志通过相同的 run/trace/span ID 关联，并记录阶段状态、耗时及 artifact/call lineage。SQLite 与 artifact lineage 共用稳定 run、snapshot、artifact、report 和 call ID。引用校验针对实际发送给模型的 prompt context。
+
+Langfuse candidate boundary 保留 `trace.jsonl` 中的脱敏本地 span，并在 `langfuse-otlp.jsonl` 逐条写入 OTLP/HTTP JSON trace requests；离线契约测试检查 OTLP envelope、普通确定性 span、prompt 输入以及 trace/parent context。它不调用 Langfuse SDK，也不验证远端 ingestion。`observability.json` 明示 remote status 为 `unverified`、外部 export disabled，且脱敏覆盖为 best-effort/incomplete；本实现不读取凭证、不连接远端。合成 end-to-end check：
+
+```sh
+demo_dir="$(mktemp -d)"
+python3 -m need_radar --output "$demo_dir"
+cat "$demo_dir/observability.json"
+```
+
+预期 CLI 状态为 `success`，observability 中 `remote_export.status` 为 `unverified`。这只证明本地 synthetic slice，不是远端验证。离线回归（含子进程网络/受保护路径拒绝、Langfuse 边界本地 sink、成功模型调用下的上下文截断诊断）：
+
+```sh
+PYTHONPATH=tests python3 -m unittest discover -s tests -p 'test_cli.py' -v
+```
+
+2026-10-08 实测：CLI 返回 `status=success`，本地写入 10 个 span 和 10 条结构化阶段日志；`remote_export.status=unverified`、`enabled=false`，未尝试远端验证。
+
 已运行的离线检查命令：
 
 ```sh

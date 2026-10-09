@@ -1,22 +1,34 @@
 import hashlib
 import json
+import os
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
+
+import need_radar.__main__ as tracer_cli
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class OfflineServeDemoTests(unittest.TestCase):
+    def run_subprocess(self, command, **options):
+        environment = {
+            "PYTHONPATH": os.pathsep.join([str(ROOT / "tests"), str(ROOT)]),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "TMPDIR": tempfile.gettempdir(),
+        }
+        return subprocess.run(command, env=environment, **options)
+
     def invoke_fixture(self, temporary_directory, fixture):
         fixture_path = Path(temporary_directory) / "fixture.json"
         output = Path(temporary_directory) / "run"
         fixture_path.write_text(json.dumps(fixture))
-        result = subprocess.run(
+        result = self.run_subprocess(
             [
                 sys.executable,
                 "-m",
@@ -37,10 +49,14 @@ class OfflineServeDemoTests(unittest.TestCase):
         fixture["model"] = model
         return self.invoke_fixture(temporary_directory, fixture)
 
+    def test_redaction_is_idempotent_after_markdown_escaping(self):
+        safe_value = tracer_cli.markdown_literal("password=[REDACTED]")
+        self.assertEqual(tracer_cli.redact(safe_value), safe_value)
+
     def test_demo_persists_snapshot_prompt_candidates_report_and_lineage(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             output = Path(temporary_directory) / "run"
-            result = subprocess.run(
+            result = self.run_subprocess(
                 [sys.executable, "-m", "need_radar", "--output", str(output)],
                 cwd=ROOT,
                 capture_output=True,
@@ -77,25 +93,246 @@ class OfflineServeDemoTests(unittest.TestCase):
 
             with sqlite3.connect(output / "lineage.sqlite3") as database:
                 stages = database.execute(
-                    "SELECT stage, status, input_stage, input_sha256, artifact_path, output_sha256 "
+                    "SELECT stage, status, input_stage, input_sha256, artifact_path, output_sha256, "
+                    "trace_id, span_id, artifact_id, input_artifact_id, call_id "
                     "FROM stages ORDER BY sequence"
                 ).fetchall()
             self.assertEqual(
                 [stage[:3] for stage in stages],
                 [
                     ("snapshot", "success", None),
-                    ("prompt", "success", "snapshot"),
-                    ("model", "success", "prompt"),
-                    ("validation", "success", "model"),
+                    ("selection", "success", "snapshot"),
+                    ("context_assembly", "success", "selection"),
+                    ("truncation", "success", "context_assembly"),
+                    ("prompt_render", "success", "truncation"),
+                    ("model_call", "success", "prompt_render"),
+                    ("validation", "success", "model_call"),
                     ("report", "success", "validation"),
                 ],
             )
+            trace_events = [json.loads(line) for line in (output / "trace.jsonl").read_text().splitlines()]
+            log_events = [json.loads(line) for line in (output / "logs.jsonl").read_text().splitlines()]
+            observations = json.loads((output / "observability.json").read_text())
+            run_span = next(event for event in trace_events if event["name"] == "run")
+            self.assertIsNone(run_span["parent_span_id"])
+            self.assertTrue({stage[7] for stage in stages} <= {event["id"] for event in trace_events})
+            self.assertEqual({event["trace_id"] for event in trace_events}, {observations["ids"]["trace_id"]})
+            self.assertTrue(all(event["parent_span_id"] == run_span["id"] for event in trace_events if event is not run_span))
+            self.assertEqual(len(log_events), len(trace_events))
+            self.assertEqual({event["span_id"] for event in log_events}, {event["id"] for event in trace_events})
+            self.assertTrue(all(event["event"] == "stage_completed" for event in log_events))
+            self.assertTrue(all(event["run_id"] == observations["ids"]["run_id"] for event in log_events))
+            self.assertTrue(all(event["trace_id"] == observations["ids"]["trace_id"] for event in log_events))
+            logged_stages = {event["stage"] for event in log_events}
+            self.assertTrue({"selection", "context_assembly", "truncation", "prompt_render", "model_call", "validation", "report"} <= logged_stages)
+            spans_by_id = {event["id"]: event for event in trace_events}
+            self.assertTrue(all(event["parent_span_id"] == spans_by_id[event["span_id"]]["parent_span_id"] for event in log_events))
+            self.assertEqual(observations["remote_export"]["status"], "unverified")
+            self.assertFalse(observations["remote_export"]["enabled"])
+            self.assertFalse(observations["coverage"]["redaction"]["complete"])
+            self.assertEqual(observations["ids"]["snapshot_id"], stages[0][8])
+            self.assertEqual(observations["ids"]["report_id"], stages[-1][8])
+            self.assertEqual(observations["ids"]["call_id"], stages[5][10])
             for index, stage in enumerate(stages):
                 with self.subTest(stage=stage[0]):
                     artifact = (output / stage[4]).read_bytes()
                     self.assertEqual(hashlib.sha256(artifact).hexdigest(), stage[5])
+                    self.assertEqual(stage[6], observations["ids"]["trace_id"])
+                    self.assertTrue(stage[7])
+                    self.assertTrue(stage[8])
                     if index:
                         self.assertEqual(stage[3], stages[index - 1][5])
+                        self.assertEqual(stage[9], stages[index - 1][8])
+
+    def test_successful_fake_model_call_exposes_upstream_context_truncation(self):
+        def faulty_truncation(context):
+            items = [dict(item) for item in context["items"]]
+            items[0]["text"] = "synthetic test truncation removed the source excerpt"
+            return {
+                **context,
+                "items": items,
+                "truncated": True,
+                "reason": "injected upstream context bug",
+            }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "run"
+            with mock.patch.object(tracer_cli, "truncate_context", side_effect=faulty_truncation):
+                status = tracer_cli.run(tracer_cli.DEFAULT_FIXTURE, output)
+
+            self.assertEqual(status, "invalid_output")
+            truncation = json.loads((output / "truncation.json").read_text())
+            self.assertTrue(truncation["truncated"])
+            self.assertEqual(truncation["reason"], "injected upstream context bug")
+            prompt = json.loads((output / "prompt.json").read_text())
+            self.assertNotIn("I manually copy the same project context", prompt["messages"][1]["content"])
+            model = json.loads((output / "model-response.json").read_text())
+            self.assertEqual(model["status"], "success")
+            validation = json.loads((output / "candidates.json").read_text())
+            self.assertEqual(validation["status"], "invalid_output")
+            self.assertIn("does not resolve to prompt context", validation["errors"][0])
+            trace_events = [json.loads(line) for line in (output / "trace.jsonl").read_text().splitlines()]
+            log_events = [json.loads(line) for line in (output / "logs.jsonl").read_text().splitlines()]
+            model_span = next(event for event in trace_events if event["name"] == "model_call")
+            truncation_span = next(event for event in trace_events if event["name"] == "truncation")
+            truncation_log = next(event for event in log_events if event["stage"] == "truncation")
+            model_log = next(event for event in log_events if event["stage"] == "model_call")
+            self.assertEqual(model_span["metadata"]["result_status"], "success")
+            self.assertEqual(truncation_span["output"]["value"]["reason"], "injected upstream context bug")
+            self.assertEqual(model_log["status"], "success")
+            self.assertEqual(truncation_log["attributes"]["details"]["reason"], "injected upstream context bug")
+            self.assertEqual(truncation_log["trace_id"], truncation_span["trace_id"])
+            self.assertEqual(truncation_log["span_id"], truncation_span["id"])
+
+    def test_span_export_failure_does_not_block_serve_and_is_reported(self):
+        class FailingSink:
+            def write(self, record):
+                raise OSError("synthetic local exporter failure")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "run"
+            with mock.patch("need_radar.observability.JsonlSpanSink", return_value=FailingSink()):
+                status = tracer_cli.run(tracer_cli.DEFAULT_FIXTURE, output)
+
+            self.assertEqual(status, "success")
+            self.assertTrue((output / "report.md").is_file())
+            observations = json.loads((output / "observability.json").read_text())
+            self.assertEqual(observations["local_export"]["status"], "failed")
+            self.assertFalse(observations["coverage"]["complete"])
+            self.assertTrue(observations["local_export"]["failures"])
+            self.assertEqual(observations["remote_export"]["status"], "unverified")
+
+    def test_langfuse_boundary_preserves_ordinary_spans_and_context_in_local_sink(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "run"
+            fixture = json.loads(tracer_cli.DEFAULT_FIXTURE.read_text())
+            fixture["items"][0]["text"] += " api_key=SYNTHETICONLY1234567890"
+            fixture_path = Path(temporary_directory) / "fixture.json"
+            fixture_path.write_text(json.dumps(fixture))
+            status = tracer_cli.run(fixture_path, output)
+
+            self.assertEqual(status, "success")
+            local_spans = [json.loads(line) for line in (output / "trace.jsonl").read_text().splitlines()]
+            requests = [json.loads(line) for line in (output / "langfuse-otlp.jsonl").read_text().splitlines()]
+            self.assertEqual(len(requests), len(local_spans))
+            exported_spans = []
+            for request in requests:
+                self.assertEqual(set(request), {"resourceSpans"})
+                resource_spans = request["resourceSpans"]
+                self.assertEqual(len(resource_spans), 1)
+                resource_attributes = {
+                    attribute["key"]: attribute["value"]["stringValue"]
+                    for attribute in resource_spans[0]["resource"]["attributes"]
+                }
+                self.assertEqual(resource_attributes["service.name"], "need-radar")
+                scope_spans = resource_spans[0]["scopeSpans"]
+                self.assertEqual(len(scope_spans), 1)
+                self.assertEqual(scope_spans[0]["scope"], {"name": "need_radar", "version": "1"})
+                self.assertEqual(len(scope_spans[0]["spans"]), 1)
+                exported_spans.extend(scope_spans[0]["spans"])
+
+            names = {record["name"] for record in exported_spans}
+            self.assertTrue({"selection", "context_assembly", "truncation", "prompt_render", "model_call", "validation", "report"} <= names)
+            run_span = next(record for record in exported_spans if record["name"] == "run")
+            self.assertNotIn("parentSpanId", run_span)
+            self.assertEqual(len(run_span["traceId"]), 32)
+            self.assertTrue(all(record["traceId"] == run_span["traceId"] for record in exported_spans))
+            self.assertTrue(all(len(record["spanId"]) == 16 for record in exported_spans))
+            for record in exported_spans:
+                self.assertGreater(int(record["traceId"], 16), 0)
+                self.assertGreater(int(record["spanId"], 16), 0)
+                self.assertEqual(record["kind"], 1)
+                self.assertEqual(record["status"]["code"], 1)
+                self.assertLessEqual(int(record["startTimeUnixNano"]), int(record["endTimeUnixNano"]))
+                self.assertTrue(all(
+                    set(attribute) == {"key", "value"}
+                    and set(attribute["value"]) == {"stringValue"}
+                    for attribute in record["attributes"]
+                ))
+            self.assertTrue(all(
+                record["parentSpanId"] == run_span["spanId"]
+                for record in exported_spans
+                if record is not run_span
+            ))
+            span_by_id = {record["spanId"]: record for record in exported_spans}
+            for local_span in local_spans:
+                exported_span = span_by_id[local_span["id"]]
+                self.assertEqual(exported_span["traceId"], local_span["trace_id"])
+                self.assertEqual(exported_span.get("parentSpanId"), local_span["parent_span_id"])
+                self.assertEqual(exported_span["name"], local_span["name"])
+            model_record = next(record for record in exported_spans if record["name"] == "model_call")
+            model_attributes = {attribute["key"]: attribute["value"]["stringValue"] for attribute in model_record["attributes"]}
+            model_input = json.loads(model_attributes["langfuse.observation.input"])
+            self.assertIn("UNTRUSTED SOURCE EVIDENCE", model_input["prompt"]["messages"][1]["content"])
+            self.assertNotIn("SYNTHETICONLY1234567890", json.dumps(requests))
+            self.assertNotIn("SYNTHETICONLY1234567890", (output / "trace.jsonl").read_text())
+            observations = json.loads((output / "observability.json").read_text())
+            self.assertEqual(observations["remote_export"]["status"], "unverified")
+            self.assertFalse(observations["remote_export"]["enabled"])
+            self.assertEqual(observations["remote_export"]["verification"], "not_attempted")
+            self.assertTrue((output / "report.md").is_file())
+
+    def test_offline_child_process_denies_network_credentials_and_live_state(self):
+        script = """
+import os
+import socket
+
+if any(any(marker in name.lower() for marker in ('secret', 'token', 'credential', 'api_key', 'password')) for name in os.environ):
+    raise SystemExit('credential environment was inherited')
+print('credentials=absent')
+
+try:
+    socket.socket()
+except PermissionError:
+    print('network=denied')
+else:
+    raise SystemExit('network=allowed')
+
+for name, path in (
+    ('credentials', '/home/ubuntu/projects/need-radar/credentials.env'),
+    ('live_state', '/home/ubuntu/.local/state/need-radar'),
+):
+    try:
+        open(path, 'rb')
+    except PermissionError:
+        print(name + '=denied')
+    else:
+        raise SystemExit(name + '=allowed')
+"""
+        sentinel_name = "NEED_RADAR_ISSUE_2_TEST_API_TOKEN"
+        self.assertNotIn(sentinel_name, os.environ)
+        os.environ[sentinel_name] = "synthetic parent token"
+        try:
+            result = self.run_subprocess(
+                [sys.executable, "-c", script],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            del os.environ[sentinel_name]
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("credentials=absent", result.stdout)
+        self.assertIn("network=denied", result.stdout)
+        self.assertIn("credentials=denied", result.stdout)
+        self.assertIn("live_state=denied", result.stdout)
+
+    def test_synthetic_end_to_end_output_redacts_all_trace_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "run"
+            result = self.run_subprocess(
+                [sys.executable, "-m", "need_radar", "--output", str(output)],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("status=success", result.stdout)
+            for path in output.iterdir():
+                if path.is_file():
+                    self.assertNotIn(b"SYNTHETICONLY1234567890", path.read_bytes(), path.name)
+            observations = json.loads((output / "observability.json").read_text())
+            self.assertEqual(observations["remote_export"]["status"], "unverified")
 
     def test_empty_model_response_is_not_an_extraction_failure(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -239,7 +476,7 @@ class OfflineServeDemoTests(unittest.TestCase):
     def test_untrusted_source_stays_in_user_data_and_secret_is_redacted(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             output = Path(temporary_directory) / "run"
-            result = subprocess.run(
+            result = self.run_subprocess(
                 [sys.executable, "-m", "need_radar", "--output", str(output)],
                 cwd=ROOT,
                 capture_output=True,
@@ -269,7 +506,7 @@ class OfflineServeDemoTests(unittest.TestCase):
             fixture_path = Path(temporary_directory) / "fixture.json"
             output = Path(temporary_directory) / "run"
             fixture_path.write_text(json.dumps(fixture))
-            result = subprocess.run(
+            result = self.run_subprocess(
                 [sys.executable, "-m", "need_radar", "--fixture", str(fixture_path), "--output", str(output)],
                 cwd=ROOT,
                 capture_output=True,
@@ -457,7 +694,7 @@ class OfflineServeDemoTests(unittest.TestCase):
                 fixture_path = Path(temporary_directory) / "fixture.json"
                 output = Path(temporary_directory) / "run"
                 fixture_path.write_bytes(invalid_input)
-                result = subprocess.run(
+                result = self.run_subprocess(
                     [
                         sys.executable,
                         "-m",
@@ -496,7 +733,7 @@ class OfflineServeDemoTests(unittest.TestCase):
     def test_prompt_evidence_matches_the_redacted_frozen_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             output = Path(temporary_directory) / "run"
-            result = subprocess.run(
+            result = self.run_subprocess(
                 [sys.executable, "-m", "need_radar", "--output", str(output)],
                 cwd=ROOT,
                 capture_output=True,
@@ -512,7 +749,7 @@ class OfflineServeDemoTests(unittest.TestCase):
     def test_resolved_system_prompt_contains_target_and_v0_strategy(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             output = Path(temporary_directory) / "run"
-            result = subprocess.run(
+            result = self.run_subprocess(
                 [sys.executable, "-m", "need_radar", "--output", str(output)],
                 cwd=ROOT,
                 capture_output=True,
