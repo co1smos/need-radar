@@ -684,6 +684,36 @@ for name, path in (
                     self.assertNotIn(b"ACTUAL_SYNTHETIC_SECRET", content, artifact.name)
                     self.assertNotIn(b"INVENTED_SYNTHETIC_SECRET", content, artifact.name)
 
+            source_case = Path(temporary_directory) / "source-result-case"
+            source_case.mkdir()
+            source_fixture = json.loads(
+                (ROOT / "fixtures" / "source_results" / "synthetic_reddit_x.json").read_text()
+            )
+            source_fixture["source_results"]["x"]["posts"][0]["text"] = "password=ACTUAL_SYNTHETIC_SECRET"
+            source_fixture["model"] = {
+                "status": "synthetic_response",
+                "response": [{
+                    "title": "Synthetic unsupported finding",
+                    "friction": "Synthetic unsupported friction",
+                    "evidence": [{
+                        "item_id": "x:100000000000000001",
+                        "excerpt": "password=INVENTED_SYNTHETIC_SECRET",
+                    }],
+                }],
+            }
+            source_result, source_output = self.invoke_fixture(source_case, source_fixture)
+
+            self.assertEqual(source_result.returncode, 1)
+            self.assertIn("status=invalid_output", source_result.stdout)
+            source_candidates = json.loads((source_output / "candidates.json").read_text())
+            self.assertEqual(source_candidates["status"], "invalid_output")
+            self.assertEqual(source_candidates["candidates"], [])
+            for artifact in source_output.iterdir():
+                if artifact.is_file():
+                    content = artifact.read_bytes()
+                    self.assertNotIn(b"ACTUAL_SYNTHETIC_SECRET", content, artifact.name)
+                    self.assertNotIn(b"INVENTED_SYNTHETIC_SECRET", content, artifact.name)
+
     def test_malformed_json_persists_sanitized_failure_lineage(self):
         invalid_inputs = (
             b'{"password":"SYNTHETIC_MALFORMED_SECRET_98765","items":',

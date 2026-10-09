@@ -501,7 +501,6 @@ def run(fixture_path, output):
                         "items": normalization["items"],
                         "model": fixture.get("model"),
                     }
-                    raw_fixture = fixture
 
                 if not redaction_failed:
                     errors = fixture_errors(fixture)
