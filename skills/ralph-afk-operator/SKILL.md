@@ -35,6 +35,14 @@ npm run ralph -- \
 
 Use repository-appropriate `--focused-test`, `--final-test`, and `--integration-test` overrides when the defaults are not valid.
 
+## Authorization without approval loops
+
+Read the standing delegation in `AGENTS.md` before supervising a run. For already-approved tickets, **act within their bounded offline scope, then report**: do not pause for repeated owner consent to edit code, run offline tests, replay previously owner-authorized sanitized private inputs locally, review, or merge accepted candidates through Ralph. #9/#19 already specify owner-authorized retention for adapter use; #20's bounded local verification does not need duplicate owner approval. Inspect the actual issue contract and existing approval record before labeling work blocked.
+
+If a worker claims an authorization blocker, verify the specific missing fact and whether earlier issue approvals already cover it. Investigate readily accessible third-party terms without requiring the owner to supply links. Unknown supplier rights must be labeled **unverified**, never certified or used to justify public/live activation; an explicit prohibition, expired retention, or genuinely missing permission still blocks the affected action. Continue independent work instead of converting one ticket's uncertainty into a global stop.
+
+Notify the owner **after** bounded reversible steps, with commit/issue IDs, tests, data handling, unresolved risks, and exact rollback instructions. Seek approval **before** unapproved spend, new live calls, external model disclosure, publishing/sending, exports, schedule activation, credential/retention changes, destructive operations, or a consequential product decision. Rollback of a Git commit cannot undo irreversible side effects. Preserve Ralph's existing implementer/reviewer/merger authority boundaries.
+
 ## Monitor
 
 Inspect the orchestrator terminal and owned Herdr panes on a bounded cadence: 15 minutes initially; after successive checks without material progress, wait 30, then 60, then 120 minutes (cap at 120). A new commit, completed review round, changed acceptance state, or finished ticket resets the next interval to 15 minutes. Process exit or a `needs_triage` result should be handled on the next observation, not left waiting for owner approval.

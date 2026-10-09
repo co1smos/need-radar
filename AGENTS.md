@@ -10,6 +10,16 @@ The scope of each ticket comes from its current acceptance criteria and authoriz
 
 Run `npm test` and `npm run typecheck:sandcastle-workflow` before starting the full workflow. Ralph reviews only the fixed acceptance criteria, stores nonblocking follow-ups, and escalates after the 20-round triage limit. Check real process/run artifacts, not Herdr badges; close only panes owned by completed runs.
 
+## Autonomous offline execution (owner update, 2026-10-09)
+
+**Default to doing bounded, reversible work and reporting afterward, not requesting approval for each step.** An already-approved `ready-for-agent` ticket is sufficient authorization for its offline implementation, local tests, documentation, committed candidate changes, and Ralph's existing independent review/accepted-merge process. Preserve worktrees and Git history; report changes, tests, remaining uncertainty, any side effects, and the exact revert/cleanup path. Do not ask for duplicate authorization already documented in an issue or this repository.
+
+This delegation includes **strictly local, network/credential/live-state-denied inspection and replay of existing sanitized private recordings** when their original issue expressly retained them for adapter development. In particular, #9 and #19 already record owner permission to retain these artifacts for adapter use; #20 does not need a second owner sign-off for that same scoped offline use. Keep source and derived content private and Git-excluded, respect existing retention/revocation, and never paste raw payloads into issues, prompts sent to remote models, logs, or reports. If a known provider/source restriction prohibits this use or a retention limit is reached, do not proceed.
+
+**Research missing facts instead of escalating routine uncertainty.** Check earlier approvals, authoritative repo evidence, and applicable public terms first. Distinguish *owner authorization* from *independent provider/source rights*: a missing legal certification is not proof of a ban, but it is also not proof of permission. For bounded internal offline validation, record any unverified terms explicitly; do not certify them, broaden use, export/distribute content, or clear downstream live gates. Escalate with a concrete evidence-backed conflict if an applicable restriction, actual ambiguity requiring a rights decision, or a necessary unavailable permission blocks the scoped work.
+
+Require explicit owner approval before **new external or hard-to-undo effects** outside the already-approved ticket: new live acquisitions or remote model calls on private source data, spending beyond approved limits, publishing/Discord sends, external exports, schedules, credentials or global settings, changes to retention/deletion, destructive work, production promotion, or important product-direction tradeoffs. Git revert can undo code but cannot undo API charges, external disclosure, or a delivered message. Do not equate `ready-for-agent` with authorization for those actions.
+
 ## Read first
 
 - `docs/owner-brief.md`: authoritative owner decisions, tentative dependencies, and the review mandate.
@@ -21,7 +31,7 @@ Run `npm test` and `npm run typecheck:sandcastle-workflow` before starting the f
 
 1. Simplicity first. Reuse existing tools; avoid frameworks, duplicate infrastructure, and speculative extensibility.
 2. Prefer deterministic execution over LLMs where appropriate. Acquisition must not use an LLM-driven browser loop by default.
-3. The owner sets intent and reviews important tradeoffs; AI does implementation when separately authorized.
+3. The owner sets intent and reviews important tradeoffs. The approved offline ticket/frontier is the implementation authorization; AI executes in-scope reversible work without asking for separate per-step approval, then reports outcomes and rollback paths.
 4. Observability covers deterministic transformations AND LLM calls, including evidence and prompt provenance. A successful exit is not proof of data quality.
 5. Serve/shadow changes exactly one experiment dimension at a time: source, retrieval, or extraction. The initial comparison changes extraction only.
 6. Both arms use the SAME fixed evaluation objective, rubric, evidence rules, and judge configuration. No arm-specific scoring and no personalized-interest/recommendation feature.

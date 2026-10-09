@@ -21,6 +21,10 @@ No personal-interest recommender or in-product owner-feedback system. The owner 
 - Hermes is the preferred scheduler/agent/Discord entry point for now, subject to actual installed capabilities. No need to reproduce its gateway or scheduling framework.
 - Failures must be diagnosed, including silent failures and incorrect deterministic inputs. AI may later propose repairs; production mutation/autodeploy is not authorized.
 
+### Operating authorization update (2026-10-09; supersedes repeated offline sign-off)
+
+For already-approved `ready-for-agent` tickets, the owner delegates bounded reversible offline implementation, local verification, and existing acceptance-gated integration without per-step permission requests. Execute first, report the work, evidence, remaining uncertainty and how to revert. Existing owner-authorized sanitized recordings retained for adapter use (#9/#19) may be used for strictly private, offline #20 adapter validation without duplicate owner approval, subject to known retention and applicable provider/source restrictions. An unverified third-party right must be labeled unverified and independently researched; it is not certified by owner authorization. Separate authorization remains necessary for newly scoped live/external effects, sensitive disclosure, meaningful new spend, irreversible mutation, and product-direction changes. See `AGENTS.md` for the operative policy.
+
 ## 3. Fixed evaluation goal (owner approved)
 
 Both serve and shadow must ALWAYS use the same evaluation standard within a comparison:
