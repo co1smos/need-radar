@@ -48,11 +48,27 @@ def assert_guards():
         raise AssertionError(f"protected state was accessible: {Path(path).name}")
 
 
+def assert_child_guards(environment):
+    probes = (
+        "import socket; socket.socket()",
+        "open('/home/ubuntu/projects/need-radar/credentials.env', 'rb')",
+        "open('/home/ubuntu/.local/state/need-radar/assessment/state.json', 'rb')",
+    )
+    for probe in probes:
+        result = subprocess.run(
+            [sys.executable, "-c", probe], cwd=ROOT, env=environment,
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+        if result.returncode == 0 or "disabled in tests" not in result.stderr:
+            raise AssertionError("subprocess offline guard did not deny a protected operation")
+
+
 def main():
     if not HERMES_TMPDIR.is_dir():
         raise RuntimeError(f"Hermes TMPDIR is unavailable: {HERMES_TMPDIR}")
     assert_guards()
     environment = safe_environment()
+    assert_child_guards(environment)
     with tempfile.TemporaryDirectory(dir=HERMES_TMPDIR) as temporary_directory:
         root = Path(temporary_directory)
         serve_fixture = json.loads((ROOT / "fixtures" / "synthetic_demo.json").read_text(encoding="utf-8"))
@@ -94,8 +110,15 @@ def main():
                 "shared_settings": shared_settings,
                 "shadow_model": {
                     "status": "synthetic_response",
-                    "response": [],
+                    "response": [{
+                        **serve_fixture["model"]["response"][0],
+                        "friction": "A builder manually reconstructs context after each reset.",
+                    }],
                     "usage": {"requests": 1, "tokens": 7},
+                },
+                "shadow_assessment": {
+                    "status": "synthetic_response",
+                    "response": serve_fixture["judge"]["response"],
                 },
             },
         }
@@ -122,6 +145,7 @@ def main():
         if result.returncode != 0:
             raise RuntimeError(result.stderr or result.stdout)
         comparison = json.loads((shadow / "comparison.json").read_text(encoding="utf-8"))
+        assessment_comparison = comparison["assessment_comparison"]
         serve_prompt = json.loads((serve / "prompt.json").read_text(encoding="utf-8"))
         v1_prompt = json.loads((shadow / "v1" / "prompt.json").read_text(encoding="utf-8"))
         serve_snapshot = json.loads((serve / "snapshot.json").read_text(encoding="utf-8"))
@@ -173,6 +197,17 @@ def main():
                 "comparison": comparison,
                 "serve_report_preserved": sha256(report_path) == report_hash,
             }, sort_keys=True))
+        if assessment_comparison["status"] != "descriptive":
+            raise AssertionError(json.dumps(assessment_comparison, sort_keys=True))
+        if len(assessment_comparison["matching"]["uncertain_matches"]) != 1:
+            raise AssertionError("post-score comparison did not preserve the ambiguous candidate match")
+        if any(
+            assessment_comparison["arms"][arm]["resources"]["cost_per_eligible_usd"] != "n/a"
+            for arm in ("v0", "v1")
+        ):
+            raise AssertionError("zero-eligible cost denominator was not n/a")
+        if comparison["assessment_comparison_report_sha256"] != sha256(shadow / "comparison.md"):
+            raise AssertionError("post-score canonical report hash does not resolve")
         if (shadow / "report.md").exists():
             raise AssertionError("shadow runner published a report")
         for path in shadow.rglob("*"):
@@ -185,12 +220,17 @@ def main():
             "shadow_status": comparison["status"],
             "v0_candidates": comparison["arms"]["v0"]["candidate_count"],
             "v1_candidates": comparison["arms"]["v1"]["candidate_count"],
+            "post_score_status": assessment_comparison["status"],
+            "eligible_counts": [assessment_comparison["arms"][arm]["eligible_count"] for arm in ("v0", "v1")],
+            "exact_overlap": assessment_comparison["matching"]["exact_overlap_count"],
+            "uncertain_matches": len(assessment_comparison["matching"]["uncertain_matches"]),
+            "cost_per_eligible": [assessment_comparison["arms"][arm]["resources"]["cost_per_eligible_usd"] for arm in ("v0", "v1")],
             "parity": comparison["parity"],
             "ordered_snapshot_sha256": snapshot_hash,
             "context_sha256": context_hash,
             "serve_report_preserved": True,
             "shadow_publication": comparison["publication"],
-            "network_credential_live_state_guards": "denied",
+            "network_credential_live_state_guards": "denied_in_process_and_subprocess",
             "verification_limit": comparison["verification_limit"],
         }, sort_keys=True))
 
