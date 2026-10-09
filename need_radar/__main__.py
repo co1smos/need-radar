@@ -1171,9 +1171,9 @@ def run(fixture_path, output):
                     inputs={"validation_id": validation_meta["artifact_id"], "validation": validation},
                     attributes={"canonical": True, "result_status": status},
                 ) as span:
-                    source_coverage = snapshot.get("source_normalization", {}).get("coverage")
+                    report_source_coverage = snapshot.get("source_normalization", {}).get("coverage")
                     report = render_report(
-                        status, candidates, errors, source_coverage, duplicate_groups,
+                        status, candidates, errors, report_source_coverage, duplicate_groups,
                     )
                     report_meta = persist_stage(
                         output,

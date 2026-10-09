@@ -240,6 +240,28 @@ class SourceAdapterTests(unittest.TestCase):
             self.assertEqual(validation["status"], "invalid_model_output")
             self.assertFalse((output / "snapshot.json").exists())
 
+    def test_normalizer_failure_persists_per_source_coverage(self):
+        failed = json.loads(json.dumps(self.fixture))
+        failed["normalization_model"]["status"] = "timeout"
+        failed["normalization_model"]["error"] = "synthetic timeout"
+        hermes_tmp = Path.home() / ".hermes" / "cache" / "scratch"
+        with tempfile.TemporaryDirectory(dir=hermes_tmp) as directory:
+            root = Path(directory)
+            fixture_path = self.write_fixture(root, failed)
+            output = root / "run"
+            result = self.run_cli(fixture_path, output, hermes_tmp)
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("status=normalization_failure", result.stdout)
+            validation = json.loads((output / "source-normalization.json").read_text())
+
+        self.assertEqual(validation["status"], "normalization_failure")
+        for source in ("reddit", "x"):
+            source_coverage = validation["coverage"]["sources"][source]
+            self.assertEqual(source_coverage["status"], "partial")
+            self.assertGreater(source_coverage["failure_count"], 0)
+            self.assertIn("normalizer call failed: synthetic timeout", source_coverage["failure_reasons"])
+
     def test_malformed_source_rows_are_skipped_with_partial_provenance(self):
         partial = json.loads(json.dumps(self.fixture))
         partial["source_results"]["reddit"]["posts"][0]["comments"].append(None)
