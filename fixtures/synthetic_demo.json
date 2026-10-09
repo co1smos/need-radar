@@ -26,5 +26,47 @@
         ]
       }
     ]
+  },
+  "judge": {
+    "status": "synthetic_response",
+    "response": [
+      {
+        "verdict": "NEEDS_EVIDENCE",
+        "reason": "The excerpt grounds repeated manual context copying, but does not establish a consequential burden or a bounded intervention.",
+        "evidence_ids": ["reddit:fixture-1"],
+        "dimensions": {
+          "friction_clarity": {
+            "status": "supported",
+            "reason": "The author explicitly describes manually copying project context between coding agents.",
+            "evidence_ids": ["reddit:fixture-1"]
+          },
+          "pain_value": {
+            "status": "supported",
+            "reason": "The excerpt says session resets make setup repeat, establishing repeated effort but not its consequence.",
+            "evidence_ids": ["reddit:fixture-1"]
+          },
+          "evidence_size": {
+            "status": "unknown",
+            "reason": "One synthetic report shows repetition but does not establish its frequency or practical burden.",
+            "evidence_ids": ["reddit:fixture-1"]
+          },
+          "solvability": {
+            "status": "unknown",
+            "reason": "The excerpt does not identify a bounded intervention or show that software would improve the workflow.",
+            "evidence_ids": ["reddit:fixture-1"]
+          },
+          "scope_fit": {
+            "status": "supported",
+            "reason": "The described workflow concerns builders using coding agents.",
+            "evidence_ids": ["reddit:fixture-1"]
+          }
+        },
+        "uncertainties": [
+          "The frequency and consequence of repeated setup are unknown.",
+          "A bounded intervention is not described.",
+          "Population prevalence is unknown and is not inferred from one report."
+        ]
+      }
+    ]
   }
 }
