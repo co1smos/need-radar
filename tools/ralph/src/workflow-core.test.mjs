@@ -102,6 +102,17 @@ test("round artifacts remain distinct across correction rounds", () => {
   assert.notDeepEqual(roundArtifactPaths("/tmp/t", 1), roundArtifactPaths("/tmp/t", 2));
 });
 
+test("initial round can inspect and reuse an existing committed candidate", () => {
+  const oldBase = "a".repeat(40);
+  const existingHead = "b".repeat(40);
+  const fresh = buildImplementerRoundContext({ round: 1, currentHead: oldBase });
+  assert.match(fresh, /Create the first candidate commit/);
+  const resumed = buildImplementerRoundContext({ round: 1, currentHead: oldBase, existingCandidateHead: existingHead });
+  assert.match(resumed, new RegExp(existingHead));
+  assert.match(resumed, /reuse that committed HEAD without making a dummy commit/);
+  assert.match(resumed, /inspect.*diff/i);
+});
+
 test("correction context contains exact review/test evidence", () => {
   const text = buildImplementerRoundContext({ round: 2, currentHead: "abc", reviewerFindings: ["fix edge"], focusedTestEvidence: "FAIL x" });
   assert.match(text, /fix edge/);

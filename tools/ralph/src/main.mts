@@ -185,6 +185,13 @@ async function runTicket(issue: Issue, iteration: number, baseSha: string, provi
   const top = await execInWorktree("git rev-parse --show-toplevel");
   if (top.exitCode !== 0) throw new Error(top.stderr || top.stdout);
   const worktreePath = top.stdout.trim();
+  const startingHead = await execInWorktree("git rev-parse HEAD");
+  if (startingHead.exitCode !== 0) throw new Error(startingHead.stderr || startingHead.stdout);
+  const candidateBranchIsCurrent = await execInWorktree(`git merge-base --is-ancestor ${shellQuote(baseSha)} HEAD`);
+  if (candidateBranchIsCurrent.exitCode !== 0) {
+    throw new Error(`candidate branch ${branch} does not contain current base ${baseSha}; preserve its commits and merge/rebase the current base into it before retrying`);
+  }
+  const existingCandidateHead = startingHead.stdout.trim();
   const templates = {
     implementer: await readFile(join(sourceDir, "implementer-prompt.md"), "utf8"),
     reviewer: await readFile(join(sourceDir, "reviewer-prompt.md"), "utf8"),
@@ -272,7 +279,7 @@ async function runTicket(issue: Issue, iteration: number, baseSha: string, provi
     await writeFile(artifacts.implementerPromptPath, fillTemplate(templates.implementer, {
       ISSUE_NUMBER: issue.number, ISSUE_TITLE: issue.title, ISSUE_BODY: issue.body,
       BASE_SHA: baseSha, BRANCH: branch,
-      ROUND_CONTEXT: buildImplementerRoundContext({ round, currentHead: candidateHead, reviewerFindings, focusedTestEvidence }),
+      ROUND_CONTEXT: buildImplementerRoundContext({ round, currentHead: candidateHead, existingCandidateHead, reviewerFindings, focusedTestEvidence }),
     }));
     await copyFile(join(sourceDir, "implementer-schema.json"), artifacts.implementerSchemaPath);
     const implementer = await runPhase({

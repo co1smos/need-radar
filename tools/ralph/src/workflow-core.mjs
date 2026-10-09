@@ -196,7 +196,10 @@ export function roundArtifactPaths(ticketRoot, round) {
   };
 }
 
-export function buildImplementerRoundContext({ round, currentHead, reviewerFindings, focusedTestEvidence }) {
+export function buildImplementerRoundContext({ round, currentHead, existingCandidateHead, reviewerFindings, focusedTestEvidence }) {
+  if (round === 1 && existingCandidateHead && existingCandidateHead !== currentHead) {
+    return `This is a fresh review of an existing candidate branch at ${existingCandidateHead} (base: ${currentHead}).\nInspect the committed diff against the base and run relevant tests before changing anything.\nIf the existing candidate already satisfies the issue, you may reuse that committed HEAD without making a dummy commit; report the actual HEAD as completed.\nIf corrections are needed, implement and commit them on this branch. Never pretend fixture-only acceptance proves live readiness.`;
+  }
   if (round === 1) return "This is the initial implementation round. Create the first candidate commit.";
   return `This is correction round ${round}.\nCurrent candidate HEAD: ${currentHead}\n\nExact reviewer findings from the previous round:\n${JSON.stringify(reviewerFindings)}\n\nPrevious controller-owned focused-test evidence:\n${focusedTestEvidence.trimEnd()}\n\nCorrect these findings and create a new commit on top of the current candidate HEAD.`;
 }
