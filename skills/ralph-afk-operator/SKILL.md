@@ -11,7 +11,7 @@ Operate the repository's Ralph orchestrator. Do not reimplement its scheduler, t
 
 1. Load/use the `herdr` skill before inspecting or controlling Herdr.
 2. Work from the target repository and verify `HERDR_ENV=1`.
-3. Confirm no Ralph orchestrator already owns the repository. Do not start a second one.
+3. Confirm no Ralph orchestrator already owns the repository. Do not start a second one. Inspect existing `ralph/issue-*` candidate branches from previous runs; preserve committed work and safely merge/rebase the target base into candidates that predate it before restarting. Never force-reset or delete WIP branches.
 4. Choose the harness, model, and effort explicitly for all three roles. V1 supports `codex` only; `claude-code` and `pi` are reserved startup values for later implementation.
 5. Run preflight first, then start the same command without `--preflight`.
    Inspect the role prompt templates for stale single-ticket authorization restrictions before launch; scheduler preflight does not validate prompt scope. Repeated merger rejection after accepted reviews can indicate a stale merger prompt rather than an implementation failure.
@@ -65,7 +65,7 @@ When the run is genuinely unhealthy:
 4. If the evidence suggests quota or a transient provider condition, wait/back off before retrying.
 5. Restart exactly one orchestrator with the same explicit harness/model/effort routing.
 
-Do not restart one ticket with a second orchestrator. Do not build phase-level resume logic. Open GitHub issues are intentionally eligible to run again after a whole-run restart.
+Do not restart one ticket with a second orchestrator. Do not build phase-level resume logic. Open GitHub issues are intentionally eligible to run again after a whole-run restart. A first round can reuse a prior committed candidate already descended from the new base; it must still pass tests and fresh read-only review. Do not reimplement it blindly or fabricate a no-op commit.
 
 ## Triage
 

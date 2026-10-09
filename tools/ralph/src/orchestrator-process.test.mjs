@@ -1,13 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, mkdir, writeFile, cp, access, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, cp, access, symlink, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 
 const sourceDir = fileURLToPath(new URL(".", import.meta.url));
 const tsxCli = fileURLToPath(import.meta.resolve("tsx/cli"));
+// Resolve from the test module, not process.cwd(): ticket worktrees do not have their own node_modules.
+const sandcastlePackage = dirname(dirname(fileURLToPath(import.meta.resolve("@ai-hero/sandcastle"))));
 
 async function exists(path) {
   try { await access(path); return true; } catch { return false; }
@@ -20,7 +22,8 @@ async function makeFixture({ existingLock = false, legacyLock = false } = {}) {
     await cp(join(sourceDir, file), join(root, "tools", "ralph", "src", file));
   }
   await writeFile(join(root, "package.json"), JSON.stringify({ type: "module" }));
-  await symlink(join(process.cwd(), "node_modules"), join(root, "node_modules"), "dir");
+  await mkdir(join(root, "node_modules", "@ai-hero"), { recursive: true });
+  await symlink(sandcastlePackage, join(root, "node_modules", "@ai-hero", "sandcastle"), "dir");
   await mkdir(join(root, "bin"));
   await mkdir(join(root, "codex-home"));
   await writeFile(join(root, "codex-home", "config.toml"), 'model_provider = "fake"\n[model_providers.fake]\nenv_key = "FAKE_API_KEY"\n');
@@ -70,6 +73,23 @@ function runMain(root) {
     child.on("close", (code) => resolveResult({ code, stdout, stderr }));
   });
 }
+
+test("fixture resolves packages when tests run outside a checkout without node_modules", async () => {
+  // Run directly rather than recursively calling node --test, which Node skips.
+  if (process.env.RALPH_PORTABILITY_TEST_CHILD === "1") return;
+  const cwd = await mkdtemp(join(tmpdir(), "ralph-test-cwd-"));
+  try {
+    const env = { ...process.env, RALPH_PORTABILITY_TEST_CHILD: "1" };
+    // The parent test runner sets NODE_TEST_CONTEXT; a standalone child must not inherit its IPC protocol.
+    delete env.NODE_TEST_CONTEXT;
+    const result = execFileSync(process.execPath, [fileURLToPath(import.meta.url)], {
+      cwd, encoding: "utf8", timeout: 30_000, env,
+    });
+    assert.match(result, /# pass 4\b/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
 
 test("fatal orchestrator error exits nonzero and releases singleton lock", async () => {
   const root = await makeFixture();
