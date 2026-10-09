@@ -17,11 +17,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class OfflineServeDemoTests(unittest.TestCase):
     def run_subprocess(self, command, **options):
-        environment = os.environ.copy()
-        guarded_paths = [str(ROOT / "tests"), str(ROOT)]
-        if environment.get("PYTHONPATH"):
-            guarded_paths.append(environment["PYTHONPATH"])
-        environment["PYTHONPATH"] = os.pathsep.join(guarded_paths)
+        environment = {
+            "PYTHONPATH": os.pathsep.join([str(ROOT / "tests"), str(ROOT)]),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "TMPDIR": tempfile.gettempdir(),
+        }
         return subprocess.run(command, env=environment, **options)
 
     def invoke_fixture(self, temporary_directory, fixture):
@@ -274,7 +274,12 @@ class OfflineServeDemoTests(unittest.TestCase):
 
     def test_offline_child_process_denies_network_credentials_and_live_state(self):
         script = """
+import os
 import socket
+
+if any(any(marker in name.lower() for marker in ('secret', 'token', 'credential', 'api_key', 'password')) for name in os.environ):
+    raise SystemExit('credential environment was inherited')
+print('credentials=absent')
 
 try:
     socket.socket()
@@ -294,13 +299,20 @@ for name, path in (
     else:
         raise SystemExit(name + '=allowed')
 """
-        result = self.run_subprocess(
-            [sys.executable, "-c", script],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-        )
+        sentinel_name = "NEED_RADAR_ISSUE_2_TEST_API_TOKEN"
+        self.assertNotIn(sentinel_name, os.environ)
+        os.environ[sentinel_name] = "synthetic parent token"
+        try:
+            result = self.run_subprocess(
+                [sys.executable, "-c", script],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            del os.environ[sentinel_name]
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("credentials=absent", result.stdout)
         self.assertIn("network=denied", result.stdout)
         self.assertIn("credentials=denied", result.stdout)
         self.assertIn("live_state=denied", result.stdout)
