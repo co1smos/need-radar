@@ -14,6 +14,7 @@ import {
   selectReadyIssues,
   summarizeSettled,
   successfulCandidates,
+  synchronizeCandidateBase,
   unsuccessfulIssueNumbers,
   updateReviewState,
   validateImplementerReceipt,
@@ -111,6 +112,69 @@ test("initial round can inspect and reuse an existing committed candidate", () =
   assert.match(resumed, new RegExp(existingHead));
   assert.match(resumed, /reuse that committed HEAD without making a dummy commit/);
   assert.match(resumed, /inspect.*diff/i);
+});
+
+test("already current candidate is not changed before fresh review", async () => {
+  const sha = "a".repeat(40);
+  const seen = [];
+  const exec = async (command) => {
+    seen.push(command);
+    return command === "git rev-parse HEAD"
+      ? { exitCode: 0, stdout: sha, stderr: "" }
+      : { exitCode: 0, stdout: "", stderr: "" };
+  };
+  assert.equal(await synchronizeCandidateBase({ baseSha: sha, branch: "ralph/issue-4", exec }), sha);
+  assert.deepEqual(seen, ["git rev-parse HEAD", `git merge-base --is-ancestor ${sha} HEAD`]);
+});
+
+test("existing candidate automatically advances after a prior iteration moved main", async () => {
+  const oldHead = "a".repeat(40);
+  const base = "b".repeat(40);
+  const merged = "c".repeat(40);
+  let index = 0;
+  const calls = [
+    ["git rev-parse HEAD", 0, oldHead],
+    [`git merge-base --is-ancestor ${base} HEAD`, 1, ""],
+    ["git status --porcelain", 0, ""],
+    [`git merge --no-edit ${base}`, 0, "Merge made by ort"],
+    ["git rev-parse HEAD", 0, merged],
+    [`git merge-base --is-ancestor ${base} HEAD`, 0, ""],
+  ];
+  const exec = async (command) => {
+    const [expected, exitCode, stdout] = calls[index++];
+    assert.equal(command, expected);
+    return { exitCode, stdout, stderr: "" };
+  };
+  assert.equal(await synchronizeCandidateBase({ baseSha: base, branch: "ralph/issue-14", exec }), merged);
+  assert.equal(index, calls.length);
+});
+
+test("dirty or conflicting existing candidates stay preserved instead of being reset", async () => {
+  const base = "b".repeat(40);
+  const initial = [
+    { exitCode: 0, stdout: "a".repeat(40), stderr: "" },
+    { exitCode: 1, stdout: "", stderr: "" },
+  ];
+  const dirtyCalls = [];
+  const dirtyExec = async (command) => {
+    dirtyCalls.push(command);
+    return initial[dirtyCalls.length - 1] || { exitCode: 0, stdout: " M saved.patch", stderr: "" };
+  };
+  await assert.rejects(synchronizeCandidateBase({ baseSha: base, branch: "ralph/issue-13", exec: dirtyExec }), /dirty candidate branch/);
+  assert.equal(dirtyCalls.length, 3);
+
+  const seen = [];
+  const conflictExec = async (command) => {
+    seen.push(command);
+    if (command === "git rev-parse HEAD") return { exitCode: 0, stdout: "a".repeat(40), stderr: "" };
+    if (command.startsWith("git merge-base")) return { exitCode: 1, stdout: "", stderr: "" };
+    if (command === "git status --porcelain") return { exitCode: 0, stdout: "", stderr: "" };
+    if (command.startsWith("git merge --no-edit")) return { exitCode: 1, stdout: "", stderr: "CONFLICT" };
+    if (command === "git merge --abort") return { exitCode: 0, stdout: "", stderr: "" };
+    throw new Error(`unexpected command ${command}`);
+  };
+  await assert.rejects(synchronizeCandidateBase({ baseSha: base, branch: "ralph/issue-14", exec: conflictExec }), /merge failed: CONFLICT/);
+  assert.equal(seen.at(-1), "git merge --abort");
 });
 
 test("correction context contains exact review/test evidence", () => {

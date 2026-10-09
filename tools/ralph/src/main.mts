@@ -20,6 +20,7 @@ import {
   shellQuote,
   summarizeSettled,
   successfulCandidates,
+  synchronizeCandidateBase,
   unsuccessfulIssueNumbers,
   updateReviewState,
   validateImplementerReceipt,
@@ -185,13 +186,9 @@ async function runTicket(issue: Issue, iteration: number, baseSha: string, provi
   const top = await execInWorktree("git rev-parse --show-toplevel");
   if (top.exitCode !== 0) throw new Error(top.stderr || top.stdout);
   const worktreePath = top.stdout.trim();
-  const startingHead = await execInWorktree("git rev-parse HEAD");
-  if (startingHead.exitCode !== 0) throw new Error(startingHead.stderr || startingHead.stdout);
-  const candidateBranchIsCurrent = await execInWorktree(`git merge-base --is-ancestor ${shellQuote(baseSha)} HEAD`);
-  if (candidateBranchIsCurrent.exitCode !== 0) {
-    throw new Error(`candidate branch ${branch} does not contain current base ${baseSha}; preserve its commits and merge/rebase the current base into it before retrying`);
-  }
-  const existingCandidateHead = startingHead.stdout.trim();
+  const existingCandidateHead = await synchronizeCandidateBase({
+    baseSha, branch, exec: execInWorktree,
+  });
   const templates = {
     implementer: await readFile(join(sourceDir, "implementer-prompt.md"), "utf8"),
     reviewer: await readFile(join(sourceDir, "reviewer-prompt.md"), "utf8"),
