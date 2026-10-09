@@ -111,12 +111,22 @@ class OfflineServeDemoTests(unittest.TestCase):
                 ],
             )
             trace_events = [json.loads(line) for line in (output / "trace.jsonl").read_text().splitlines()]
+            log_events = [json.loads(line) for line in (output / "logs.jsonl").read_text().splitlines()]
             observations = json.loads((output / "observability.json").read_text())
             run_span = next(event for event in trace_events if event["name"] == "run")
             self.assertIsNone(run_span["parent_span_id"])
             self.assertTrue({stage[7] for stage in stages} <= {event["id"] for event in trace_events})
             self.assertEqual({event["trace_id"] for event in trace_events}, {observations["ids"]["trace_id"]})
             self.assertTrue(all(event["parent_span_id"] == run_span["id"] for event in trace_events if event is not run_span))
+            self.assertEqual(len(log_events), len(trace_events))
+            self.assertEqual({event["span_id"] for event in log_events}, {event["id"] for event in trace_events})
+            self.assertTrue(all(event["event"] == "stage_completed" for event in log_events))
+            self.assertTrue(all(event["run_id"] == observations["ids"]["run_id"] for event in log_events))
+            self.assertTrue(all(event["trace_id"] == observations["ids"]["trace_id"] for event in log_events))
+            logged_stages = {event["stage"] for event in log_events}
+            self.assertTrue({"selection", "context_assembly", "truncation", "prompt_render", "model_call", "validation", "report"} <= logged_stages)
+            spans_by_id = {event["id"]: event for event in trace_events}
+            self.assertTrue(all(event["parent_span_id"] == spans_by_id[event["span_id"]]["parent_span_id"] for event in log_events))
             self.assertEqual(observations["remote_export"]["status"], "unverified")
             self.assertFalse(observations["remote_export"]["enabled"])
             self.assertFalse(observations["coverage"]["redaction"]["complete"])
@@ -162,10 +172,17 @@ class OfflineServeDemoTests(unittest.TestCase):
             self.assertEqual(validation["status"], "invalid_output")
             self.assertIn("does not resolve to prompt context", validation["errors"][0])
             trace_events = [json.loads(line) for line in (output / "trace.jsonl").read_text().splitlines()]
+            log_events = [json.loads(line) for line in (output / "logs.jsonl").read_text().splitlines()]
             model_span = next(event for event in trace_events if event["name"] == "model_call")
             truncation_span = next(event for event in trace_events if event["name"] == "truncation")
+            truncation_log = next(event for event in log_events if event["stage"] == "truncation")
+            model_log = next(event for event in log_events if event["stage"] == "model_call")
             self.assertEqual(model_span["metadata"]["result_status"], "success")
             self.assertEqual(truncation_span["output"]["value"]["reason"], "injected upstream context bug")
+            self.assertEqual(model_log["status"], "success")
+            self.assertEqual(truncation_log["attributes"]["details"]["reason"], "injected upstream context bug")
+            self.assertEqual(truncation_log["trace_id"], truncation_span["trace_id"])
+            self.assertEqual(truncation_log["span_id"], truncation_span["id"])
 
     def test_span_export_failure_does_not_block_serve_and_is_reported(self):
         class FailingSink:

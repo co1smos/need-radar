@@ -44,10 +44,11 @@ class LangfuseBoundary:
 
 
 class Tracer:
-    def __init__(self, run_id, trace_id, boundary, redact):
+    def __init__(self, run_id, trace_id, boundary, event_sink, redact):
         self.run_id = run_id
         self.trace_id = trace_id
         self.boundary = boundary
+        self.event_sink = event_sink
         self.redact = redact
         self.span_count = 0
         self.exported_span_count = 0
@@ -59,6 +60,30 @@ class Tracer:
         if parent and parent[0] == self.trace_id:
             parent_span_id = parent[1]
         return _Span(self, name, parent_span_id, inputs or {}, attributes or {})
+
+    def log_span(self, span):
+        try:
+            self.event_sink.write(self.redact({
+                "event": "stage_completed",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "run_id": span["run_id"],
+                "trace_id": span["trace_id"],
+                "span_id": span["span_id"],
+                "parent_span_id": span["parent_span_id"],
+                "stage": span["name"],
+                "status": span["status"],
+                "duration_ms": span["duration_ms"],
+                "attributes": span["attributes"],
+                "error": span["error"],
+            }))
+        except Exception as log_error:
+            self.export_failures.append({
+                "span_id": span["span_id"],
+                "stage": span["name"],
+                "kind": "structured_log",
+                "error_type": type(log_error).__name__,
+                "message": self.redact(str(log_error)),
+            })
 
 
 class _Span:
@@ -109,5 +134,6 @@ class _Span:
         else:
             self.tracer.exported_span_count += 1
         finally:
+            self.tracer.log_span(self.record)
             ACTIVE_SPAN.reset(self.token)
         return False

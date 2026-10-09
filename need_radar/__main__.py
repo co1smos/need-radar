@@ -8,7 +8,7 @@ import sys
 import uuid
 from pathlib import Path
 
-from need_radar.observability import LangfuseBoundary, Tracer
+from need_radar.observability import JsonlSpanSink, LangfuseBoundary, Tracer
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -165,6 +165,7 @@ def persist_stage(
         "artifact_path": artifact.as_posix(),
         "artifact_sha256": output_hash,
         "call_id": call_id,
+        "details": redact(details or {}),
     })
     span["output"] = {
         "artifact_id": artifact_id,
@@ -330,7 +331,13 @@ def run(fixture_path, output):
         "report_id": None,
         "call_id": None,
     }
-    tracer = Tracer(run_id, trace_id, LangfuseBoundary(output / "trace.jsonl", redact), redact)
+    tracer = Tracer(
+        run_id,
+        trace_id,
+        LangfuseBoundary(output / "trace.jsonl", redact),
+        JsonlSpanSink(output / "logs.jsonl"),
+        redact,
+    )
     with sqlite3.connect(output / "lineage.sqlite3") as database:
         database.execute(
             "CREATE TABLE stages (sequence INTEGER, run_id TEXT, stage TEXT, status TEXT, input_stage TEXT, input_sha256 TEXT, artifact_path TEXT, output_sha256 TEXT, details TEXT, trace_id TEXT, span_id TEXT, artifact_id TEXT, input_artifact_id TEXT, call_id TEXT, PRIMARY KEY (run_id, stage))"
@@ -484,7 +491,7 @@ def run(fixture_path, output):
                         truncated_context,
                         span,
                         context_meta,
-                        details={"truncated": truncated_context["truncated"]},
+                        details={"truncated": truncated_context["truncated"], "reason": truncated_context["reason"]},
                     )
 
                 with tracer.span(

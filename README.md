@@ -69,7 +69,7 @@ CLI 输出 `status=success`，并在目录中保存有序 `snapshot.json`、解�
 
 ## Ticket #2：本地 observability
 
-同一个离线命令也会保存 `selection.json`、`context.json`、`truncation.json`、`trace.jsonl` 和 `observability.json`。Trace 使用本地 trace/span/parent ID，保留脱敏后的阶段输入输出、prompt、合成模型调用、验证结果和报告；SQLite 与 artifact lineage 共用稳定 run、snapshot、artifact、report 和 call ID。引用校验针对实际发送给模型的 prompt context。
+同一个离线命令也会保存 `selection.json`、`context.json`、`truncation.json`、`trace.jsonl`、`logs.jsonl` 和 `observability.json`。Trace 使用本地 trace/span/parent ID，保留脱敏后的阶段输入输出、prompt、合成模型调用、验证结果和报告；结构化阶段日志通过相同的 run/trace/span ID 关联，并记录阶段状态、耗时及 artifact/call lineage。SQLite 与 artifact lineage 共用稳定 run、snapshot、artifact、report 和 call ID。引用校验针对实际发送给模型的 prompt context。
 
 测试过的 Langfuse export boundary 仅写入本地 JSONL sink。`observability.json` 明示 remote status 为 `unverified`、外部 export disabled，且脱敏覆盖为 best-effort/incomplete；本实现不读取凭证、不连接远端。合成 end-to-end check：
 
@@ -85,7 +85,7 @@ cat "$demo_dir/observability.json"
 PYTHONPATH=tests python3 -m unittest discover -s tests -p 'test_cli.py' -v
 ```
 
-2026-10-08 实测：CLI 返回 `status=success`，本地写入 10 个 span；`remote_export.status=unverified`、`enabled=false`，未尝试远端验证。
+2026-10-08 实测：CLI 返回 `status=success`，本地写入 10 个 span 和 10 条结构化阶段日志；`remote_export.status=unverified`、`enabled=false`，未尝试远端验证。
 
 已运行的离线检查命令：
 
