@@ -196,6 +196,32 @@ export function roundArtifactPaths(ticketRoot, round) {
   };
 }
 
+/** Advance a preserved candidate branch to the current base without throwing away its commits. */
+export async function synchronizeCandidateBase({ baseSha, branch, exec }) {
+  const head = await exec("git rev-parse HEAD");
+  if (head.exitCode !== 0) throw new Error(`cannot inspect candidate ${branch}: ${head.stderr || head.stdout}`);
+  const ancestorCommand = `git merge-base --is-ancestor ${shellQuote(baseSha)} HEAD`;
+  const ancestry = await exec(ancestorCommand);
+  if (ancestry.exitCode === 0) return head.stdout.trim();
+  if (ancestry.exitCode !== 1) throw new Error(`cannot inspect base ancestry for ${branch}: ${ancestry.stderr || ancestry.stdout}`);
+
+  const status = await exec("git status --porcelain");
+  if (status.exitCode !== 0 || status.stdout.trim()) {
+    throw new Error(`cannot advance dirty candidate branch ${branch}; preserve WIP and resolve before retrying`);
+  }
+  const merge = await exec(`git merge --no-edit ${shellQuote(baseSha)}`);
+  if (merge.exitCode !== 0) {
+    const abort = await exec("git merge --abort");
+    throw new Error(`cannot advance candidate branch ${branch} to ${baseSha}; merge failed: ${merge.stderr || merge.stdout}; abort exit: ${abort.exitCode}. Preserve the branch for manual conflict resolution`);
+  }
+  const synced = await exec("git rev-parse HEAD");
+  const verified = await exec(ancestorCommand);
+  if (synced.exitCode !== 0 || verified.exitCode !== 0) {
+    throw new Error(`candidate branch ${branch} did not reach base ${baseSha} after merge`);
+  }
+  return synced.stdout.trim();
+}
+
 export function buildImplementerRoundContext({ round, currentHead, existingCandidateHead, reviewerFindings, focusedTestEvidence }) {
   if (round === 1 && existingCandidateHead && existingCandidateHead !== currentHead) {
     return `This is a fresh review of an existing candidate branch at ${existingCandidateHead} (base: ${currentHead}).\nInspect the committed diff against the base and run relevant tests before changing anything.\nIf the existing candidate already satisfies the issue, you may reuse that committed HEAD without making a dummy commit; report the actual HEAD as completed.\nIf corrections are needed, implement and commit them on this branch. Never pretend fixture-only acceptance proves live readiness.`;
