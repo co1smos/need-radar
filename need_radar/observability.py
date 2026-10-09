@@ -20,9 +20,11 @@ class JsonlSpanSink:
 class LangfuseBoundary:
     def __init__(self, path, redact):
         self.sink = JsonlSpanSink(path)
+        self.otlp_sink = JsonlSpanSink(path.with_name("langfuse-otlp.jsonl"))
         self.redact = redact
 
     def export(self, span):
+        span = self.redact(span)
         self.sink.write({
             "event": "span",
             "id": span["span_id"],
@@ -41,6 +43,55 @@ class LangfuseBoundary:
             "remote_status": "unverified",
             "external_export_enabled": False,
         })
+        otlp_span = {
+            "traceId": span["trace_id"],
+            "spanId": span["span_id"],
+            "name": span["name"],
+            "kind": 1,
+            "startTimeUnixNano": _unix_nanos(span["start_time"]),
+            "endTimeUnixNano": _unix_nanos(span["end_time"]),
+            "attributes": [
+                _otlp_attribute("need_radar.run_id", span["run_id"]),
+                _otlp_attribute("need_radar.status", span["status"]),
+                _otlp_attribute("langfuse.observation.input", span["input"]),
+                _otlp_attribute("langfuse.observation.output", span["output"]),
+                _otlp_attribute("langfuse.observation.metadata", span["attributes"]),
+                *(
+                    [_otlp_attribute("need_radar.error", span["error"])]
+                    if span["error"] is not None
+                    else []
+                ),
+            ],
+            "status": {
+                "code": 1 if span["status"] == "success" else 2,
+                **({"message": span["error"]["message"]} if span["error"] else {}),
+            },
+        }
+        if span["parent_span_id"] is not None:
+            otlp_span["parentSpanId"] = span["parent_span_id"]
+        self.otlp_sink.write({
+            "resourceSpans": [{
+                "resource": {"attributes": [
+                    _otlp_attribute("service.name", "need-radar"),
+                    _otlp_attribute("need_radar.run_id", span["run_id"]),
+                ]},
+                "scopeSpans": [{
+                    "scope": {"name": "need_radar", "version": "1"},
+                    "spans": [otlp_span],
+                }],
+            }],
+        })
+
+
+def _otlp_attribute(key, value):
+    encoded = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return {"key": key, "value": {"stringValue": encoded}}
+
+
+def _unix_nanos(value):
+    timestamp = datetime.fromisoformat(value).astimezone(timezone.utc)
+    elapsed = timestamp - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return str((elapsed.days * 86400 + elapsed.seconds) * 1_000_000_000 + elapsed.microseconds * 1_000)
 
 
 class Tracer:
@@ -94,7 +145,7 @@ class _Span:
         self.record = {
             "run_id": tracer.run_id,
             "trace_id": tracer.trace_id,
-            "span_id": uuid.uuid4().hex,
+            "span_id": uuid.uuid4().hex[:16],
             "parent_span_id": parent_span_id,
             "name": name,
             "start_time": datetime.now(timezone.utc).isoformat(),

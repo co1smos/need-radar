@@ -203,36 +203,73 @@ class OfflineServeDemoTests(unittest.TestCase):
             self.assertEqual(observations["remote_export"]["status"], "unverified")
 
     def test_langfuse_boundary_preserves_ordinary_spans_and_context_in_local_sink(self):
-        class LocalSink:
-            def __init__(self):
-                self.records = []
-
-            def write(self, record):
-                self.records.append(record)
-
         with tempfile.TemporaryDirectory() as temporary_directory:
             output = Path(temporary_directory) / "run"
-            sink = LocalSink()
-            with mock.patch("need_radar.observability.JsonlSpanSink", return_value=sink):
-                status = tracer_cli.run(tracer_cli.DEFAULT_FIXTURE, output)
+            fixture = json.loads(tracer_cli.DEFAULT_FIXTURE.read_text())
+            fixture["items"][0]["text"] += " api_key=SYNTHETICONLY1234567890"
+            fixture_path = Path(temporary_directory) / "fixture.json"
+            fixture_path.write_text(json.dumps(fixture))
+            status = tracer_cli.run(fixture_path, output)
 
             self.assertEqual(status, "success")
-            names = {record["name"] for record in sink.records}
+            local_spans = [json.loads(line) for line in (output / "trace.jsonl").read_text().splitlines()]
+            requests = [json.loads(line) for line in (output / "langfuse-otlp.jsonl").read_text().splitlines()]
+            self.assertEqual(len(requests), len(local_spans))
+            exported_spans = []
+            for request in requests:
+                self.assertEqual(set(request), {"resourceSpans"})
+                resource_spans = request["resourceSpans"]
+                self.assertEqual(len(resource_spans), 1)
+                resource_attributes = {
+                    attribute["key"]: attribute["value"]["stringValue"]
+                    for attribute in resource_spans[0]["resource"]["attributes"]
+                }
+                self.assertEqual(resource_attributes["service.name"], "need-radar")
+                scope_spans = resource_spans[0]["scopeSpans"]
+                self.assertEqual(len(scope_spans), 1)
+                self.assertEqual(scope_spans[0]["scope"], {"name": "need_radar", "version": "1"})
+                self.assertEqual(len(scope_spans[0]["spans"]), 1)
+                exported_spans.extend(scope_spans[0]["spans"])
+
+            names = {record["name"] for record in exported_spans}
             self.assertTrue({"selection", "context_assembly", "truncation", "prompt_render", "model_call", "validation", "report"} <= names)
-            run_record = next(record for record in sink.records if record["name"] == "run")
-            self.assertIsNone(run_record["parent_span_id"])
-            self.assertTrue(all(record["run_id"] == run_record["run_id"] for record in sink.records))
-            self.assertTrue(all(record["trace_id"] == run_record["trace_id"] for record in sink.records))
+            run_span = next(record for record in exported_spans if record["name"] == "run")
+            self.assertNotIn("parentSpanId", run_span)
+            self.assertEqual(len(run_span["traceId"]), 32)
+            self.assertTrue(all(record["traceId"] == run_span["traceId"] for record in exported_spans))
+            self.assertTrue(all(len(record["spanId"]) == 16 for record in exported_spans))
+            for record in exported_spans:
+                self.assertGreater(int(record["traceId"], 16), 0)
+                self.assertGreater(int(record["spanId"], 16), 0)
+                self.assertEqual(record["kind"], 1)
+                self.assertEqual(record["status"]["code"], 1)
+                self.assertLessEqual(int(record["startTimeUnixNano"]), int(record["endTimeUnixNano"]))
+                self.assertTrue(all(
+                    set(attribute) == {"key", "value"}
+                    and set(attribute["value"]) == {"stringValue"}
+                    for attribute in record["attributes"]
+                ))
             self.assertTrue(all(
-                record["parent_span_id"] == run_record["id"]
-                for record in sink.records
-                if record is not run_record
+                record["parentSpanId"] == run_span["spanId"]
+                for record in exported_spans
+                if record is not run_span
             ))
-            self.assertTrue(all(record["remote_status"] == "unverified" for record in sink.records))
-            self.assertTrue(all(record["external_export_enabled"] is False for record in sink.records))
-            model_record = next(record for record in sink.records if record["name"] == "model_call")
-            self.assertIn("UNTRUSTED SOURCE EVIDENCE", model_record["input"]["prompt"]["messages"][1]["content"])
-            self.assertNotIn("SYNTHETICONLY1234567890", json.dumps(sink.records))
+            span_by_id = {record["spanId"]: record for record in exported_spans}
+            for local_span in local_spans:
+                exported_span = span_by_id[local_span["id"]]
+                self.assertEqual(exported_span["traceId"], local_span["trace_id"])
+                self.assertEqual(exported_span.get("parentSpanId"), local_span["parent_span_id"])
+                self.assertEqual(exported_span["name"], local_span["name"])
+            model_record = next(record for record in exported_spans if record["name"] == "model_call")
+            model_attributes = {attribute["key"]: attribute["value"]["stringValue"] for attribute in model_record["attributes"]}
+            model_input = json.loads(model_attributes["langfuse.observation.input"])
+            self.assertIn("UNTRUSTED SOURCE EVIDENCE", model_input["prompt"]["messages"][1]["content"])
+            self.assertNotIn("SYNTHETICONLY1234567890", json.dumps(requests))
+            self.assertNotIn("SYNTHETICONLY1234567890", (output / "trace.jsonl").read_text())
+            observations = json.loads((output / "observability.json").read_text())
+            self.assertEqual(observations["remote_export"]["status"], "unverified")
+            self.assertFalse(observations["remote_export"]["enabled"])
+            self.assertEqual(observations["remote_export"]["verification"], "not_attempted")
             self.assertTrue((output / "report.md").is_file())
 
     def test_offline_child_process_denies_network_credentials_and_live_state(self):
