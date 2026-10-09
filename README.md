@@ -26,6 +26,7 @@
 | [ChatGPT × Hermes 讨论摘要](docs/grill/discussion.md) | 中文结论、原始记录导航和后续实验例子；不是问答全文 |
 | [Design](docs/design.md) | 系统边界、extraction-only 实验、固定 judge、报告和完整 observability |
 | [Decisions](docs/decisions.md) | 区分用户已定要求、可逆代理默认值与未来启用审批 |
+| [Extraction shadow runner](docs/shadow-runner.md) | #6 离线 v0/v1 parity、资源上限、failure isolation 与实测结果 |
 | [Activation checklist](docs/activation-checklist.md) | 真实接入前的预算、数据处理、频道配置和技术核查；目前全部未启用 |
 | [Owner brief](docs/owner-brief.md) | 本次对话中已经确认的意图和约束 |
 | [Evidence notes](docs/evidence-notes.md) | 已核实的文档/CLI 信息及尚未实测的依赖假设 |
