@@ -746,6 +746,7 @@ def run(fixture_path, output):
                         "notice": fixture.get("notice", "synthetic offline source-result fixture"),
                         "items": normalization["items"],
                         "model": fixture.get("model"),
+                        **({"judge": fixture["judge"]} if "judge" in fixture else {}),
                     }
 
                 if not redaction_failed:
