@@ -20,11 +20,17 @@ def import_normalized_items(ledger, items):
             raise ValueError("discovery_origin must be a non-empty string")
         pending.append((source, native_id, text, origin.strip()))
 
+    contents = ledger.setdefault("contents", {})
     versions = ledger.setdefault("versions", {})
     current = ledger.setdefault("current", {})
     for source, native_id, text, origin in pending:
         identity = f"{source}:{native_id}"
         content_version = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        content = contents.get(content_version)
+        if content is None:
+            contents[content_version] = {"text": text}
+        elif content["text"] != text:
+            raise ValueError("content hash collision")
         item_versions = versions.setdefault(identity, {})
         evidence = item_versions.get(content_version)
         if evidence is None:
@@ -33,11 +39,31 @@ def import_normalized_items(ledger, items):
                 "source": source,
                 "native_id": native_id,
                 "content_version": content_version,
-                "text": text,
                 "discovery_origins": [],
             }
             item_versions[content_version] = evidence
         evidence["discovery_origins"] = sorted(set(evidence["discovery_origins"]) | {origin})
         current[identity] = content_version
 
-    return [versions[identity][current[identity]] for identity in sorted(current)]
+    items = []
+    for identity in sorted(current):
+        content_version = current[identity]
+        references = [
+            {
+                **version,
+                "discovery_origins": list(version["discovery_origins"]),
+            }
+            for identity in sorted(versions)
+            for version in [versions[identity].get(content_version)]
+            if version is not None
+        ]
+        origins = sorted({origin for reference in references for origin in reference["discovery_origins"]})
+        representative = versions[identity][content_version]
+        items.append({
+            **representative,
+            "content_version": content_version,
+            "text": contents[content_version]["text"],
+            "discovery_origins": origins,
+            "identity_versions": references,
+        })
+    return sorted(items, key=lambda item: (item["id"], item["content_version"]))

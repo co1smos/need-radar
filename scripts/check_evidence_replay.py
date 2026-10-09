@@ -40,7 +40,7 @@ def write_json(path, value):
     return path
 
 
-def version_count(ledger):
+def identity_version_count(ledger):
     return sum(len(versions) for versions in ledger["versions"].values())
 
 
@@ -104,12 +104,13 @@ def main():
     fixture = redact(json.loads((ROOT / "fixtures" / "evidence_replay.json").read_text(encoding="utf-8")))
     ledger = {}
     initial_items = evidence.import_normalized_items(ledger, fixture["initial_import"])
-    if version_count(ledger) != 2 or len(initial_items) != 2:
-        raise AssertionError("exact duplicate imports were not collapsed")
-    if [item["id"] for item in initial_items] != ["reddit:shared-42", "x:shared-42"]:
+    if len(ledger["contents"]) != 1 or identity_version_count(ledger) != 3 or len(initial_items) != 3:
+        raise AssertionError("exact cross-identity content was not stored once with distinct identities")
+    if [item["id"] for item in initial_items] != [
+        "reddit:alias-42", "reddit:shared-42", "x:shared-42",
+    ]:
         raise AssertionError("source-qualified identities did not distinguish Reddit and X")
-    reddit_initial = next(item for item in initial_items if item["source"] == "reddit")
-    if len(reddit_initial["discovery_origins"]) != 2:
+    if len(initial_items[0]["discovery_origins"]) != 3:
         raise AssertionError("discovery origins were not preserved")
 
     ledger_path = write_json(arguments.output / "evidence-ledger.json", ledger)
@@ -120,25 +121,51 @@ def main():
     if run(initial_input, first_output) != "success":
         raise AssertionError("initial synthetic report did not succeed")
     verify_stage_artifacts(first_output)
+    initial_selection = json.loads((first_output / "selection.json").read_bytes())
+    if len(initial_items) != 3 or len(initial_selection["items"]) != 1:
+        raise AssertionError("identical content inflated extraction demand")
+    if [item["id"] for item in initial_selection["items"][0]["identity_versions"]] != [
+        "reddit:alias-42", "reddit:shared-42", "x:shared-42",
+    ]:
+        raise AssertionError("selection did not preserve all source-qualified identity versions")
     first_snapshot_bytes = (first_output / "snapshot.json").read_bytes()
+    if [item["id"] for item in json.loads(first_snapshot_bytes)["items"]] != [
+        "reddit:alias-42", "reddit:shared-42", "x:shared-42",
+    ]:
+        raise AssertionError("snapshot did not preserve separate source-qualified identities")
     first_item_bytes = json_bytes(json.loads(first_snapshot_bytes)["items"])
     first_report_bytes = (first_output / "report.md").read_bytes()
 
     repeated_items = evidence.import_normalized_items(ledger, fixture["initial_import"])
-    if version_count(ledger) != 2 or repeated_items != initial_items:
+    if len(ledger["contents"]) != 1 or identity_version_count(ledger) != 3 or repeated_items != initial_items:
         raise AssertionError("identical re-import inflated evidence or demand")
     write_json(ledger_path, ledger)
     if ledger_path.read_bytes() != initial_ledger_bytes:
         raise AssertionError("persisted exact re-import was not byte-identical")
 
     edited_items = evidence.import_normalized_items(ledger, fixture["edited_import"])
-    if version_count(ledger) != 3 or len(edited_items) != 2:
+    if len(ledger["contents"]) != 2 or identity_version_count(ledger) != 4 or len(edited_items) != 3:
         raise AssertionError("edit did not create a version without inflating independent demand")
+    prior_content = next(item for item in edited_items if "Synthetic Reddit evidence:" in item["text"])
+    if [item["id"] for item in prior_content["identity_versions"]] != [
+        "reddit:alias-42", "reddit:shared-42", "x:shared-42",
+    ]:
+        raise AssertionError("editing one duplicate lost its prior identity or origin provenance")
     edited_input = write_json(arguments.output / "snapshot-2-input.json", fixture_for(edited_items))
     edited_output = arguments.output / "snapshot-2"
     if run(edited_input, edited_output) != "success":
         raise AssertionError("edited synthetic report did not succeed")
     verify_stage_artifacts(edited_output)
+    edited_selection = json.loads((edited_output / "selection.json").read_bytes())
+    if len(edited_items) != 3 or len(edited_selection["items"]) != 2:
+        raise AssertionError("edited content did not create one additional demand item")
+    prior_selection = next(
+        item for item in edited_selection["items"] if "Synthetic Reddit evidence:" in item["text"]
+    )
+    if [item["id"] for item in prior_selection["identity_versions"]] != [
+        "reddit:alias-42", "reddit:shared-42", "x:shared-42",
+    ]:
+        raise AssertionError("report selection lost provenance when an identity was edited")
     write_json(ledger_path, ledger)
 
     frozen_input = write_json(
@@ -164,9 +191,11 @@ def main():
         "status": "passed",
         "evidence_kind": "synthetic_offline",
         "source_qualified_identities": len(ledger["versions"]),
-        "content_versions": version_count(ledger),
-        "independent_items_after_edit": len(edited_items),
-        "reddit_discovery_origins": len(reddit_initial["discovery_origins"]),
+        "identity_versions": identity_version_count(ledger),
+        "content_versions": len(ledger["contents"]),
+        "independent_items_before_edit": len(initial_selection["items"]),
+        "independent_items_after_edit": len(edited_selection["items"]),
+        "discovery_origins_before_edit": len(initial_items[0]["discovery_origins"]),
         "snapshot_and_report_replay": "stable",
         "artifact_lineage_hashes": "verified",
         "network_credential_live_state_guards": "denied_in_process_and_subprocess",

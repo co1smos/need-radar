@@ -15,14 +15,14 @@
     },
     {
       "source": "reddit",
-      "native_id": "shared-42",
+      "native_id": "alias-42",
       "text": "Synthetic Reddit evidence: builders rebuild agent context after session resets. api_key=sk-REPLAYFIXTURESECRET1234567890",
-      "discovery_origin": "query:context-handoff"
+      "discovery_origin": "query:context-handoff-followup"
     },
     {
       "source": "x",
       "native_id": "shared-42",
-      "text": "Synthetic X evidence: agent tools lose project context between sessions.",
+      "text": "Synthetic Reddit evidence: builders rebuild agent context after session resets. api_key=sk-REPLAYFIXTURESECRET1234567890",
       "discovery_origin": "query:context-handoff"
     }
   ],
