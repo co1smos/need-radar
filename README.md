@@ -2,7 +2,7 @@
 
 独立项目：持续发现 AI 开发/学习中具体、有价值、可解决、有合理规模切入口的 friction。
 
-**当前状态：设计讨论已完成；ticket #1 离线 serve tracer、ticket #7 合成离线 assessment 与 ticket #13 HTML 投影已实现。未连接实时来源、模型、定时任务或 Discord。**
+**当前状态：设计讨论已完成；ticket #1 离线 serve tracer、ticket #7 合成离线 assessment、ticket #11 Reddit+X 离线实验与 ticket #13 HTML 投影已实现。未连接实时来源、模型、定时任务或 Discord。**
 
 项目路径：`/home/ubuntu/projects/need-radar`
 
@@ -28,6 +28,7 @@
 | [Offline assessment](docs/assessment.md) | 固定 rubric、arm-blind evidence、failure isolation 与合成离线验证 |
 | [Decisions](docs/decisions.md) | 区分用户已定要求、可逆代理默认值与未来启用审批 |
 | [Extraction shadow runner](docs/shadow-runner.md) | #6 离线 v0/v1 parity、资源上限、failure isolation 与实测结果 |
+| [Mixed-source offline experiment](docs/mixed-source-experiment.md) | #11 synthetic Reddit+X fixture, per-source coverage, duplicate provenance, and assessed comparison |
 | [Activation checklist](docs/activation-checklist.md) | 真实接入前的预算、数据处理、频道配置和技术核查；目前全部未启用 |
 | [Owner brief](docs/owner-brief.md) | 本次对话中已经确认的意图和约束 |
 | [Evidence notes](docs/evidence-notes.md) | 已核实的文档/CLI 信息及尚未实测的依赖假设 |

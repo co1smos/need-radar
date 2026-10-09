@@ -132,15 +132,25 @@ def _make_record(source, kind, raw, envelope, content_fields, relationships):
 
 
 def prepare_source_results(source_results):
-    prepared = {"records": [], "errors": []}
+    prepared = {
+        "records": [],
+        "errors": [],
+        "input_counts": {source: 0 for source in SOURCES},
+        "source_envelopes": {source: False for source in SOURCES},
+        "source_partial": {source: False for source in SOURCES},
+        "source_posts_valid": {source: False for source in SOURCES},
+    }
     if not isinstance(source_results, dict):
-        return {"records": [], "errors": ["source results must be an object"]}
+        prepared["errors"].extend(f"{source}: source results must be an object" for source in SOURCES)
+        return prepared
 
     for source in SOURCES:
         envelope = source_results.get(source)
         if not isinstance(envelope, dict):
             _source_error(prepared["errors"], source, "response envelope is missing or malformed")
             continue
+        prepared["source_envelopes"][source] = True
+        prepared["source_partial"][source] = envelope.get("partial") is True
         source_error_start = len(prepared["errors"])
         if not isinstance(envelope.get("partial"), bool):
             _source_error(prepared["errors"], source, "envelope partial flag must be boolean")
@@ -150,6 +160,8 @@ def prepare_source_results(source_results):
         if not isinstance(posts, list):
             _source_error(prepared["errors"], source, "posts must be an array")
             continue
+        prepared["source_posts_valid"][source] = True
+        prepared["input_counts"][source] = len(posts)
 
         for index, post in enumerate(posts):
             if not isinstance(post, dict):
@@ -175,6 +187,7 @@ def prepare_source_results(source_results):
                 if not isinstance(comments, list):
                     _source_error(prepared["errors"], source, f"posts[{index}].comments is malformed")
                     continue
+                prepared["input_counts"][source] += len(comments)
                 for comment_index, comment in enumerate(comments):
                     if not isinstance(comment, dict):
                         _source_error(
@@ -224,6 +237,93 @@ def prepare_source_results(source_results):
                     record["flags"]["partial_coverage"] = True
 
     return prepared
+
+
+def source_coverage(prepared, returned_ids, errors):
+    coverage = {
+        "evidence_kind": "synthetic_normalized_fixture",
+        "live_source_verification": "not performed",
+        "sources": {},
+    }
+    for source in SOURCES:
+        records = [record for record in prepared["records"] if record["source"] == source]
+        expected_ids = {
+            record["id"] for record in records if not record["flags"]["withheld"]
+        }
+        source_returned_ids = expected_ids & returned_ids
+        source_errors = [error for error in errors if error.startswith(f"{source}:")]
+        missing_ids = sorted(expected_ids - source_returned_ids)
+        source_errors.extend(f"normalizer omitted {item_id}" for item_id in missing_ids)
+        generic_normalizer_errors = [
+            error for error in errors
+            if error.startswith("normalizer ") and error != "normalizer omitted one or more source records"
+        ]
+        if generic_normalizer_errors and prepared["input_counts"][source]:
+            source_errors.extend(generic_normalizer_errors)
+        if "normalizer omitted one or more source records" in errors and missing_ids:
+            source_errors.append("normalizer omitted one or more source records")
+        source_errors = list(dict.fromkeys(source_errors))
+
+        omission_reasons = [
+            f"{record['id']}: withheld"
+            for record in records
+            if record["flags"]["withheld"]
+        ]
+        omission_reasons.extend(f"{item_id}: normalizer omission" for item_id in missing_ids)
+        omitted_count = max(0, prepared["input_counts"][source] - len(source_returned_ids))
+        if omitted_count > len(omission_reasons):
+            omission_reasons.append(
+                f"{omitted_count - len(omission_reasons)} malformed or unidentified source record(s)"
+            )
+
+        if not prepared["source_envelopes"][source]:
+            status = "missing"
+        elif not prepared["source_posts_valid"][source]:
+            status = "failed"
+        elif (
+            prepared["input_counts"][source] == 0
+            and not prepared["source_partial"][source]
+            and not source_errors
+        ):
+            status = "empty"
+        elif (
+            source_errors
+            or omitted_count
+            or prepared["source_partial"][source]
+            or any(
+                record["flags"]["partial_coverage"] is True
+                or record["flags"]["incomplete"]
+                or record["flags"]["withheld"]
+                for record in records
+            )
+        ):
+            status = "partial"
+        else:
+            status = "synthetic_complete"
+        omissions_unknown = status in {"missing", "failed"} or (
+            status == "partial"
+            and (
+                prepared["source_partial"][source]
+                or any(
+                    record["flags"]["partial_coverage"] is True
+                    or record["flags"]["incomplete"]
+                    for record in records
+                )
+            )
+        )
+
+        coverage["sources"][source] = {
+            "status": status,
+            "input_count": prepared["input_counts"][source],
+            "prepared_count": len(records),
+            "returned_count": len(source_returned_ids),
+            "omitted_count": omitted_count,
+            "omissions_unknown": omissions_unknown,
+            "failure_count": len(source_errors),
+            "omission_reasons": omission_reasons,
+            "failure_reasons": source_errors,
+        }
+    return coverage
 
 
 def normalization_prompt(prepared):
@@ -333,7 +433,13 @@ def normalize_prepared_results(prepared, model_output):
     if not isinstance(model_output, dict) or set(model_output) != {"results"} or not isinstance(
         model_output.get("results"), list
     ):
-        return {"status": "invalid_model_output", "items": [], "errors": [*errors, "normalizer response has an invalid shape"]}
+        errors.append("normalizer response has an invalid shape")
+        return {
+            "status": "invalid_model_output",
+            "items": [],
+            "errors": errors,
+            "coverage": source_coverage(prepared, set(), errors),
+        }
 
     expected = {item["id"] for item in prepared["records"] if not item["flags"]["withheld"]}
     normalized = {}
@@ -356,7 +462,12 @@ def normalize_prepared_results(prepared, model_output):
     if expected - normalized.keys():
         errors.append("normalizer omitted one or more source records")
     if any(error.startswith("normalizer ") for error in errors):
-        return {"status": "invalid_model_output", "items": [], "errors": errors}
+        return {
+            "status": "invalid_model_output",
+            "items": [],
+            "errors": errors,
+            "coverage": source_coverage(prepared, set(), errors),
+        }
 
     items = []
     for record in prepared["records"]:
@@ -368,11 +479,18 @@ def normalize_prepared_results(prepared, model_output):
         items.append(item)
     canonical_errors = validate_canonical_evidence(items)
     if canonical_errors:
-        return {"status": "invalid_model_output", "items": [], "errors": [*errors, *canonical_errors]}
+        errors.extend(canonical_errors)
+        return {
+            "status": "invalid_model_output",
+            "items": [],
+            "errors": errors,
+            "coverage": source_coverage(prepared, set(), errors),
+        }
     return {
         "status": "partial" if errors or any(item["flags"]["partial_coverage"] for item in items) else "success",
         "items": items,
         "errors": errors,
+        "coverage": source_coverage(prepared, set(normalized), errors),
     }
 
 

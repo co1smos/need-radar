@@ -281,6 +281,23 @@ def render_markdown(result):
         result["qualification"], "",
         "This is a judge-qualified description, not market truth or global recall. One run does not justify promotion.", "",
     ]
+    source_coverage = result.get("source_coverage")
+    if isinstance(source_coverage, dict):
+        lines.extend(["## Source coverage", ""])
+        for source, source_result in source_coverage.get("sources", {}).items():
+            omission_note = ", additional omissions unknown" if source_result["omissions_unknown"] else ""
+            lines.append(
+                f"- {source}: {source_result['status']}; synthetic inputs {source_result['input_count']}, "
+                f"normalized returns {source_result['returned_count']}, omissions {source_result['omitted_count']}, "
+                f"failures {source_result['failure_count']}{omission_note}."
+            )
+        lines.extend([
+            "",
+            "Synthetic fixture coverage only; live source completeness is unverified.",
+            f"Cross-source duplicate groups consolidated as one independent item each: "
+            f"{len(result.get('cross_source_duplicate_groups', []))}.",
+            "",
+        ])
     if result["status"] == "inconclusive":
         lines.extend(["## Inconclusive reasons", "", *(f"- {reason}" for reason in result["reasons"])])
         return "\n".join(lines) + "\n"

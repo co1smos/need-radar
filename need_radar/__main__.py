@@ -14,6 +14,7 @@ from need_radar.source_adapter import (
     normalize_prepared_results,
     normalization_prompt,
     prepare_source_results,
+    source_coverage,
 )
 from need_radar.snapshot import read_frozen_snapshot
 from need_radar.report_html import render_file
@@ -320,7 +321,11 @@ def execute_extraction(prompt, invoke, shared_settings=None):
 def select_items(items):
     def identity_reference(item):
         return {
-            **{key: item[key] for key in ("id", "source", "native_id", "content_version") if key in item},
+            **{
+                key: item[key]
+                for key in ("id", "source", "native_id", "source_id", "content_version", "discovery_origin")
+                if key in item
+            },
             "discovery_origins": list(item.get("discovery_origins", [])),
         }
 
@@ -351,6 +356,21 @@ def select_items(items):
             set(existing.get("discovery_origins", [])) | set(item.get("discovery_origins", []))
         )
     return selected
+
+
+def cross_source_duplicate_groups(items):
+    groups = []
+    for item in items:
+        identities = item.get("identity_versions", [])
+        sources = sorted({identity.get("source") for identity in identities if identity.get("source")})
+        if len(sources) > 1:
+            groups.append({
+                "representative_id": item["id"],
+                "sources": sources,
+                "identities": identities,
+                "independent_item_count": 1,
+            })
+    return groups
 
 
 def assemble_context(items):
@@ -417,7 +437,7 @@ def validate_response(response, items):
     return "success", candidates, []
 
 
-def render_report(status, candidates, errors):
+def render_report(status, candidates, errors, source_coverage=None, duplicate_groups=None):
     lines = [
         "# Need Radar",
         "",
@@ -439,6 +459,32 @@ def render_report(status, candidates, errors):
                 f"- [Evidence {candidate_index}-{citation_index}](#evidence-{candidate_index}-{citation_index}): "
                 f"{markdown_literal(citation['source'])}"
             )
+    if isinstance(source_coverage, dict):
+        lines.extend(["", "## Source coverage"])
+        for source, source_result in source_coverage.get("sources", {}).items():
+            omission_note = ", additional omissions unknown" if source_result["omissions_unknown"] else ""
+            lines.append(
+                f"- {markdown_literal(source)}: {markdown_literal(source_result['status'])}; "
+                f"synthetic inputs {source_result['input_count']}, normalized returns "
+                f"{source_result['returned_count']}, omissions {source_result['omitted_count']}, "
+                f"failures {source_result['failure_count']}{omission_note}."
+            )
+            for reason in source_result["omission_reasons"]:
+                lines.append(f"  - Omission: {markdown_literal(reason)}")
+            for reason in source_result["failure_reasons"]:
+                lines.append(f"  - Failure: {markdown_literal(reason)}")
+        lines.append("Synthetic fixture coverage only; live source completeness is unverified.")
+    if duplicate_groups:
+        lines.extend(["", "## Cross-source duplicate evidence"])
+        lines.append(
+            f"{len(duplicate_groups)} demonstrated duplicate group(s) are consolidated; each counts as one "
+            "independent evidence item, not independent demand per source."
+        )
+        for group in duplicate_groups:
+            identities = ", ".join(
+                markdown_literal(identity["id"]) for identity in group["identities"]
+            )
+            lines.append(f"- {identities}")
     if status == "no_findings":
         lines.append("No findings.")
     elif candidates:
@@ -814,10 +860,12 @@ def run(fixture_path, output):
                         )
 
                     if normalizer_status == "failure":
+                        normalizer_errors = [f"normalizer call failed: {normalizer_error}"]
                         normalization = {
                             "status": "normalization_failure",
                             "items": [],
-                            "errors": [normalizer_error],
+                            "errors": normalizer_errors,
+                            "coverage": source_coverage(prepared, set(), normalizer_errors),
                         }
                     else:
                         normalization = normalize_prepared_results(prepared, normalization_response)
@@ -857,6 +905,7 @@ def run(fixture_path, output):
                         "schema_version": 1,
                         "status": normalization["status"],
                         "errors": normalization["errors"],
+                        "coverage": normalization["coverage"],
                     }
                     normalized_fixture = {
                         "notice": fixture.get("notice", "synthetic offline source-result fixture"),
@@ -964,10 +1013,12 @@ def run(fixture_path, output):
                     attributes={"policy": "exact_content_deduplication"},
                 ) as span:
                     selected_items = select_items(snapshot["items"])
+                    duplicate_groups = cross_source_duplicate_groups(selected_items)
                     selection = {
                         "policy": "exact_content_deduplication",
                         "item_ids": [item["id"] for item in selected_items],
                         "items": selected_items,
+                        "cross_source_duplicate_groups": duplicate_groups,
                     }
                     selection_meta = persist_stage(
                         output,
@@ -1120,7 +1171,10 @@ def run(fixture_path, output):
                     inputs={"validation_id": validation_meta["artifact_id"], "validation": validation},
                     attributes={"canonical": True, "result_status": status},
                 ) as span:
-                    report = render_report(status, candidates, errors)
+                    report_source_coverage = snapshot.get("source_normalization", {}).get("coverage")
+                    report = render_report(
+                        status, candidates, errors, report_source_coverage, duplicate_groups,
+                    )
                     report_meta = persist_stage(
                         output,
                         database,

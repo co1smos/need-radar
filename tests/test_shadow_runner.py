@@ -141,6 +141,34 @@ class ShadowRunnerTests(unittest.TestCase):
         self.assertTrue(summary["parity"]["only_extraction_instruction_differs"])
         self.assertTrue(summary["parity"]["same_execution_seam"])
 
+    def test_mixed_source_snapshot_is_shared_and_reports_partial_coverage_and_duplicates(self):
+        output = self.root / "mixed-source-experiment"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "check_mixed_source_experiment.py"),
+                "--output",
+                str(output),
+            ],
+            cwd=ROOT,
+            env=safe_environment(),
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary["status"], "passed")
+        self.assertEqual(summary["source_coverage"]["reddit"]["status"], "partial")
+        self.assertEqual(summary["source_coverage"]["reddit"]["omitted_count"], 1)
+        self.assertEqual(summary["source_coverage"]["x"]["returned_count"], 2)
+        self.assertEqual(summary["cross_source_duplicate_groups"], 1)
+        self.assertTrue(summary["same_ordered_input"])
+        self.assertEqual(summary["network_requests"], 0)
+        self.assertEqual(summary["provider_calls"], 0)
+        self.assertIn("not independent demand per source", (output / "serve" / "report.md").read_text())
+        self.assertIn("Source coverage", (output / "shadow" / "comparison.md").read_text())
+
     def test_post_score_comparison_keeps_ambiguous_match_uncertain(self):
         serve_result, serve = self.run_serve(settings())
         self.assertEqual(serve_result.returncode, 0, serve_result.stderr)
