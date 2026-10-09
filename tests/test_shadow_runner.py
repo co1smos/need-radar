@@ -72,14 +72,17 @@ class ShadowRunnerTests(unittest.TestCase):
     def tearDown(self):
         self.temporary_directory.cleanup()
 
-    def fixture_path(self, shadow_model, shared_settings=None):
+    def fixture_path(self, shadow_model, shared_settings=None, shadow_assessment=None):
         path = self.root / f"shadow-fixture-{uuid.uuid4().hex}.json"
+        experiment = {
+            "shared_settings": shared_settings or settings(),
+            "shadow_model": shadow_model,
+        }
+        if shadow_assessment is not None:
+            experiment["shadow_assessment"] = shadow_assessment
         path.write_text(json.dumps({
             "provider": "synthetic_fixture",
-            "experiment": {
-                "shared_settings": shared_settings or settings(),
-                "shadow_model": shadow_model,
-            },
+            "experiment": experiment,
         }), encoding="utf-8")
         return path
 
@@ -138,6 +141,105 @@ class ShadowRunnerTests(unittest.TestCase):
         self.assertTrue(summary["parity"]["only_extraction_instruction_differs"])
         self.assertTrue(summary["parity"]["same_execution_seam"])
 
+    def test_post_score_comparison_keeps_ambiguous_match_uncertain(self):
+        serve_result, serve = self.run_serve(settings())
+        self.assertEqual(serve_result.returncode, 0, serve_result.stderr)
+        item_id = "reddit:fixture-1"
+        excerpt = "I manually copy the same project context"
+        shadow_candidate = candidate(item_id, excerpt, "Agent context handoff is manual")
+        shadow_score = json.loads((serve / "judge-response.json").read_text())["response"]
+        fixture = self.fixture_path(
+            outcome([shadow_candidate]),
+            shadow_assessment={"status": "synthetic_response", "response": shadow_score},
+        )
+        output = self.root / "assessed-shadow"
+        result = self.run_shadow(serve, fixture, output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        comparison_result = json.loads((output / "comparison.json").read_text())
+        assessed = comparison_result["assessment_comparison"]
+        self.assertEqual(assessed["status"], "descriptive")
+        self.assertEqual(assessed["matching"]["exact_overlap_count"], 0)
+        self.assertEqual(len(assessed["matching"]["uncertain_matches"]), 1)
+        self.assertEqual(assessed["arms"]["v0"]["eligible_count"], 0)
+        self.assertEqual(assessed["arms"]["v0"]["resources"]["cost_per_eligible_usd"], "n/a")
+        report = (output / "comparison.md").read_text(encoding="utf-8")
+        self.assertIn("extraction fixture usage", report)
+        self.assertIn("judge-provider usage is not included", report)
+        self.assertIn("judge-qualified descriptive", assessed["qualification"])
+        self.assertEqual(
+            comparison_result["assessment_comparison_report_sha256"],
+            hashlib.sha256((output / "comparison.md").read_bytes()).hexdigest(),
+        )
+        self.assertTrue((output / "v1" / "assessment.json").is_file())
+        self.assertFalse(json.loads((output / "v1" / "assessment-input.json").read_text())["provider_invoked"])
+
+    def test_serve_scores_must_match_the_recorded_judge_response(self):
+        from need_radar.shadow import _read_artifact, _serve_stage_refs, _validate_serve_assessment
+
+        serve_result, serve = self.run_serve(settings())
+        self.assertEqual(serve_result.returncode, 0, serve_result.stderr)
+        names = {
+            "snapshot": "snapshot.json",
+            "v0_candidates": "candidates.json",
+            "v0_consolidation": "consolidation.json",
+            "v0_judge_prompt": "judge-prompt.json",
+            "v0_judge_response": "judge-response.json",
+            "v0_assessment": "assessment.json",
+            "report": "report.md",
+        }
+        paths = {name: serve / filename for name, filename in names.items()}
+        artifacts = {name: _read_artifact(path) for name, path in paths.items() if path.suffix == ".json"}
+        stage_refs, errors = _serve_stage_refs(serve, paths)
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            _validate_serve_assessment(artifacts, artifacts["snapshot"][1]["items"], stage_refs),
+            [],
+        )
+
+        artifacts["v0_assessment"][1]["assessments"][0]["reason"] = "A different but valid rationale."
+        errors = _validate_serve_assessment(artifacts, artifacts["snapshot"][1]["items"], stage_refs)
+        self.assertIn("serve assessment has incomplete or invalid grounding", errors)
+
+    def test_missing_shadow_assessment_is_explicitly_inconclusive(self):
+        serve_result, serve = self.run_serve(settings())
+        self.assertEqual(serve_result.returncode, 0, serve_result.stderr)
+        fixture = self.fixture_path(outcome([]))
+        output = self.root / "missing-shadow-assessment"
+        result = self.run_shadow(serve, fixture, output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        comparison = json.loads((output / "comparison.json").read_text())
+        assessed = comparison["assessment_comparison"]
+        self.assertEqual(assessed["status"], "inconclusive")
+        self.assertIsNone(assessed["matching"])
+        self.assertTrue(any("judging failed or is incomplete" in reason for reason in assessed["reasons"]))
+
+    def test_empty_common_snapshot_is_inconclusive(self):
+        fixture = json.loads((ROOT / "fixtures" / "synthetic_demo.json").read_text())
+        fixture["items"] = []
+        fixture["model"] = {"status": "synthetic_response", "response": [], "usage": {"requests": 1, "tokens": 1}}
+        fixture["judge"] = {"status": "synthetic_response", "response": []}
+        fixture["experiment"] = {"shared_settings": settings()}
+        serve_fixture = self.root / "empty-serve-fixture.json"
+        serve_fixture.write_text(json.dumps(fixture), encoding="utf-8")
+        serve = self.root / "empty-serve"
+        serve_result = subprocess.run(
+            [sys.executable, "-m", "need_radar", "--fixture", str(serve_fixture), "--output", str(serve)],
+            cwd=ROOT, env=safe_environment(), capture_output=True, text=True,
+        )
+        self.assertEqual(serve_result.returncode, 0, serve_result.stderr)
+        shadow_fixture = self.fixture_path(
+            outcome([]),
+            shadow_assessment={"status": "synthetic_response", "response": []},
+        )
+        shadow = self.root / "empty-shadow"
+        shadow_result = self.run_shadow(serve, shadow_fixture, shadow)
+        self.assertEqual(shadow_result.returncode, 1, shadow_result.stdout + shadow_result.stderr)
+        self.assertIn("status=incomplete", shadow_result.stdout)
+        comparison = json.loads((shadow / "comparison.json").read_text())
+        assessed = comparison["assessment_comparison"]
+        self.assertEqual(assessed["status"], "inconclusive")
+        self.assertTrue(any("input is empty" in reason for reason in assessed["reasons"]))
+
     def test_candidate_cap_and_zero_findings_are_not_padded(self):
         serve_result, serve = self.run_serve(settings(candidate_limit=1))
         self.assertEqual(serve_result.returncode, 0, serve_result.stderr)
@@ -186,6 +288,7 @@ class ShadowRunnerTests(unittest.TestCase):
         self.assertEqual(comparison["arms"]["v0"]["status"], "success")
         self.assertEqual(comparison["arms"]["v1"]["status"], "extraction_failure")
         self.assertTrue(comparison["incomplete_reasons"])
+        self.assertEqual(comparison["assessment_comparison"]["status"], "inconclusive")
         self.assertIn("[REDACTED]", v1_call["error"])
         self.assertNotIn("sk-SYNTHETICSECRET123456", v1_call["error"])
         for path in output.rglob("*"):
@@ -213,6 +316,7 @@ class ShadowRunnerTests(unittest.TestCase):
                 model_response = json.loads((output / "v1" / "model-response.json").read_text())
                 self.assertEqual(comparison["arms"]["v0"]["status"], "success")
                 self.assertEqual(comparison["arms"]["v1"]["status"], "resource_failure")
+                self.assertEqual(comparison["assessment_comparison"]["status"], "inconclusive")
                 self.assertEqual(model_response["status"], "resource_failure")
                 self.assertEqual((serve / "report.md").read_bytes(), report_before)
 
@@ -228,6 +332,7 @@ class ShadowRunnerTests(unittest.TestCase):
         self.assertEqual(comparison["status"], "incomplete")
         self.assertEqual(comparison["arms"]["v0"]["status"], "success")
         self.assertEqual(comparison["arms"]["v1"]["status"], "not_run_parity_failure")
+        self.assertEqual(comparison["assessment_comparison"]["status"], "inconclusive")
         self.assertFalse(comparison["parity"]["shared_settings_identical"])
         self.assertEqual(v1_call["resolved_shared_settings"]["max_tokens"], 49)
         self.assertEqual(v1_call["attempted_requests"], 0)
