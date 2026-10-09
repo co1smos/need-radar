@@ -9,6 +9,12 @@ import uuid
 from pathlib import Path
 
 from need_radar.observability import JsonlSpanSink, LangfuseBoundary, Tracer
+from need_radar.source_adapter import (
+    normalize_prepared_results,
+    normalization_prompt,
+    prepare_source_results,
+)
+from need_radar.snapshot import read_frozen_snapshot
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -330,6 +336,7 @@ def run(fixture_path, output):
         "snapshot_id": None,
         "report_id": None,
         "call_id": None,
+        "normalization_call_id": None,
     }
     tracer = Tracer(
         run_id,
@@ -376,6 +383,127 @@ def run(fixture_path, output):
                     fixture = None
                     errors = ["fixture cannot be safely redacted"]
                 else:
+                    errors = []
+
+                sequence_offset = 0
+                source_normalization = None
+                source_normalization_meta = None
+                if not redaction_failed and isinstance(fixture, dict) and "source_results" in fixture:
+                    prepared = prepare_source_results(fixture.get("source_results"))
+                    prompt = normalization_prompt(prepared)
+                    with tracer.span(
+                        "source_normalization_prompt",
+                        inputs={"source_results": fixture.get("source_results")},
+                    ) as span:
+                        prompt_meta = persist_stage(
+                            output,
+                            database,
+                            run_id,
+                            trace_id,
+                            1,
+                            "source_normalization_prompt",
+                            "success",
+                            Path("source-normalization-prompt.json"),
+                            prompt,
+                            span,
+                            details=prompt["config"],
+                        )
+
+                    normalizer = fixture.get("normalization_model")
+                    if not isinstance(normalizer, dict):
+                        normalizer = {}
+                    normalizer_status = "success" if normalizer.get("status") == "synthetic_response" else "failure"
+                    normalizer_error = normalizer.get("error")
+                    if normalizer_status == "failure" and not normalizer_error:
+                        normalizer_error = "synthetic normalizer failure"
+                    normalizer_error = str(normalizer_error) if normalizer_error is not None else None
+                    normalization_call_id = uuid.uuid4().hex
+                    ids["normalization_call_id"] = normalization_call_id
+                    normalization_response = normalizer.get("response") if normalizer_status == "success" else None
+                    with tracer.span(
+                        "source_normalization_model_call",
+                        inputs={"call_id": normalization_call_id, "prompt": prompt},
+                        attributes={
+                            "call_id": normalization_call_id,
+                            "boundary": "synthetic_fixture",
+                            "result_status": normalizer_status,
+                        },
+                    ) as span:
+                        model_meta = persist_stage(
+                            output,
+                            database,
+                            run_id,
+                            trace_id,
+                            2,
+                            "source_normalization_model_call",
+                            normalizer_status,
+                            Path("source-normalization-response.json"),
+                            {
+                                "boundary": "synthetic_fixture",
+                                "status": normalizer_status,
+                                "reported_status": normalizer.get("status"),
+                                "response": normalization_response,
+                                "error": normalizer_error,
+                            },
+                            span,
+                            prompt_meta,
+                            normalization_call_id,
+                            {"boundary": "synthetic_fixture"},
+                        )
+
+                    if normalizer_status == "failure":
+                        normalization = {
+                            "status": "normalization_failure",
+                            "items": [],
+                            "errors": [normalizer_error],
+                        }
+                    else:
+                        normalization = normalize_prepared_results(prepared, normalization_response)
+                    with tracer.span(
+                        "source_normalization_validation",
+                        inputs={
+                            "call_id": normalization_call_id,
+                            "response": normalization_response,
+                            "source_record_count": len(prepared["records"]),
+                        },
+                    ) as span:
+                        span["attributes"]["result_status"] = normalization["status"]
+                        normalization_meta = persist_stage(
+                            output,
+                            database,
+                            run_id,
+                            trace_id,
+                            3,
+                            "source_normalization_validation",
+                            normalization["status"],
+                            Path("source-normalization.json"),
+                            normalization,
+                            span,
+                            model_meta,
+                            normalization_call_id,
+                            {"error_count": len(normalization["errors"])},
+                        )
+                    ids["normalization_id"] = normalization_meta["artifact_id"]
+                    source_normalization_meta = normalization_meta
+                    sequence_offset = 3
+                    if normalization["status"] in {"invalid_model_output", "normalization_failure"}:
+                        run_span["attributes"]["result_status"] = normalization["status"]
+                        run_span["output"] = {"status": normalization["status"], "ids": ids}
+                        return normalization["status"]
+
+                    source_normalization = {
+                        "schema_version": 1,
+                        "status": normalization["status"],
+                        "errors": normalization["errors"],
+                    }
+                    fixture = {
+                        "notice": fixture.get("notice", "synthetic offline source-result fixture"),
+                        "items": normalization["items"],
+                        "model": fixture.get("model"),
+                    }
+                    raw_fixture = fixture
+
+                if not redaction_failed:
                     errors = fixture_errors(fixture)
                 if errors:
                     validation = {"status": "invalid_input", "errors": errors}
@@ -391,7 +519,7 @@ def run(fixture_path, output):
                             database,
                             run_id,
                             trace_id,
-                            1,
+                            1 + sequence_offset,
                             "fixture_validation",
                             "invalid_input",
                             Path("validation.json"),
@@ -414,18 +542,22 @@ def run(fixture_path, output):
                         "notice": fixture.get("notice", "synthetic offline fixture"),
                         "items": fixture["items"],
                     }
+                    if source_normalization is not None:
+                        snapshot["source_normalization"] = source_normalization
                     snapshot_meta = persist_stage(
                         output,
                         database,
                         run_id,
                         trace_id,
-                        1,
+                        1 + sequence_offset,
                         "snapshot",
                         "success",
                         Path("snapshot.json"),
                         snapshot,
                         span,
+                        source_normalization_meta,
                     )
+                    snapshot = read_frozen_snapshot(output / "snapshot.json")
                 ids["snapshot_id"] = snapshot_meta["artifact_id"]
 
                 with tracer.span(
@@ -444,7 +576,7 @@ def run(fixture_path, output):
                         database,
                         run_id,
                         trace_id,
-                        2,
+                        2 + sequence_offset,
                         "selection",
                         "success",
                         Path("selection.json"),
@@ -464,7 +596,7 @@ def run(fixture_path, output):
                         database,
                         run_id,
                         trace_id,
-                        3,
+                        3 + sequence_offset,
                         "context_assembly",
                         "success",
                         Path("context.json"),
@@ -484,7 +616,7 @@ def run(fixture_path, output):
                         database,
                         run_id,
                         trace_id,
-                        4,
+                        4 + sequence_offset,
                         "truncation",
                         "success",
                         Path("truncation.json"),
@@ -504,7 +636,7 @@ def run(fixture_path, output):
                         database,
                         run_id,
                         trace_id,
-                        5,
+                        5 + sequence_offset,
                         "prompt_render",
                         "success",
                         Path("prompt.json"),
@@ -541,7 +673,7 @@ def run(fixture_path, output):
                         database,
                         run_id,
                         trace_id,
-                        6,
+                        6 + sequence_offset,
                         "model_call",
                         model_status,
                         Path("model-response.json"),
@@ -583,7 +715,7 @@ def run(fixture_path, output):
                         database,
                         run_id,
                         trace_id,
-                        7,
+                        7 + sequence_offset,
                         "validation",
                         status,
                         Path("candidates.json"),
@@ -605,7 +737,7 @@ def run(fixture_path, output):
                         database,
                         run_id,
                         trace_id,
-                        8,
+                        8 + sequence_offset,
                         "report",
                         "success",
                         Path("report.md"),
