@@ -644,8 +644,13 @@ def _finish(database, lock, record_path, result):
 
 def check_missed(config, scheduled_for=None, observed_at=None):
     _ensure_hermes_tmpdir()
-    slot = _validate_slot(config, scheduled_for) if scheduled_for else _scheduled_for(config)
     observed = observed_at or datetime.now(UTC)
+    if scheduled_for:
+        slot = _validate_slot(config, scheduled_for)
+    else:
+        anchor = _utc(config["schedule"]["anchor_at"])
+        latest_due = observed - timedelta(seconds=config["schedule"]["grace_seconds"])
+        slot = _scheduled_for(config, latest_due if latest_due >= anchor else observed)
     due_at = _utc(slot) + timedelta(seconds=config["schedule"]["grace_seconds"])
     database = _database(Path(config["state_db"]))
     if observed < due_at:
