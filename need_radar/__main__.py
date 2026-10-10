@@ -649,6 +649,7 @@ def run_fixture_assessment(
         "status": judge_status,
         "reported_status": reported_status,
         "response": raw_judge.get("response") if isinstance(raw_judge, dict) else None,
+        "usage": raw_judge.get("usage") if isinstance(raw_judge, dict) else None,
         "error": judge_error,
     }
     with tracer.span(
@@ -851,6 +852,7 @@ def run(fixture_path, output):
                                 "status": normalizer_status,
                                 "reported_status": normalizer.get("status"),
                                 "response": normalization_response,
+                                "usage": normalizer.get("usage"),
                                 "error": normalizer_error,
                             },
                             span,

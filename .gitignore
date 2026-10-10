@@ -225,6 +225,7 @@ __marimo__/
 
 # Private reusable acquisition responses; never publish source recordings
 /artifacts/
+/.need-radar/
 
 # Ralph and Sandcastle generated state
 /.ralph/
