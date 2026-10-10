@@ -285,6 +285,20 @@ class OfflineServeDemoTests(unittest.TestCase):
             self.assertIn("assessment failed", assessment_result["errors"][0])
             self.assertIn("snapshot", assessment_result["source_artifacts"])
 
+    def test_html_render_failure_does_not_block_valid_serve_report(self):
+        if not HERMES_TMPDIR.is_dir():
+            self.skipTest("Hermes TMPDIR is unavailable")
+        with tempfile.TemporaryDirectory(dir=HERMES_TMPDIR) as temporary_directory:
+            output = Path(temporary_directory) / "run"
+            with mock.patch.object(tracer_cli, "render_file", side_effect=OSError("synthetic renderer failure")):
+                status = tracer_cli.run(tracer_cli.DEFAULT_FIXTURE, output)
+
+            self.assertEqual(status, "success")
+            self.assertIn("Agent context handoff is manual", (output / "report.md").read_text())
+            self.assertFalse((output / "report.html").exists())
+            spans = [json.loads(line) for line in (output / "trace.jsonl").read_text().splitlines()]
+            self.assertTrue(any(span["name"] == "html_render_failure" for span in spans))
+
     def test_successful_fake_model_call_exposes_upstream_context_truncation(self):
         def faulty_truncation(context):
             items = [dict(item) for item in context["items"]]
