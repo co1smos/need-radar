@@ -261,7 +261,14 @@ def resolve_shared_settings(fixture):
     return (None, errors) if errors else (settings, [])
 
 
-def execute_extraction(prompt, invoke, shared_settings=None):
+def execute_extraction(
+    prompt,
+    invoke,
+    shared_settings=None,
+    *,
+    boundary="synthetic_fixture",
+    success_status="synthetic_response",
+):
     call_prevented = shared_settings is not None and shared_settings["request_limit"] < 1
     if call_prevented:
         model = {"status": "failure", "error": "request ceiling prevents model call"}
@@ -273,7 +280,7 @@ def execute_extraction(prompt, invoke, shared_settings=None):
     reported_status = model.get("status") if isinstance(model, dict) else None
     response = model.get("response") if isinstance(model, dict) else None
     error = model.get("error") if isinstance(model, dict) else None
-    status = "success" if reported_status == "synthetic_response" else "failure"
+    status = "success" if reported_status == success_status else "failure"
     if status == "failure" and not error:
         error = "synthetic model failure" if reported_status == "failure" else f"unsupported synthetic model status: {reported_status!r}"
 
@@ -282,21 +289,21 @@ def execute_extraction(prompt, invoke, shared_settings=None):
         if call_prevented:
             status, error = "resource_failure", "request ceiling prevents model call"
         elif status == "success" and not isinstance(usage, dict):
-            status, error = "resource_failure", "synthetic response is missing resource usage"
+            status, error = "resource_failure", "model response is missing resource usage"
         elif isinstance(usage, dict):
             requests = usage.get("requests")
             tokens = usage.get("tokens")
             if type(requests) is not int or requests < 0 or type(tokens) is not int or tokens < 0:
-                status, error = "resource_failure", "synthetic resource usage is invalid"
+                status, error = "resource_failure", "model resource usage is invalid"
             elif requests > shared_settings["request_limit"]:
                 status, error = "resource_failure", "request ceiling exceeded"
             elif requests != 1:
-                status, error = "resource_failure", "one synthetic model call must report one request"
+                status, error = "resource_failure", "one model call must report one request"
             elif tokens > shared_settings["max_tokens"]:
                 status, error = "resource_failure", "token ceiling exceeded"
 
     artifact = {
-        "boundary": "synthetic_fixture",
+        "boundary": boundary,
         "execution_seam": "execute_extraction",
         "attempted_requests": 0 if call_prevented else 1,
         "prompt_sha256": digest(json_bytes(prompt)),
@@ -308,6 +315,15 @@ def execute_extraction(prompt, invoke, shared_settings=None):
         "candidate_count": len(response) if isinstance(response, list) else None,
         "error": str(error) if error is not None else None,
     }
+    if isinstance(model, dict):
+        for key in (
+            "attempt_id",
+            "attempted_requests",
+            "usage_derived_estimated_cost_micro_usd",
+            "account_billed_usd",
+        ):
+            if key in model:
+                artifact[key] = model[key]
     limited_response = response
     candidate_limit_applied = False
     if shared_settings is not None and isinstance(response, list):
