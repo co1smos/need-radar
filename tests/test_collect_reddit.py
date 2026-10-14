@@ -346,10 +346,17 @@ if os.environ.get("NEED_RADAR_OFFLINE_TESTS") == "1":
     def test_public_cli_replays_synthetic_recording_under_child_guards(self):
         self.collect_text_recording("ordinary useful synthetic fixture text")
         scratch = pathlib.Path(os.environ.get("TMPDIR", tempfile.gettempdir()))
+        replay_clock = NOW.isoformat()
+        code = (
+            "import sys; from datetime import datetime; import network_guard; network_guard.install(); "
+            "import collect_reddit; "
+            f"raise SystemExit(collect_reddit.main(sys.argv[1:], clock=lambda: datetime.fromisoformat({replay_clock!r})))"
+        )
         result = subprocess.run(
             [
                 sys.executable,
-                str(CLI),
+                "-c",
+                code,
                 "replay",
                 "--recordings-dir", str(self.recordings_dir),
                 "--state-dir", str(self.state_dir),
@@ -361,7 +368,7 @@ if os.environ.get("NEED_RADAR_OFFLINE_TESTS") == "1":
             env={
                 "HOME": str(scratch),
                 "PATH": os.environ.get("PATH", ""),
-                "PYTHONPATH": str(ROOT / "tests"),
+                "PYTHONPATH": os.pathsep.join([str(ROOT / "tests"), str(ROOT / "scripts")]),
                 "TMPDIR": str(scratch),
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "NEED_RADAR_OFFLINE_TESTS": "1",

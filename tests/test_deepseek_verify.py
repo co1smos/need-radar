@@ -261,9 +261,11 @@ class DeepSeekVerificationTests(unittest.TestCase):
         credential.chmod(0o600)
         state = self.root / "subprocess-state"
         code = (
-            "import sys; from pathlib import Path; "
+            "import sys; from pathlib import Path; from datetime import datetime, timezone; "
+            "import network_guard; network_guard.install(); "
             "from need_radar import deepseek_verify as module; "
             "module.DEFAULT_STATE_DIR = Path(sys.argv[1]); "
+            "module._utc_now = lambda: datetime(2026, 10, 13, tzinfo=timezone.utc); "
             "module.load_api_key = lambda: 'synthetic-subprocess-key'; "
             "sys.argv = ['deepseek_verify', '--pricing-verified-on', '2026-10-13']; "
             "raise SystemExit(module.main())"
@@ -297,6 +299,7 @@ class DeepSeekVerificationTests(unittest.TestCase):
         network_command = [
             sys.executable,
             "-c",
+            "import network_guard; network_guard.install(); "
             "from need_radar.deepseek_verify import _send; _send(b'{}', 'synthetic-key')",
         ]
         network = subprocess.run(
@@ -313,7 +316,8 @@ class DeepSeekVerificationTests(unittest.TestCase):
         protected_credential.write_text("DEEPSEEK_API_KEY=synthetic-only\n")
         protected_credential.chmod(0o600)
         credential_code = (
-            "import sys; from need_radar.deepseek_verify import load_api_key; "
+            "import sys, network_guard; network_guard.install(); "
+            "from need_radar.deepseek_verify import load_api_key; "
             "load_api_key(sys.argv[1])"
         )
         credential = subprocess.run(
@@ -330,6 +334,7 @@ class DeepSeekVerificationTests(unittest.TestCase):
             [
                 sys.executable,
                 "-c",
+                "import network_guard; network_guard.install(); "
                 "from pathlib import Path; "
                 "Path('/home/ubuntu/.local/state/need-radar/test-denied').write_text('x')",
             ],
@@ -342,13 +347,21 @@ class DeepSeekVerificationTests(unittest.TestCase):
         self.assertIn("live state access is disabled", canonical.stderr)
 
     def test_subprocess_cli_offline_validation_never_reads_credentials(self):
+        code = (
+            "import sys; from datetime import datetime, timezone; "
+            "import network_guard; network_guard.install(); "
+            "from need_radar import deepseek_verify as module; "
+            "original_load = module.load_api_key; "
+            "module._utc_now = lambda: datetime(2026, 10, 13, tzinfo=timezone.utc); "
+            "module.load_api_key = lambda: original_load(network_guard.DEEPSEEK_CREDENTIALS_PATH); "
+            "sys.argv = ['deepseek_verify', '--pricing-verified-on', '2026-10-13']; "
+            "raise SystemExit(module.main())"
+        )
         result = subprocess.run(
             [
                 sys.executable,
-                "-m",
-                "need_radar.deepseek_verify",
-                "--pricing-verified-on",
-                TODAY,
+                "-c",
+                code,
             ],
             cwd=ROOT,
             env=safe_environment(),

@@ -454,18 +454,27 @@ def validate_response(response, items):
 
 
 def render_report(status, candidates, errors, source_coverage=None, duplicate_groups=None):
+    recorded_inputs = isinstance(source_coverage, dict) and source_coverage.get("evidence_kind") == (
+        "authentic_private_recording_offline_replay"
+    )
+    input_label = "private recorded inputs" if recorded_inputs else "synthetic fixture inputs"
+    run_label = "private recorded/offline replay" if recorded_inputs else "synthetic/offline only"
+    model_label = (
+        "Model responses use predetermined local fixtures."
+        if recorded_inputs else "The model response is predetermined synthetic fixture data."
+    )
     lines = [
         "# Need Radar",
         "",
-        f"Status: {status} (synthetic/offline only; no live source or model verification)",
+        f"Status: {status} ({run_label}; no live source or model verification)",
         "",
-        "The model response is predetermined synthetic fixture data.",
+        model_label,
         "Citation validation checks exact excerpt substrings only; it does not assess semantic support.",
         "",
         "## Summary",
         f"- Status: {status}",
         f"- Validated findings: {len(candidates)}",
-        "- Coverage: synthetic fixture inputs only; live-source coverage is unverified.",
+        f"- Coverage: {input_label} only; live-source completeness is unverified.",
         "- Assessment: unevaluated in this frozen report; any assessment is a separate artifact.",
     ]
     for candidate_index, candidate in enumerate(candidates, start=1):
@@ -481,7 +490,7 @@ def render_report(status, candidates, errors, source_coverage=None, duplicate_gr
             omission_note = ", additional omissions unknown" if source_result["omissions_unknown"] else ""
             lines.append(
                 f"- {markdown_literal(source)}: {markdown_literal(source_result['status'])}; "
-                f"synthetic inputs {source_result['input_count']}, normalized returns "
+                f"{('recorded' if recorded_inputs else 'synthetic')} inputs {source_result['input_count']}, normalized returns "
                 f"{source_result['returned_count']}, omissions {source_result['omitted_count']}, "
                 f"failures {source_result['failure_count']}{omission_note}."
             )
@@ -489,7 +498,10 @@ def render_report(status, candidates, errors, source_coverage=None, duplicate_gr
                 lines.append(f"  - Omission: {markdown_literal(reason)}")
             for reason in source_result["failure_reasons"]:
                 lines.append(f"  - Failure: {markdown_literal(reason)}")
-        lines.append("Synthetic fixture coverage only; live source completeness is unverified.")
+        lines.append(
+            "Private recorded replay only; live source completeness is unverified."
+            if recorded_inputs else "Synthetic fixture coverage only; live source completeness is unverified."
+        )
     if duplicate_groups:
         lines.extend(["", "## Cross-source duplicate evidence"])
         lines.append(

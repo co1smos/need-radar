@@ -1,32 +1,44 @@
 # Issue 20: Genuine source recording validation
 
-**Status: blocked (October 13, 2026).** The approved local replay cannot continue until the applicable upstream rights for the Reddit recording are resolved. The X recording is also unavailable in its documented private location. This is not a finding that either provider has denied permission, and it is not legal certification.
+**Status: completed as a strictly local technical replay (October 14, 2026).** The retained Reddit and X recordings were available, private, and within their documented owner retention at replay time. Provider/source rights and live freshness remain `unverified`; this is not legal certification or live-pilot approval.
 
-## Authorization and artifacts
+## Authorization, retention, and terms
 
-- `docs/decisions.md` decision 75, `docs/owner-brief.md` and the current #20 issue body establish owner authorization for strictly local #9/#19 adapter use without repeat consent. No revocation is recorded in the repository or current issue context reviewed.
-- The #19 private artifact metadata records owner-revocable retention (`owner_authorized_until_revoked: true`) and downstream rights as `unverified`. One genuine sanitized Reddit response recording is present in the owner-private, Git-ignored #19 artifact directory. No source text, IDs, file names, or raw payload were included in this report.
-- The #9 documented `recordings/` directory is absent in this environment. The private ticket-9 metadata available locally does not contain a source response envelope. The prior #9 artifact summary does not substitute for a recording in this offline replay.
-- A metadata-only check counted two JSON files under the #19 private directory, one of which is a response recording, and no JSON response recording in the documented #9 `recordings/` directory.
+- `docs/decisions.md` decision 75 and `docs/owner-brief.md` authorize local adapter use of the retained #9/#19 recordings until owner revocation. No revocation was present in the current issue context or inspected private retention records.
+- Both artifact directories were mode `0700`; both source files were mode `0600`. The X response is an `authentic_sanitized_response`; its retained owner policy says keep for adapter use until revoked and supersedes the old seven-day automatic deletion. The response metadata was also still unexpired. The Reddit response is a completed live-provider recording with `owner_authorized_until_revoked: true`, private owner-only access, and no expiry.
+- `/artifacts/` is Git-ignored. The replay and its derived serve artifacts are stored privately under `/home/ubuntu/projects/need-radar/artifacts/ticket-20/` with directories `0700` and files `0600`.
+- Public terms checked October 14, 2026: [Treg Terms of Service](https://treg.to/terms), §5, assigns upstream API limits, quotas, billing, and enforcement to the upstream provider. [Reddit Data API Terms](https://redditinc.com/policies/data-api-terms), §§2.1 and 2.4–2.5, describe a revocable API license, limit User Content use to the approved App use case, and address removals. Whether those terms apply to this recorded Treg/TikHub route and private adapter replay is `unverified`. [X Developer Policy](https://docs.x.com/developer-terms/policy), “Content compliance,” requires stored X content to track the current source state and be updated or removed when it changes. Recording freshness was not checked with a live request and remains `unverified`.
+- No provider/source terms reviewed establish a prohibition on this narrowly scoped local replay; none certify permission for other use. No provider requests or remote model calls were made. #16’s rights, freshness, and activation gates remain unchanged.
 
-## Partial Reddit format check
+## Recorded provider formats and mapping
 
-Before the terms review was complete, one deterministic schema-only inspection of the #19 response observed an HTTP 200, non-truncated response. The body is nested under `data.subredditV3.elements.edges[]` (8 entries); each edge has a `node` with heterogeneous `cells[]`, including typed `title`, `text`, and `createdAt` fields. `elements.pageInfo.endCursor` is present. No comments/replies were present in the inspected feed response. No post text, IDs, or source values are recorded here.
+The deterministic structural inspection emitted field names, types, and counts only; no source text or IDs were printed. The reusable evidence is `artifacts/ticket-20/replay-20261014-validated/proof.json`.
 
-The same inspected body was passed once to the existing adapter with a local empty fake-normalization response and network, credential, and live-state access denied. The adapter prepared zero canonical records: the actual body lacks its expected `partial`, `origin`, and `posts[]` envelope fields. No source IDs, timestamps, discovery origin, reply relationships, or coverage flags were validated. This confirms a concrete incompatibility for #4/follow-up, not successful provider compatibility. No further Reddit replay or parsing was performed after the terms question was identified.
+| Source | Observed response | Canonical mapping and coverage |
+| --- | --- | --- |
+| Reddit | HTTP 200, not truncated; `response.body.data.subredditV3.elements.edges[]` contained 8 edges: 6 usable post entries, one recommendation unit, and one ad. Usable cells included `TitleCell.title`, `PreviewTextCell.text`, and `MetadataCell.createdAt`/`detailsLink`; `pageInfo.endCursor` was present. | Decoded provider post IDs, title/preview text, timestamps, request provenance, and recording hash produced 6 canonical posts. Coverage is `partial`; no comment text or parent-thread references were supplied. No permalink passed the absolute Reddit URL check. Edited/deleted state remains unknown. |
+| X | HTTP 200; `response.data[]` had 10 records with `id`, `created_at`, `text`, `conversation_id`, and `edit_history_tweet_ids`; one record also had `article.title`. Five `referenced_tweets` entries comprised two `replied_to`, one `quoted`, and two `retweeted`; `meta.next_token` was present. | All 10 canonical records retained IDs, timestamps, thread IDs, two reply links, article title, request provenance, and recording hash. Coverage is `partial`; the next page is unknown. Deletion state remains unknown, and no URL field was supplied. Quote/repost references are not represented in the current canonical relationship fields. |
 
-## Rights check and stop
+Both recordings yielded 16 canonical records and passed `validate_canonical_evidence`. All records retained source-qualified identity, supplied timestamps and discovery lineage. The local normalization fake returned only a fixed placeholder through the shared source-normalization prompt and adapter. The v0 serve run loaded the frozen snapshot, passed all 16 selected items to `execute_extraction`, and accepted a local fake `[]` response; the canonical report says `no_findings` and contains no source text. That result is only an execution-seam check.
 
-Current public terms checked October 13, 2026:
+The adapter correctly reports partial coverage rather than completeness. Reddit coverage reports 6 inputs, 6 normalized returns, zero omitted records, and 18 field warnings (edited status, deleted status, and a canonical URL are unavailable for each post). X coverage reports 10 inputs, 10 normalized returns, zero omitted records, and 20 warnings (deleted status and URL unavailable for each record). These warnings are preserved in the private `source-normalization.json`; they do not fabricate values or erase otherwise valid records. Future requirements to preserve these URLs or X quote/repost edges should be handled as a scoped #4 follow-up.
 
-- [Treg Terms of Service](https://treg.to/terms), last updated July 22, 2026, §5 says calls through its hosted service remain subject to the upstream provider's terms, and Treg is not a party to that upstream relationship.
-- [Reddit Data API Terms](https://redditinc.com/policies/data-api-terms), §§2.4–2.5, describe a limited, revocable license for content use in the approved app use case and state that no other rights are granted or implied. Whether these terms govern the Treg/TikHub route, whether the upstream route is separately authorized, and whether this private adapter replay is within an applicable license are `unverified`.
-- [X Developer Policy](https://docs.x.com/developer-terms/policy) requires stored X content to be kept current and deleted or modified when its state changes. With no X recording available, freshness and route applicability could not be checked; rights remain `unverified`.
+## Offline guards and reproducibility
 
-These public terms make route and use applicability a concrete unresolved rights question; they do not establish a prohibition on this replay or permission for it. Owner authorization alone does not resolve upstream rights. No further recording parsing, adapter replay, or derived-content persistence should occur before the route/use permission is evidenced or the owner resolves the rights question. Do not acquire new data, send source content to a remote model, export or publish content, or treat this as clearing #16.
+The replay process and serve subprocess both verified socket creation, credential-path access, and canonical live-state access were denied. The child inherited only a clean environment with Hermes `TMPDIR`; it used the existing CLI and its frozen snapshot, prompt, model-response, and report stages. Input hashes were checked unchanged after replay. The proof records zero remote calls and the report/snapshot/prompt hashes.
 
-## Verification and remaining work
+Verification: `TMPDIR=/home/ubuntu/.hermes/cache/scratch npm test` passed (278 tests), and `npm run typecheck:sandcastle-workflow` passed. The focused adapter suite passed 10 tests; the three date-sensitive subprocess checks also passed with deterministic test-only clocks.
 
-- `TMPDIR="$HOME/.hermes/cache/scratch" PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tests python3 -m unittest discover -s tests -p 'test_source_adapter.py' -q` passed (8 tests). These existing checks use synthetic inputs and fake model outputs; they exercise the frozen-snapshot/v0 path and deny network, credentials, and live state in the test process and child processes.
-- Before the rights stop, one local guarded adapter probe of the Reddit response returned zero canonical records. It emitted schema/error summaries only. This incomplete probe is not acceptance evidence for provider compatibility.
-- No genuine two-source replay, canonical snapshot, or v0 report was completed. Keep #20 open until upstream route/use rights are resolved, the Reddit response can be replayed within the applicable scope, and the authentic #9 X recording is available for its own retention and terms check.
+Run from the repository root, using the retained paths supplied in the #9/#19 handoff:
+
+```sh
+TMPDIR=/home/ubuntu/.hermes/cache/scratch PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tests \
+python3 scripts/replay_issue20.py \
+  --reddit-record "$REDDIT_RECORD" \
+  --x-record "$X_RECORD" \
+  --output "/home/ubuntu/projects/need-radar/artifacts/ticket-20/replay-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+Set `REDDIT_RECORD` and `X_RECORD` in the local shell to the corresponding owner-private #19 and #9 response files before running the command; their filenames are intentionally omitted from tracked documentation.
+
+The script refuses inputs without the matching owner-retention evidence or private permissions, writes only to a private directory outside the worktree, and prints structural evidence without post text or source IDs. Recheck the current owner issue/retention state before each replay; provider rights, X content freshness, complete pagination, Reddit comment enrichment, URLs, and quote/repost relationship support remain follow-up or live-gate questions.

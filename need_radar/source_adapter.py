@@ -1,5 +1,8 @@
+import base64
+import hashlib
 import json
 import math
+from urllib.parse import urlparse
 
 
 SCHEMA_VERSION = 1
@@ -35,6 +38,162 @@ def _timestamp(value):
 
 def _source_error(errors, source, message):
     errors.append(f"{source}: {message}")
+
+
+def _recording_origin(source, recording):
+    request = recording.get("request") if isinstance(recording.get("request"), dict) else {}
+    parameters = request.get("parameters") if isinstance(request.get("parameters"), dict) else {}
+    if source == "reddit":
+        parameter_hash = recording.get("request_parameters_sha256")
+    else:
+        parameter_hash = hashlib.sha256(
+            json.dumps(parameters, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    return {
+        key: value
+        for key, value in {
+            "provider": recording.get("provider", source),
+            "endpoint": recording.get("endpoint", request.get("route")),
+            "recorded_at": recording.get("recorded_at", recording.get("recorded_at_epoch")),
+            "request_parameters": parameters,
+            "request_parameters_sha256": parameter_hash,
+            "recording_sha256": recording.get("replay_record_sha256"),
+        }.items()
+        if value is not None
+    }
+
+
+def _recorded_reddit(recording):
+    response = recording.get("response")
+    body = response.get("body") if isinstance(response, dict) else None
+    data = body.get("data") if isinstance(body, dict) else None
+    subreddit = data.get("subredditV3") if isinstance(data, dict) else None
+    elements = subreddit.get("elements") if isinstance(subreddit, dict) else None
+    edges = elements.get("edges") if isinstance(elements, dict) else None
+    page_info = elements.get("pageInfo") if isinstance(elements, dict) else None
+    partial = True if (
+        (isinstance(response, dict) and response.get("truncated") is True)
+        or (isinstance(page_info, dict) and page_info.get("endCursor"))
+    ) else None
+    origin = _recording_origin("reddit", recording)
+    if not isinstance(response, dict) or response.get("http_status") != 200 or not isinstance(edges, list):
+        return {"partial": partial, "origin": origin, "posts": None}
+
+    posts = []
+    for edge in edges:
+        if not isinstance(edge, dict) or not isinstance(edge.get("node"), dict):
+            posts.append(None)
+            continue
+        node = edge["node"]
+        if node.get("__typename") == "CarouselCommunityRecommendationsFeedUnit":
+            continue
+        cells = node.get("cells")
+        if not isinstance(cells, list):
+            posts.append(None)
+            continue
+        if node.get("adPayload") or any(
+            isinstance(cell, dict) and cell.get("__typename") == "AdMetadataCell" for cell in cells
+        ):
+            continue
+        metadata = next(
+            (cell for cell in cells if isinstance(cell, dict) and cell.get("__typename") == "MetadataCell"),
+            None,
+        )
+        title = next(
+            (cell for cell in cells if isinstance(cell, dict) and cell.get("__typename") == "TitleCell"),
+            None,
+        )
+        preview = next(
+            (cell for cell in cells if isinstance(cell, dict) and cell.get("__typename") == "PreviewTextCell"),
+            None,
+        )
+        if metadata is None or title is None or not isinstance(title.get("title"), str) or not title["title"].strip():
+            posts.append(None)
+            continue
+        encoded_id = node.get("id")
+        try:
+            source_id = base64.b64decode(encoded_id + "=" * (-len(encoded_id) % 4), validate=True).decode("utf-8")
+        except (TypeError, ValueError, UnicodeDecodeError):
+            source_id = None
+        if not isinstance(source_id, str) or not source_id.startswith("t3_"):
+            posts.append(None)
+            continue
+        link = metadata.get("detailsLink")
+        parsed_link = urlparse(link) if isinstance(link, str) else None
+        permalink = (
+            link
+            if parsed_link
+            and parsed_link.scheme in {"http", "https"}
+            and parsed_link.hostname
+            and (parsed_link.hostname == "reddit.com" or parsed_link.hostname.endswith(".reddit.com"))
+            and "/comments/" in parsed_link.path
+            else None
+        )
+        posts.append({
+            "id": source_id,
+            "title": title["title"],
+            "selftext": preview.get("text") if preview else None,
+            "created_at": metadata.get("createdAt"),
+            "permalink": permalink,
+            "edited": node.get("edited"),
+            "deleted": node.get("deleted"),
+            "partial": partial,
+            "origin": origin,
+        })
+    return {"partial": partial, "origin": origin, "posts": posts}
+
+
+def _recorded_x(recording):
+    response = recording.get("response")
+    data = response.get("data") if isinstance(response, dict) else None
+    meta = response.get("meta") if isinstance(response, dict) else None
+    partial = True if isinstance(meta, dict) and meta.get("next_token") else None
+    origin = _recording_origin("x", recording)
+    if not isinstance(response, dict) or recording.get("http_status") != 200 or not isinstance(data, list):
+        return {"partial": partial, "origin": origin, "posts": None}
+
+    posts = []
+    for row in data:
+        if not isinstance(row, dict):
+            posts.append(None)
+            continue
+        references = row.get("referenced_tweets")
+        replies = [
+            reference.get("id")
+            for reference in references
+            if isinstance(reference, dict) and reference.get("type") == "replied_to"
+        ] if isinstance(references, list) else []
+        reply_to = replies[0] if len(replies) == 1 else replies if replies else None
+        edit_history = row.get("edit_history_tweet_ids")
+        article = row.get("article")
+        posts.append({
+            "id": row.get("id"),
+            "text": row.get("text"),
+            "article_title": article.get("title") if isinstance(article, dict) else None,
+            "created_at": row.get("created_at"),
+            "conversation_id": row.get("conversation_id"),
+            "in_reply_to_id": reply_to,
+            "edited": len(edit_history) > 1 if isinstance(edit_history, list) else None,
+            "deleted": row.get("deleted"),
+            "partial": partial,
+            "origin": origin,
+        })
+    return {"partial": partial, "origin": origin, "posts": posts}
+
+
+def source_results_from_recordings(reddit_recording, x_recording, recording_hashes=None):
+    hashes = recording_hashes if isinstance(recording_hashes, dict) else {}
+    reddit = dict(reddit_recording)
+    x = dict(x_recording)
+    if hashes.get("reddit"):
+        reddit["replay_record_sha256"] = hashes["reddit"]
+    if hashes.get("x"):
+        x["replay_record_sha256"] = hashes["x"]
+    return {
+        "evidence_kind": "authentic_private_recording_offline_replay",
+        "reddit": _recorded_reddit(reddit),
+        "x": _recorded_x(x),
+    }
 
 
 def _make_record(source, kind, raw, envelope, content_fields, relationships):
@@ -139,10 +298,13 @@ def prepare_source_results(source_results):
         "source_envelopes": {source: False for source in SOURCES},
         "source_partial": {source: False for source in SOURCES},
         "source_posts_valid": {source: False for source in SOURCES},
+        "evidence_kind": "synthetic_normalized_fixture",
     }
     if not isinstance(source_results, dict):
         prepared["errors"].extend(f"{source}: source results must be an object" for source in SOURCES)
         return prepared
+    if source_results.get("evidence_kind") == "authentic_private_recording_offline_replay":
+        prepared["evidence_kind"] = "authentic_private_recording_offline_replay"
 
     for source in SOURCES:
         envelope = source_results.get(source)
@@ -216,7 +378,7 @@ def prepare_source_results(source_results):
                     kind,
                     post,
                     envelope,
-                    ("text",),
+                    ("text", "article_title"),
                     {
                         "thread_id": post.get("conversation_id"),
                         "reply_to_id": reply_to,
@@ -241,7 +403,7 @@ def prepare_source_results(source_results):
 
 def source_coverage(prepared, returned_ids, errors):
     coverage = {
-        "evidence_kind": "synthetic_normalized_fixture",
+        "evidence_kind": prepared.get("evidence_kind", "synthetic_normalized_fixture"),
         "live_source_verification": "not performed",
         "sources": {},
     }
