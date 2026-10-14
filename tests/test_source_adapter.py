@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 from pathlib import Path
@@ -15,7 +16,12 @@ import network_guard
 network_guard.install()
 
 from need_radar.snapshot import read_frozen_snapshot
-from need_radar.source_adapter import adapt_source_results, prepare_source_results
+from need_radar.source_adapter import (
+    adapt_source_results,
+    prepare_source_results,
+    source_results_from_recordings,
+    validate_canonical_evidence,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -314,6 +320,134 @@ class SourceAdapterTests(unittest.TestCase):
         empty_result = adapt_source_results(source_results, normalization_response)
         self.assertEqual(empty_result["coverage"]["sources"]["x"]["status"], "empty")
         self.assertEqual(empty_result["coverage"]["sources"]["x"]["failure_count"], 0)
+
+    def test_recording_envelopes_keep_source_identity_provenance_and_partial_context(self):
+        reddit_id = base64.b64encode(b"t3_post-1").decode().rstrip("=")
+        reddit = {
+            "provider": "recorded-reddit-route",
+            "endpoint": "recorded-reddit-endpoint",
+            "recorded_at": "2026-10-13T12:00:00Z",
+            "request_parameters_sha256": "r" * 64,
+            "request": {"parameters": {"subreddit_name": "synthetic"}},
+            "response": {
+                "http_status": 200,
+                "body": {"data": {"subredditV3": {"elements": {
+                    "edges": [{"node": {
+                        "id": reddit_id,
+                        "cells": [
+                            {"__typename": "MetadataCell", "createdAt": "2026-10-12T11:00:00.000Z"},
+                            {"__typename": "TitleCell", "title": "Synthetic Reddit title"},
+                            {"__typename": "PreviewTextCell", "text": "Synthetic Reddit preview"},
+                        ],
+                    }}],
+                    "pageInfo": {"endCursor": "synthetic-next-page"},
+                }}}},
+            },
+        }
+        x = {
+            "http_status": 200,
+            "recorded_at_epoch": 1791892800,
+            "request": {
+                "method": "GET",
+                "route": "synthetic-x-route",
+                "window": "synthetic-window",
+                "parameters": {"query": "synthetic"},
+            },
+            "response": {
+                "data": [{
+                    "id": "100000000000000001",
+                    "created_at": "2026-10-12T10:00:00.000Z",
+                    "text": "Synthetic X post",
+                    "article": {"title": "Synthetic X article title"},
+                    "conversation_id": "100000000000000001",
+                    "edit_history_tweet_ids": ["100000000000000001"],
+                    "referenced_tweets": [
+                        {"type": "replied_to", "id": "100000000000000000"},
+                        {"type": "quoted", "id": "100000000000000002"},
+                        {"type": "retweeted", "id": "100000000000000003"},
+                    ],
+                }],
+                "meta": {"result_count": 1, "next_token": "synthetic-next-page"},
+            },
+        }
+        source_results = source_results_from_recordings(
+            reddit, x, {"reddit": "a" * 64, "x": "b" * 64}
+        )
+        prepared = prepare_source_results(source_results)
+        response = {
+            "results": [
+                {"record_id": record["id"], "normalized_text": "local fake normalized text"}
+                for record in prepared["records"]
+            ]
+        }
+
+        result = adapt_source_results(source_results, response)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["coverage"]["evidence_kind"], "authentic_private_recording_offline_replay")
+        self.assertEqual({item["id"] for item in result["items"]}, {f"reddit:t3_post-1", "x:100000000000000001"})
+        reddit_item = next(item for item in result["items"] if item["source"] == "reddit")
+        x_item = next(item for item in result["items"] if item["source"] == "x")
+        self.assertEqual(reddit_item["timestamp"], "2026-10-12T11:00:00.000Z")
+        self.assertEqual(reddit_item["text"], "Synthetic Reddit title\nSynthetic Reddit preview")
+        self.assertEqual(reddit_item["discovery_origin"]["recording_sha256"], "a" * 64)
+        self.assertTrue(reddit_item["flags"]["partial_coverage"])
+        self.assertIsNone(reddit_item["flags"]["edited"])
+        self.assertIsNone(reddit_item["flags"]["deleted"])
+        self.assertIsNone(reddit_item["relationships"]["reply_to_id"])
+        self.assertEqual(x_item["timestamp"], "2026-10-12T10:00:00.000Z")
+        self.assertEqual(x_item["text"], "Synthetic X post\nSynthetic X article title")
+        self.assertEqual(x_item["relationships"]["thread_id"], "x:100000000000000001")
+        self.assertEqual(x_item["relationships"]["reply_to_id"], "x:100000000000000000")
+        self.assertTrue(x_item["flags"]["partial_coverage"])
+        self.assertFalse(x_item["flags"]["edited"])
+        self.assertIsNone(x_item["flags"]["deleted"])
+        self.assertEqual(x_item["discovery_origin"]["recording_sha256"], "b" * 64)
+        self.assertEqual(x_item["references"], [])
+        self.assertFalse(any(item["kind"] == "comment" for item in result["items"]))
+        self.assertEqual(validate_canonical_evidence(result["items"]), [])
+
+        no_pagination = json.loads(json.dumps(source_results))
+        no_pagination["reddit"]["partial"] = None
+        missing_coverage = prepare_source_results(no_pagination)
+        self.assertTrue(any("envelope partial flag must be boolean" in error for error in missing_coverage["errors"]))
+
+        unsupported_reddit = json.loads(json.dumps(reddit))
+        del unsupported_reddit["response"]["body"]["data"]["subredditV3"]["elements"]["edges"]
+        unsupported_x = json.loads(json.dumps(x))
+        unsupported_x["response"]["data"] = {"unexpected": []}
+        unsupported = source_results_from_recordings(unsupported_reddit, unsupported_x)
+        rejected = adapt_source_results(unsupported, {"results": []})
+        self.assertEqual(rejected["items"], [])
+        self.assertEqual(rejected["coverage"]["sources"]["reddit"]["status"], "failed")
+        self.assertEqual(rejected["coverage"]["sources"]["x"]["status"], "failed")
+
+    def test_nonempty_frozen_context_reaches_shared_v0_extraction_seam(self):
+        from need_radar import __main__ as app
+
+        fixture = json.loads(json.dumps(self.fixture))
+        fixture["model"] = {"status": "synthetic_response", "response": []}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            hermes_tmp = root / "hermes-tmp"
+            hermes_tmp.mkdir()
+            fixture_path = self.write_fixture(root, fixture)
+            output = root / "serve"
+            with mock.patch.dict(os.environ, self.safe_environment(hermes_tmp), clear=True):
+                with mock.patch.object(app, "execute_extraction", wraps=app.execute_extraction) as extraction:
+                    status = app.run(fixture_path, output)
+
+            self.assertEqual(status, "no_findings")
+            extraction.assert_called_once()
+            prompt = extraction.call_args.args[0]
+            source_items = json.loads(prompt["messages"][1]["content"].split("\n", 1)[1])
+            snapshot = read_frozen_snapshot(output / "snapshot.json")
+            snapshot_ids = {item["id"] for item in snapshot["items"]}
+            self.assertTrue(source_items)
+            self.assertTrue(all(item["id"] in snapshot_ids for item in source_items))
+            response = json.loads((output / "model-response.json").read_text())
+            self.assertEqual(response["execution_seam"], "execute_extraction")
+            self.assertEqual(response["status"], "success")
 
     def test_no_findings_report_keeps_missing_source_degradation_visible(self):
         fixture = json.loads(json.dumps(self.fixture))
