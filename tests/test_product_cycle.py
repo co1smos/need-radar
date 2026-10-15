@@ -296,7 +296,7 @@ def _seed_source_ledgers(directories):
     collect_x._save_state(x_dir, collect_x._new_state())
 
 
-def _run_authentic_preflight_with_mocked_ledgers(directory):
+def _run_authentic_preflight_with_mocked_ledgers(directory, *, runtime_credentials=False):
     import network_guard
 
     network_guard.install()
@@ -331,11 +331,11 @@ def _run_authentic_preflight_with_mocked_ledgers(directory):
         patch.object(collect_reddit, "locked_state", reddit_ledger),
         patch.object(collect_x, "_ticket_lock", x_ledger),
         patch.object(collect_x, "load_state", return_value=collect_x._new_state()),
-        patch.object(
+        (contextlib.nullcontext() if runtime_credentials else patch.object(
             product.ProductRunner,
             "_credentials",
             side_effect=product.ProductError("synthetic_preflight_stop", "credentials"),
-        ),
+        )),
         patch.object(product, "_default_http_request", side_effect=AssertionError("network boundary reached")),
     ):
         return product.run_product_cycle(config, output, "synthetic-preflight", SCHEDULED_FOR)
@@ -389,6 +389,94 @@ class ProductCycleTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(dir=HERMES_TMPDIR)
         self.directory = Path(self.temporary.name)
         self.addCleanup(self.temporary.cleanup)
+
+    def test_production_credentials_reuse_selected_hermes_profile_without_copy(self):
+        profile = self.directory / "selected-profile"
+        profile.mkdir(mode=0o700)
+        credential_file = profile / ".env"
+        seen = []
+
+        def stop_after_credentials(_runner, _ledger, credentials, *_args):
+            seen.append(credentials["discord_bot_token"] == DISCORD_KEY)
+            raise product.ProductError("synthetic_stop_after_credentials", "source_acquisition")
+
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(profile), "DISCORD_BOT_TOKEN": "wrong-inherited-profile"}),
+            patch.object(collect_x, "_load_credentials", return_value=(TOKEN, None)),
+            patch.object(product.deepseek_verify, "load_api_key", return_value=MODEL_KEY),
+            patch.object(product.ProductRunner, "_acquire", autospec=True, side_effect=stop_after_credentials),
+        ):
+            contents = (
+                f'DISCORD_BOT_TOKEN="{DISCORD_KEY}"\n',
+                f"export DISCORD_BOT_TOKEN = '{DISCORD_KEY}' # existing bot\n",
+                f"export\tDISCORD_BOT_TOKEN={DISCORD_KEY}\n",
+                f"export \t'DISCORD_BOT_TOKEN'={DISCORD_KEY}\n",
+                f'export\t"DISCORD_BOT_TOKEN" = "{DISCORD_KEY}" # existing bot\n',
+                f'\ufeffDISCORD_BOT_TOKEN="{DISCORD_KEY}" # existing bot\n',
+                f"DISCORD_BOT_TOKEN={DISCORD_KEY} # existing bot\n",
+            )
+            for index, content in enumerate(contents):
+                with self.subTest(index=index):
+                    credential_file.write_text(content, encoding="utf-8")
+                    credential_file.chmod(0o600)
+                    result = _run_authentic_preflight_with_mocked_ledgers(
+                        self.directory / "probes" / str(index), runtime_credentials=True,
+                    )
+                    self.assertEqual(result["error"], "synthetic_stop_after_credentials")
+                    self.assertEqual(credential_file.read_text(), content)
+        self.assertEqual(seen, [True] * len(contents))
+        self.assertFalse((profile / "discord.env").exists())
+        for artifact in (self.directory / "probes").rglob("*"):
+            if artifact.is_file():
+                self.assertNotIn(DISCORD_KEY.encode(), artifact.read_bytes())
+
+    def test_missing_or_unsafe_profile_credential_never_falls_back(self):
+        for case in ("missing", "unsafe", "empty", "duplicate", "mixed_duplicate", "tab_duplicate", "quoted_duplicate", "double_quoted_duplicate", "malformed", "bare_key", "symlink"):
+            with self.subTest(case=case):
+                directory = self.directory / case
+                profile = directory / "profile"
+                profile.mkdir(parents=True, mode=0o700)
+                if case != "missing":
+                    credential_file = profile / ".env"
+                    content = "DISCORD_BOT_TOKEN=\n" if case == "empty" else f"DISCORD_BOT_TOKEN={DISCORD_KEY}\n"
+                    credential_file.write_text(content * (2 if case == "duplicate" else 1), encoding="utf-8")
+                    if case == "mixed_duplicate":
+                        credential_file.write_text(content + "export DISCORD_BOT_TOKEN=stale-bot\n", encoding="utf-8")
+                    if case == "tab_duplicate":
+                        credential_file.write_text(content + "export\tDISCORD_BOT_TOKEN=current-bot\n", encoding="utf-8")
+                    if case == "quoted_duplicate":
+                        credential_file.write_text(content + "export\t'DISCORD_BOT_TOKEN'=current-bot\n", encoding="utf-8")
+                    if case == "double_quoted_duplicate":
+                        credential_file.write_text(content + 'export\t"DISCORD_BOT_TOKEN"=current-bot\n', encoding="utf-8")
+                    if case == "malformed":
+                        credential_file.write_text(f'DISCORD_BOT_TOKEN="{DISCORD_KEY}\n', encoding="utf-8")
+                    if case == "bare_key":
+                        credential_file.write_text("DISCORD_BOT_TOKEN\n", encoding="utf-8")
+                    credential_file.chmod(0o644 if case == "unsafe" else 0o600)
+                    if case == "symlink":
+                        credential_file.rename(profile / "original.env")
+                        credential_file.symlink_to(profile / "original.env")
+                with (
+                    patch.dict(os.environ, {"HERMES_HOME": str(profile), "DISCORD_BOT_TOKEN": "wrong-inherited-profile"}),
+                    patch.object(collect_x, "_load_credentials", return_value=(TOKEN, None)),
+                    patch.object(product.deepseek_verify, "load_api_key", return_value=MODEL_KEY),
+                    patch.object(product.ProductRunner, "_acquire", side_effect=AssertionError("dispatch reached")),
+                ):
+                    result = _run_authentic_preflight_with_mocked_ledgers(directory / "probe", runtime_credentials=True)
+                self.assertEqual(result["error"], "discord_credential_unavailable")
+                self.assertEqual(result["dispatches"], {"source": 0, "model": 0, "discord": 0})
+
+    def test_default_hermes_profile_is_used_only_without_a_selected_profile(self):
+        home = self.directory / "home"
+        home.mkdir(mode=0o700)
+        hermes = home / ".hermes"
+        hermes.mkdir(mode=0o700)
+        credential_file = hermes / ".env"
+        credential_file.write_text(f'DISCORD_BOT_TOKEN="{DISCORD_KEY}"\n', encoding="utf-8")
+        credential_file.chmod(0o600)
+        with patch.dict(os.environ, {"HOME": str(home), "DISCORD_BOT_TOKEN": "wrong-inherited-profile"}, clear=True):
+            self.assertEqual(product._load_discord_token(), DISCORD_KEY)
+        self.assertFalse((hermes / "discord.env").exists())
 
     def test_runnable_product_cycle_uses_concrete_adapters_and_retains_lineage(self):
         code, result, service, calls, output = _run(
@@ -866,6 +954,7 @@ class ProductCycleTests(unittest.TestCase):
             "PYTHONPATH": os.pathsep.join((str(ROOT / "tests"), str(ROOT))),
             "PYTHONDONTWRITEBYTECODE": "1",
             "TMPDIR": str(HERMES_TMPDIR),
+            "HERMES_HOME": os.environ.get("HERMES_HOME", ""),
         }
         child_directory = self.directory / "subprocess"
         child = subprocess.run(
@@ -926,12 +1015,23 @@ class ProductCycleTests(unittest.TestCase):
     def test_live_state_credentials_and_network_denials_apply_in_process_and_subprocess(self):
         import network_guard
 
+        selected_profile = self.directory / "custom-hermes-profile"
+        selected_profile.mkdir(mode=0o700)
+        selected_credentials = selected_profile / ".env"
+        selected_credentials.write_text("DISCORD_BOT_TOKEN=synthetic-only\n", encoding="utf-8")
+        selected_credentials.chmod(0o600)
+        previous_selected_credentials = network_guard.HERMES_CREDENTIALS_PATH
+        network_guard.HERMES_CREDENTIALS_PATH = str(selected_credentials)
+        self.addCleanup(setattr, network_guard, "HERMES_CREDENTIALS_PATH", previous_selected_credentials)
         network_guard.install()
         probes = (
             lambda: socket.socket(),
             lambda: open(network_guard.CREDENTIALS_PATH, "rb"),
             lambda: open(network_guard.DEEPSEEK_CREDENTIALS_PATH, "rb"),
             lambda: open(network_guard.DISCORD_CREDENTIALS_PATH, "rb"),
+            lambda: open(network_guard.HERMES_CREDENTIALS_PATH, "rb"),
+            lambda: open(network_guard.HERMES_DEFAULT_CREDENTIALS_PATH, "rb"),
+            lambda: open(network_guard.HERMES_PROFILES_PATH + "/guard-probe/.env", "rb"),
             lambda: open(network_guard.LIVE_STATE_PATH + "/assessment/state.json", "rb"),
         )
         for probe in probes:
@@ -942,6 +1042,7 @@ class ProductCycleTests(unittest.TestCase):
             "PYTHONPATH": os.pathsep.join((str(ROOT / "tests"), str(ROOT))),
             "PYTHONDONTWRITEBYTECODE": "1",
             "TMPDIR": str(HERMES_TMPDIR),
+            "HERMES_HOME": str(selected_profile),
         }
         with tempfile.TemporaryDirectory(dir=HERMES_TMPDIR) as child_directory:
             product_probe = f'''import network_guard
@@ -958,11 +1059,22 @@ print(result["status"])
             )
         self.assertEqual(product_result.returncode, 0, product_result.stderr)
         self.assertEqual(product_result.stdout.strip(), "success")
+        credential_result = subprocess.run(
+            [sys.executable, "-m", "unittest",
+             "test_product_cycle.ProductCycleTests.test_production_credentials_reuse_selected_hermes_profile_without_copy",
+             "test_product_cycle.ProductCycleTests.test_missing_or_unsafe_profile_credential_never_falls_back", "-q"],
+            cwd=ROOT, env=env, capture_output=True, text=True, timeout=20, check=False,
+        )
+        self.assertEqual(credential_result.returncode, 0, credential_result.stderr)
+        self.assertNotIn(DISCORD_KEY, credential_result.stdout + credential_result.stderr)
         commands = (
             "import socket; socket.socket()",
             f"open({network_guard.CREDENTIALS_PATH!r}, 'rb')",
             f"open({network_guard.DEEPSEEK_CREDENTIALS_PATH!r}, 'rb')",
             f"open({network_guard.DISCORD_CREDENTIALS_PATH!r}, 'rb')",
+            f"open({network_guard.HERMES_CREDENTIALS_PATH!r}, 'rb')",
+            f"open({network_guard.HERMES_DEFAULT_CREDENTIALS_PATH!r}, 'rb')",
+            f"open({str(Path(network_guard.HERMES_PROFILES_PATH) / 'guard-probe/.env')!r}, 'rb')",
             f"open({str(Path(network_guard.LIVE_STATE_PATH) / 'assessment/state.json')!r}, 'rb')",
         )
         for command in commands:

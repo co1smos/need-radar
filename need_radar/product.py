@@ -9,6 +9,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import stat
@@ -943,7 +944,7 @@ class ProductRunner:
                     "treg_token": treg_token,
                     "treg_org": treg_org,
                     "deepseek_api_key": load_api_key(),
-                    "discord_bot_token": _load_discord_token(Path.home() / ".config" / "need-radar" / "discord.env"),
+                    "discord_bot_token": _load_discord_token(),
                 }
         except ProductError:
             raise
@@ -1606,13 +1607,30 @@ def _charge(value):
     return int(value)
 
 
-def _load_discord_token(path):
-    path = Path(path)
+def _load_discord_token():
+    profile_home = Path(os.environ.get("HERMES_HOME", "").strip() or Path.home() / ".hermes").expanduser()
+    path = profile_home / ".env"
     try:
         info = path.lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
             raise ValueError
-        values = [line.split("=", 1)[1].strip().strip("\"'") for line in path.read_text().splitlines() if line.strip().startswith("DISCORD_BOT_TOKEN=")]
+        values = []
+        names = ("DISCORD_BOT_TOKEN", "'DISCORD_BOT_TOKEN'", '"DISCORD_BOT_TOKEN"')
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
+            line = re.sub(r"^export[^\S\r\n]+", "", line.strip())
+            name, separator, value = line.partition("=")
+            if name.strip() not in names:
+                if any(re.match(rf"^{re.escape(candidate)}(?:$|[ \t=:])", line) for candidate in names):
+                    raise ValueError
+                continue
+            # Accept Hermes assignment forms only when they contain a literal bot token.
+            match = re.fullmatch(
+                r'''(?:"([A-Za-z0-9._-]+)"(?:\s*\#.*)?|'([A-Za-z0-9._-]+)'(?:\s*\#.*)?|([A-Za-z0-9._-]+)(?:\s+\#.*)?)''',
+                value.strip(),
+            )
+            if not separator or match is None:
+                raise ValueError
+            values.append(next(item for item in match.groups() if item is not None))
         if len(values) != 1 or not values[0]:
             raise ValueError
         return values[0]
