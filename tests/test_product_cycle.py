@@ -271,6 +271,51 @@ def _seed_source_ledgers(directories):
     collect_x._save_state(x_dir, collect_x._new_state())
 
 
+def _run_authentic_preflight_with_mocked_ledgers(directory):
+    import network_guard
+
+    network_guard.install()
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    activation_path = directory / "activation.json"
+    activation_path.write_text(json.dumps(_activation()), encoding="utf-8")
+    activation_path.chmod(0o600)
+    config = _config(directory)
+    budget_path = directory / "product-budget.sqlite3"
+    config["product_budget_db"] = str(budget_path)
+    output = directory / "runs" / "preflight"
+
+    @contextlib.contextmanager
+    def reddit_ledger(state_dir):
+        assert Path(state_dir).absolute() == collect_reddit.STATE_DEFAULT.absolute()
+        state = collect_reddit.default_state()
+        state["incident_hold"]["disposition"] = {
+            "classification": collect_reddit.INCIDENT_CLASSIFICATION,
+            "evidence_ref": collect_reddit.INCIDENT_EVIDENCE_REF,
+            "evidence_sha256": collect_reddit.INCIDENT_EVIDENCE_SHA256,
+        }
+        yield Path(state_dir) / "state.json", state
+
+    @contextlib.contextmanager
+    def x_ledger(state_dir):
+        assert Path(state_dir).absolute() == collect_x.DEFAULT_STATE_DIR.absolute()
+        yield
+
+    with (
+        patch.object(product, "PRODUCT_BUDGET_DB", budget_path),
+        patch.object(collect_reddit, "locked_state", reddit_ledger),
+        patch.object(collect_x, "_ticket_lock", x_ledger),
+        patch.object(collect_x, "load_state", return_value=collect_x._new_state()),
+        patch.object(
+            product.ProductRunner,
+            "_credentials",
+            side_effect=product.ProductError("synthetic_preflight_stop", "credentials"),
+        ),
+        patch.object(product, "_default_http_request", side_effect=AssertionError("network boundary reached")),
+    ):
+        return product.run_product_cycle(config, output, "synthetic-preflight", SCHEDULED_FOR)
+
+
 def _run(directory, *, http=None, activation=None, mode="success", partial_reddit=False, ambiguous_discord=False, timeout_seconds=60, budget_exhausted=False):
     directory = Path(directory)
     activation_path = directory / "activation.json"
@@ -327,6 +372,13 @@ class ProductCycleTests(unittest.TestCase):
         self.assertEqual(code, 0, result)
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["evidence_kind"], "synthetic_injected_boundary")
+        run_record = json.loads((output / "run-record.json").read_text())
+        self.assertIs(run_record["configuration"]["provider_invoked"], False)
+        self.assertIs(run_record["configuration"]["source_acquisition_invoked"], False)
+        self.assertIs(run_record["configuration"]["real_delivery_invoked"], False)
+        self.assertEqual(run_record["configuration"]["injected_boundary_dispatches"], {
+            "source": 2, "model": 5, "discord": 2,
+        })
         health = json.loads((output / "product-health.json").read_text())
         self.assertEqual(health["serve_status"], "success")
         self.assertEqual(health["delivery_status"], "delivered_reconciled")
@@ -685,6 +737,36 @@ class ProductCycleTests(unittest.TestCase):
         collect_x._save_state(paths["x"], x_state)
         with self.assertRaisesRegex(product.ProductError, "x_canonical_accounting_hold_unresolved"):
             product._check_existing_holds(paths)
+
+    def test_authentic_preflight_uses_canonical_ledgers_with_network_denied(self):
+        result = _run_authentic_preflight_with_mocked_ledgers(self.directory / "in-process")
+        self.assertEqual((result["status"], result["stage"]), ("blocked", "credentials"))
+        self.assertEqual(result["dispatches"], {"source": 0, "model": 0, "discord": 0})
+
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONPATH": os.pathsep.join((str(ROOT / "tests"), str(ROOT))),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "TMPDIR": str(HERMES_TMPDIR),
+        }
+        child_directory = self.directory / "subprocess"
+        child = subprocess.run(
+            [
+                sys.executable, "-c",
+                "from pathlib import Path; from test_product_cycle import _run_authentic_preflight_with_mocked_ledgers; "
+                f"result = _run_authentic_preflight_with_mocked_ledgers(Path({str(child_directory)!r})); "
+                "assert (result['status'], result['stage']) == ('blocked', 'credentials'), result; "
+                "assert result['dispatches'] == {'source': 0, 'model': 0, 'discord': 0}; print('preflight=passed')",
+            ],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(child.returncode, 0, child.stderr)
+        self.assertEqual(child.stdout.strip(), "preflight=passed")
 
     def test_cleanup_enforces_short_retention_and_keeps_other_directories(self):
         runs = self.directory / "runs"

@@ -989,7 +989,7 @@ class ProductRunner:
             if not self.injected and budget_path != PRODUCT_BUDGET_DB:
                 raise ProductError("product_budget_path_must_use_persistent_canonical_ledger")
             if not self.injected:
-                _check_existing_holds(self.source_state_dirs)
+                _check_existing_holds()
             _private_dir(self.config["output_root"])
             ledger = ProductBudget(budget_path)
             ledger.claim_one_shot(self.run_id)

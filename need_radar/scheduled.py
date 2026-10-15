@@ -507,10 +507,12 @@ def run_cycle(config, scheduled_for=None, boundaries=None):
                 "warnings": ([operation["error"]] if operation.get("error") else []) + operation.get("warnings", []),
             })
             dispatches = operation.get("dispatches", {})
+            authentic = operation.get("evidence_kind") == "authentic_live"
             result["configuration"].update({
-                "provider_invoked": dispatches.get("model", 0) > 0,
-                "source_acquisition_invoked": dispatches.get("source", 0) > 0,
-                "real_delivery_invoked": dispatches.get("discord", 0) > 0,
+                "provider_invoked": authentic and dispatches.get("model", 0) > 0,
+                "source_acquisition_invoked": authentic and dispatches.get("source", 0) > 0,
+                "real_delivery_invoked": authentic and dispatches.get("discord", 0) > 0,
+                "injected_boundary_dispatches": dispatches if operation.get("evidence_kind") == "synthetic_injected_boundary" else {},
             })
             if operation.get("serve_status") in {"success", "no_findings"}:
                 serve_ref = _accept_serve_exit(0, output_directory / "serve")
