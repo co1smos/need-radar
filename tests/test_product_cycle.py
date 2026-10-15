@@ -126,11 +126,10 @@ class InjectedHTTP:
                 body_value = {"data": {"subredditV3": {"elements": {
                     "edges": [{"node": {
                         "id": reddit_id,
-                        "createdAt": post_time,
                         "cells": [
                             {"__typename": "TitleCell", "title": "Agent setup repeats"},
                             {"__typename": "PreviewTextCell", "text": "I repeat tool setup after each session reset."},
-                            {"__typename": "MetadataCell", "detailsLink": "https://www.reddit.com/r/AI_Agents/comments/synthetic001/setup"},
+                            {"__typename": "MetadataCell", "createdAt": post_time, "detailsLink": "https://www.reddit.com/r/AI_Agents/comments/synthetic001/setup"},
                         ],
                     }}],
                     "pageInfo": {"hasNextPage": True, "endCursor": "synthetic-next"},
@@ -367,7 +366,7 @@ class ProductCycleTests(unittest.TestCase):
 
     def test_runnable_product_cycle_uses_concrete_adapters_and_retains_lineage(self):
         code, result, service, calls, output = _run(
-            self.directory, partial_reddit=True, ambiguous_discord=True,
+            self.directory, ambiguous_discord=True,
         )
         self.assertEqual(code, 0, result)
         self.assertEqual(result["status"], "success")
@@ -407,6 +406,18 @@ class ProductCycleTests(unittest.TestCase):
             for record in json.loads((output / "serve" / "snapshot.json").read_text())["items"]
         }
         self.assertEqual(acquisition_ids, {health["lineage"]["acquisition"]["artifact_id"]})
+        acquisition = json.loads((output / "acquisition.json").read_text())
+        reddit_posts = acquisition["source_results"]["reddit"]["posts"]
+        self.assertEqual(len(reddit_posts), 1)
+        self.assertEqual(reddit_posts[0]["id"], "t3_synthetic001")
+        self.assertEqual(
+            reddit_posts[0]["created_at"],
+            (NOW - timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+        )
+        snapshot = json.loads((output / "serve" / "snapshot.json").read_text())
+        reddit_items = [item for item in snapshot["items"] if item["id"] == "reddit:t3_synthetic001"]
+        self.assertEqual(len(reddit_items), 1)
+        self.assertEqual(reddit_items[0]["timestamp"], reddit_posts[0]["created_at"])
         self.assertEqual(len(health["artifacts"]["model_calls"]), service.model_calls)
         judge_prompt = json.loads((output / "serve" / "judge-prompt.json").read_text())
         self.assertEqual(judge_prompt["prompts"][0]["prompt"]["config"]["provider"], "deepseek-direct")
@@ -449,19 +460,19 @@ class ProductCycleTests(unittest.TestCase):
         source_dirs = _source_state_dirs(self.directory)
         reddit_state, _ = collect_reddit.load_state(source_dirs["reddit"] / "state.json")
         x_state = collect_x.load_state(source_dirs["x"])
-        self.assertEqual((reddit_state["attempts"], reddit_state["spent_micro_usd"], reddit_state["successful_requests"]), (1, 500, 0))
+        self.assertEqual((reddit_state["attempts"], reddit_state["spent_micro_usd"], reddit_state["successful_requests"]), (1, 500, 1))
         self.assertIsNone(reddit_state["pending"])
         self.assertEqual((x_state["attempt_count"], x_state["charged_micro_usd"], x_state["successful_requests"]), (1, 1000, 1))
         self.assertEqual(x_state["attempts"][0]["call_id"], "call-x-success")
         budget_attempts = product.ProductBudget(self.directory / "private-budget.sqlite3").attempts()
-        self.assertEqual(budget_attempts[0]["provider_call_id"], "call-reddit-partial")
+        self.assertEqual(budget_attempts[0]["provider_call_id"], "call-reddit-success")
         self.assertEqual(budget_attempts[1]["provider_call_id"], "call-x-success")
         self.assertEqual(budget_attempts[0]["accounting_evidence"]["charged_micro_usd"], 500)
         self.assertEqual(budget_attempts[2]["provider_request_id"], "synthetic-deepseek-request")
         product._check_existing_holds(source_dirs)
         self.assertEqual(product.cleanup(output.parent, now=NOW + timedelta(days=4))["removed"], 1)
         self.assertTrue(any(
-            item["provider_call_id"] == "call-reddit-partial"
+            item["provider_call_id"] == "call-reddit-success"
             for item in product.ProductBudget(self.directory / "private-budget.sqlite3").attempts()
         ))
 

@@ -747,8 +747,17 @@ def _reddit_rows(body, window_start, window_end, origin, token):
         if not isinstance(node, dict):
             errors.append("response_invalid")
             continue
+        cells = node.get("cells")
+        metadata = next(
+            (item for item in cells if isinstance(item, dict) and item.get("__typename") == "MetadataCell"),
+            None,
+        ) if isinstance(cells, list) else None
         try:
-            created = collect_reddit.post_time(node)
+            time_node = (
+                {**node, "createdAt": metadata.get("createdAt", node.get("createdAt"))}
+                if isinstance(metadata, dict) else node
+            )
+            created = collect_reddit.post_time(time_node)
         except (ValueError, TypeError):
             created = None
         if created is None:
@@ -771,11 +780,9 @@ def _reddit_rows(body, window_start, window_end, origin, token):
             continue
         title = node.get("title")
         text = node.get("selftext", node.get("text"))
-        cells = node.get("cells")
         if isinstance(cells, list):
             title_cell = next((item for item in cells if isinstance(item, dict) and item.get("__typename") == "TitleCell"), None)
             preview = next((item for item in cells if isinstance(item, dict) and item.get("__typename") == "PreviewTextCell"), None)
-            metadata = next((item for item in cells if isinstance(item, dict) and item.get("__typename") == "MetadataCell"), None)
             title = title_cell.get("title") if isinstance(title_cell, dict) else title
             text = preview.get("text") if isinstance(preview, dict) else text
             if isinstance(metadata, dict):
