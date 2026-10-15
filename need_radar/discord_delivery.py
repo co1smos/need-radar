@@ -203,6 +203,14 @@ def deliver_payload(payload, transport, on_update=None, tracer=None):
                     break
 
                 if message is not None:
+                    if message.get("status") == "inconclusive":
+                        attempt["reconciliation"] = {"status": "inconclusive"}
+                        result["status"] = "ambiguous"
+                        if span:
+                            span["attributes"]["result_status"] = result["status"]
+                            span["output"] = {"reconciliation": attempt["reconciliation"]}
+                        checkpoint()
+                        break
                     message_id = message.get("message_id")
                     if message.get("payload_identity") == payload["payload_identity"] and isinstance(message_id, str) and message_id:
                         attempt.update({

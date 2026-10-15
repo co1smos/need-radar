@@ -485,11 +485,14 @@ class DiscordRestTransport:
         else:
             body = json.dumps(value, ensure_ascii=False).encode("utf-8")
             content_type = "application/json"
-        status, _headers, raw = self.request(
-            "POST", f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages",
-            {"Authorization": f"Bot {self.token}", "Content-Type": content_type, "Accept": "application/json"},
-            body, 15, 8 * 1024 * 1024,
-        )
+        try:
+            status, _headers, raw = self.request(
+                "POST", f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages",
+                {"Authorization": f"Bot {self.token}", "Content-Type": content_type, "Accept": "application/json"},
+                body, 15, 8 * 1024 * 1024,
+            )
+        except Exception:
+            raise RuntimeError("discord_send_transport_error") from None
         result = _json_body(raw)
         message_id = self._message_id(result.get("id")) if isinstance(result, dict) else None
         if status not in {200, 201} or message_id is None:
@@ -498,18 +501,21 @@ class DiscordRestTransport:
 
     def find_by_payload_identity(self, payload_identity):
         query = urllib.parse.urlencode({"limit": 100})
-        status, _headers, raw = self.request(
-            "GET", f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages?{query}",
-            {"Authorization": f"Bot {self.token}", "Accept": "application/json"},
-            None, 15, 2 * 1024 * 1024,
-        )
+        try:
+            status, _headers, raw = self.request(
+                "GET", f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages?{query}",
+                {"Authorization": f"Bot {self.token}", "Accept": "application/json"},
+                None, 15, 2 * 1024 * 1024,
+            )
+        except Exception:
+            raise RuntimeError("discord_readback_transport_error") from None
         messages = _json_body(raw)
         if status != 200 or not isinstance(messages, list):
             raise RuntimeError("discord_readback_unavailable")
         nonce = self._nonce(payload_identity)
         message = next((item for item in messages if isinstance(item, dict) and item.get("nonce") == nonce), None)
         if message is None:
-            return None
+            return {"status": "inconclusive"}
         return {"message_id": self._message_id(message.get("id")), "payload_identity": payload_identity}
 
 
@@ -1259,7 +1265,11 @@ class ProductRunner:
     def _acquire(self, ledger, credentials, window, activation, evidence_kind):
         start, end = _created_datetime(window["start"]), _created_datetime(window["end"])
         now_text = window["end"]
-        x_params = {"query": X_QUERY, "start_time": window["start"], "end_time": window["end"], "max_results": 10}
+        x_params = {
+            "query": X_QUERY, "start_time": window["start"], "end_time": window["end"],
+            "max_results": 10,
+            "tweet.fields": "created_at,conversation_id,edit_history_tweet_ids,referenced_tweets",
+        }
         reddit_params = {"subreddit_name": "AI_Agents", "sort": "NEW", "need_format": "false"}
         sources, errors, unknown, budget_violation, accounting_unresolved = {}, {}, False, False, False
         all_bodies = {}
