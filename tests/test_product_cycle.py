@@ -1036,32 +1036,31 @@ class ProductCycleTests(unittest.TestCase):
         runs = self.directory / "partial-removal-runs"
         run_dir, message_id, identity = _make_removable_run(runs, run_id="b" * 32)
         marker_path = run_dir / ".product-retention.json"
-        original_rmtree = product.shutil.rmtree
-        first_attempt = True
-
-        def fail_after_removing_report(path, *args, **kwargs):
-            nonlocal first_attempt
-            if first_attempt and Path(path) == run_dir / "serve":
-                first_attempt = False
-                (Path(path) / "report.md").unlink()
-                raise PermissionError("synthetic failure after partial deletion")
-            return original_rmtree(path, *args, **kwargs)
-
-        with patch.object(product.shutil, "rmtree", side_effect=fail_after_removing_report):
-            first = product.remove_run(runs, run_dir.name, now=NOW)
-
-        self.assertEqual(first["local"]["status"], "partial")
-        self.assertTrue(marker_path.is_file())
-        self.assertFalse((run_dir / "serve" / "report.md").exists())
-        self.assertTrue((run_dir / "serve" / "lineage.sqlite3").is_file())
-        receipt_path = runs / ".product-removals" / f"{run_dir.name}.json"
-        self.assertEqual(json.loads(receipt_path.read_text())["local_status"], "partial")
-
+        deleted_dir = run_dir / "a-deleted-first"
+        deleted_dir.mkdir(mode=0o700)
+        (deleted_dir / "private.txt").write_text("synthetic private content", encoding="utf-8")
+        (deleted_dir / "private.txt").chmod(0o600)
+        blocked_dir = run_dir / "z-inaccessible"
+        blocked_dir.mkdir(mode=0o700)
+        (blocked_dir / "private.txt").write_text("synthetic private content", encoding="utf-8")
+        (blocked_dir / "private.txt").chmod(0o600)
+        blocked_dir.chmod(0o500)
         transport = product.FakeDiscordTransport()
         transport.messages.append({
             "message_id": message_id, "channel_id": product.CHANNEL_ID,
             "payload_identity": identity, "bot_created": True,
         })
+
+        first = product.remove_run(runs, run_dir.name, transport=transport, now=NOW)
+
+        self.assertEqual(first["local"]["status"], "partial")
+        self.assertTrue(marker_path.is_file())
+        self.assertFalse(deleted_dir.exists())
+        self.assertTrue(blocked_dir.is_dir())
+        receipt_path = runs / ".product-removals" / f"{run_dir.name}.json"
+        self.assertEqual(json.loads(receipt_path.read_text())["local_status"], "partial")
+
+        blocked_dir.chmod(0o700)
         recovered = product.remove_run(runs, run_dir.name, transport=transport, now=NOW)
 
         self.assertEqual(recovered["local"]["status"], "removed")
