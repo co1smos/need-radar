@@ -816,6 +816,7 @@ def _reddit_rows(body, window_start, window_end, origin, token):
             "id": source_id,
             "title": title,
             "selftext": text or "",
+            "author": metadata.get("authorName", node.get("author")) if isinstance(metadata, dict) else node.get("author"),
             "created_at": created.isoformat().replace("+00:00", "Z"),
             "permalink": url,
             "edited": node.get("edited") if isinstance(node.get("edited"), bool) else None,
@@ -1268,6 +1269,7 @@ class ProductRunner:
         now_text = window["end"]
         x_params = {
             "query": X_QUERY, "start_time": window["start"], "end_time": window["end"],
+            "sort_order": "recency",
             "max_results": 10,
             "tweet.fields": "created_at,conversation_id,edit_history_tweet_ids,referenced_tweets",
         }

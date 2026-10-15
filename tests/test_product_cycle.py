@@ -17,8 +17,10 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlsplit
 from unittest.mock import patch
 
+import network_guard
 from need_radar import __main__ as serve
 from need_radar import product, scheduled
+from need_radar.discord_delivery import FakeDiscordTransport, build_payload
 from scripts import collect_reddit, collect_x
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -97,6 +99,7 @@ class InjectedHTTP:
         self.ambiguous_discord = ambiguous_discord
         self.calls = []
         self.discord_messages = []
+        self.discord_payloads = []
         self.model_calls = 0
         self.judge_calls = 0
         self.model_requests = []
@@ -125,17 +128,24 @@ class InjectedHTTP:
                 reddit_id = base64.b64encode(b"t3_synthetic001").decode().rstrip("=")
                 post_time = (NOW - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
                 metadata = {"__typename": "MetadataCell", "createdAt": post_time}
-                if self.mode != "reddit_missing_link":
+                if self.mode == "reddit_attribution":
+                    metadata["authorName"] = "@everyone [click](https://evil.invalid) <@12345678901234567>"
+                elif self.mode == "reddit_unsafe_link":
+                    metadata["authorName"] = "[deleted]"
+                if self.mode == "reddit_unsafe_link":
+                    metadata["detailsLink"] = "https://www.reddit.com.evil.invalid/r/AI_Agents/comments/synthetic001/setup"
+                elif self.mode != "reddit_missing_link":
                     metadata["detailsLink"] = "https://www.reddit.com/r/AI_Agents/comments/synthetic001/setup"
+                node = {
+                    "id": reddit_id,
+                    "cells": [
+                        {"__typename": "TitleCell", "title": "Agent setup repeats"},
+                        {"__typename": "PreviewTextCell", "text": "I repeat tool setup after each session reset."},
+                        metadata,
+                    ],
+                }
                 body_value = {"data": {"subredditV3": {"elements": {
-                    "edges": [{"node": {
-                        "id": reddit_id,
-                        "cells": [
-                            {"__typename": "TitleCell", "title": "Agent setup repeats"},
-                            {"__typename": "PreviewTextCell", "text": "I repeat tool setup after each session reset."},
-                            metadata,
-                        ],
-                    }}],
+                    "edges": [{"node": node}],
                     "pageInfo": {"hasNextPage": True, "endCursor": "synthetic-next"},
                 }}}}
                 return 200, {
@@ -146,6 +156,7 @@ class InjectedHTTP:
             assert route == product.X_ROUTE
             assert max_bytes == 1024 * 1024
             assert params["query"] == [product.X_QUERY]
+            assert params["sort_order"] == ["recency"]
             assert params["max_results"] == ["10"]
             assert params["tweet.fields"] == ["created_at,conversation_id,edit_history_tweet_ids,referenced_tweets"]
             start, end = params["start_time"][0], params["end_time"][0]
@@ -215,6 +226,7 @@ class InjectedHTTP:
                 payload = json.loads(match.group(1))
             else:
                 payload = json.loads(body)
+            self.discord_payloads.append(payload)
             message_id = DISCORD_KEY if self.mode == "discord_readback_credential" else "145000000000000001"
             self.discord_messages.append({"id": message_id, "nonce": payload["nonce"]})
             if self.mode == "discord_send_transport_exception_credential":
@@ -580,6 +592,7 @@ class ProductCycleTests(unittest.TestCase):
         self.assertEqual(len(requests), 2)
         x_query = parse_qs(urlsplit(requests[1]).query)
         self.assertEqual(x_query["query"], [product.X_QUERY])
+        self.assertEqual(x_query["sort_order"], ["recency"])
         self.assertEqual(x_query["max_results"], ["10"])
         self.assertEqual(x_query["tweet.fields"], ["created_at,conversation_id,edit_history_tweet_ids,referenced_tweets"])
         source_dirs = _source_state_dirs(self.directory)
@@ -686,9 +699,50 @@ class ProductCycleTests(unittest.TestCase):
         snapshot = json.loads((output / "serve" / "snapshot.json").read_text())
         item = next(item for item in snapshot["items"] if item["id"] == "reddit:t3_synthetic001")
         self.assertEqual(item["references"], [])
+        self.assertIsNone(item["source_author"])
         self.assertTrue(item["flags"]["incomplete"])
+        report = (output / "serve" / "report.md").read_text(encoding="utf-8")
+        self.assertIn("author: unavailable; Reddit backlink unavailable", report)
         coverage = snapshot["source_normalization"]["coverage"]["sources"]["reddit"]
         self.assertIn("reddit:t3_synthetic001 has no source reference", coverage["failure_reasons"])
+
+    def test_source_author_and_backlink_reach_report_and_fake_discord_with_recency_request(self):
+        network_guard.install()
+        _code, result, service, _calls, output = _run(self.directory, mode="reddit_attribution")
+        self.assertEqual(result["status"], "success")
+
+        acquisition = json.loads((output / "acquisition.json").read_text())
+        post = acquisition["source_results"]["reddit"]["posts"][0]
+        self.assertEqual(post["author"], "@everyone [click](https://evil.invalid%29 <@12345678901234567>")
+        snapshot = json.loads((output / "serve" / "snapshot.json").read_text())
+        item = next(item for item in snapshot["items"] if item["id"] == "reddit:t3_synthetic001")
+        self.assertEqual(item["source_author"], post["author"])
+        self.assertEqual(item["references"][0]["value"], post["permalink"])
+        report = (output / "serve" / "report.md").read_text(encoding="utf-8")
+        self.assertIn("@everyone", report)
+        self.assertIn(r"\[click\]", report)
+        self.assertIn("&lt;@12345678901234567&gt;", report)
+        self.assertIn("%29", report)
+        backlink = "[Reddit backlink](https://www.reddit.com/r/AI_Agents/comments/synthetic001/setup)"
+        self.assertIn(backlink, report)
+        self.assertNotIn("[click](https://evil.invalid)", report)
+        self.assertEqual(service.discord_payloads[0]["allowed_mentions"], {"parse": []})
+        fake = FakeDiscordTransport()
+        fake.send(build_payload(report))
+        self.assertEqual(fake.messages[0]["payload"]["canonical_markdown"], report)
+        self.assertIn(backlink, fake.messages[0]["payload"]["canonical_markdown"])
+
+    def test_deleted_author_and_untrusted_backlink_render_as_unavailable(self):
+        network_guard.install()
+        for mode in ("reddit_missing_link", "reddit_unsafe_link"):
+            with self.subTest(mode=mode):
+                case = self.directory / mode
+                case.mkdir()
+                _code, result, _service, _calls, output = _run(case, mode=mode)
+                self.assertEqual(result["status"], "success")
+                report = (output / "serve" / "report.md").read_text(encoding="utf-8")
+                self.assertIn("author: unavailable; Reddit backlink unavailable", report)
+                self.assertNotIn("reddit.com.evil.invalid", report)
 
     def test_source_injection_remains_untrusted_data_in_the_real_model_request(self):
         _code, result, service, _calls, _output = _run(self.directory, mode="source_injection")

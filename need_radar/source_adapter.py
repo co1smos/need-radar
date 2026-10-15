@@ -2,10 +2,11 @@ import base64
 import hashlib
 import json
 import math
-from urllib.parse import urlparse
+import re
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SOURCES = ("reddit", "x")
 CANONICAL_FIELDS = {
     "schema_version",
@@ -15,6 +16,7 @@ CANONICAL_FIELDS = {
     "kind",
     "text",
     "normalized_text",
+    "source_author",
     "timestamp",
     "references",
     "discovery_origin",
@@ -38,6 +40,64 @@ def _timestamp(value):
 
 def _source_error(errors, source, message):
     errors.append(f"{source}: {message}")
+
+
+def _reddit_permalink(value, source_id=None, *, comment=False):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+        path = [unquote(segment, errors="strict") for segment in parsed.path.split("/")]
+    except ValueError:
+        return None
+    trailing_slash = len(path) > 5 and path[-1] == ""
+    if trailing_slash:
+        path.pop()
+    suffix = path[5:]
+    valid_path = (
+        5 <= len(path) <= 7
+        and path[0] == ""
+        and path[1].casefold() == "r"
+        and re.fullmatch(r"[A-Za-z0-9_-]+", path[2], re.ASCII) is not None
+        and path[3].casefold() == "comments"
+        and re.fullmatch(r"[A-Za-z0-9_-]+", path[4], re.ASCII) is not None
+        and (not comment or bool(suffix))
+        and all(segment and segment not in {".", ".."} for segment in path[1:])
+        and all("/" not in segment and "\\" not in segment for segment in path)
+        and all(not any(ord(character) < 0x20 for character in segment) for segment in path)
+    )
+    path_id = suffix[-1] if comment and suffix else path[4] if valid_path else None
+    expected_id = source_id[3:] if isinstance(source_id, str) and source_id.startswith(("t1_", "t3_")) else None
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.hostname not in {"reddit.com", "www.reddit.com", "old.reddit.com"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or not valid_path
+        or (
+            expected_id is not None
+            and path_id.casefold() != expected_id.casefold()
+        )
+    ):
+        return None
+    try:
+        safe_path = "/" + "/".join(quote(segment, safe="-._~") for segment in path[1:])
+    except UnicodeEncodeError:
+        return None
+    return urlunsplit(("https", "www.reddit.com", safe_path + ("/" if trailing_slash else ""), "", ""))
+
+
+def _reddit_author(value):
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return None if not value or value.casefold() in {"[deleted]", "[removed]"} else value
 
 
 def _recording_origin(source, recording):
@@ -118,23 +178,14 @@ def _recorded_reddit(recording):
         if not isinstance(source_id, str) or not source_id.startswith("t3_"):
             posts.append(None)
             continue
-        link = metadata.get("detailsLink")
-        parsed_link = urlparse(link) if isinstance(link, str) else None
-        permalink = (
-            link
-            if parsed_link
-            and parsed_link.scheme in {"http", "https"}
-            and parsed_link.hostname
-            and (parsed_link.hostname == "reddit.com" or parsed_link.hostname.endswith(".reddit.com"))
-            and "/comments/" in parsed_link.path
-            else None
-        )
+        permalink = _reddit_permalink(metadata.get("detailsLink"), source_id)
         posts.append({
             "id": source_id,
             "title": title["title"],
             "selftext": preview.get("text") if preview else None,
             "created_at": metadata.get("createdAt"),
             "permalink": permalink,
+            "author": metadata.get("authorName", node.get("author")),
             "edited": node.get("edited"),
             "deleted": node.get("deleted"),
             "partial": partial,
@@ -237,6 +288,8 @@ def _make_record(source, kind, raw, envelope, content_fields, relationships):
 
     url_field = "permalink" if source == "reddit" else "url"
     url = raw.get(url_field)
+    if source == "reddit":
+        url = _reddit_permalink(url, source_id, comment=kind == "comment")
     if not isinstance(url, str) or not url.strip():
         errors.append(f"{source}:{source_id} has no source reference")
         url = None
@@ -265,6 +318,7 @@ def _make_record(source, kind, raw, envelope, content_fields, relationships):
         "source_id": source_id,
         "kind": kind,
         "text": text,
+        "source_author": _reddit_author(raw.get("author")) if source == "reddit" else None,
         "normalizer_content": {
             field: raw[field]
             for field in content_fields
@@ -513,7 +567,7 @@ def normalization_prompt(prepared):
         if not item["flags"]["withheld"]
     ]
     return {
-        "config": {"version": "source-normalization-v1", "schema_version": SCHEMA_VERSION},
+        "config": {"version": f"source-normalization-v{SCHEMA_VERSION}", "schema_version": SCHEMA_VERSION},
         "messages": [
             {
                 "role": "system",
@@ -569,12 +623,25 @@ def validate_canonical_evidence(items):
             errors.append(f"{prefix} text fields must be strings")
         if not _timestamp(item["timestamp"]):
             errors.append(f"{prefix} has an invalid timestamp")
+        author = item["source_author"]
+        if author is not None and (
+            source != "reddit"
+            or not isinstance(author, str)
+            or not author.strip()
+            or author.casefold() in {"[deleted]", "[removed]"}
+        ):
+            errors.append(f"{prefix} has an invalid source author")
         if not isinstance(item["references"], list) or any(
             not isinstance(reference, dict)
             or set(reference) != {"type", "value"}
             or reference["type"] != "source_url"
             or not isinstance(reference["value"], str)
             or not reference["value"]
+            or (
+                source == "reddit"
+                and _reddit_permalink(reference["value"], source_id, comment=item["kind"] == "comment")
+                != reference["value"]
+            )
             for reference in item["references"]
         ):
             errors.append(f"{prefix} has invalid evidence references")
