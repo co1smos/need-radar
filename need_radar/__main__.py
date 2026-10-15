@@ -11,6 +11,7 @@ from pathlib import Path
 from need_radar import assessment
 from need_radar.observability import JsonlSpanSink, LangfuseBoundary, Tracer
 from need_radar.source_adapter import (
+    _reddit_permalink,
     normalize_prepared_results,
     normalization_prompt,
     prepare_source_results,
@@ -445,12 +446,27 @@ def validate_response(response, items):
             if item is None or excerpt not in item["text"]:
                 errors.append(f"{citation_prefix} does not resolve to prompt context")
                 continue
+            source_author, source_url = None, None
+            if item["source"] == "reddit":
+                source_author = item.get("source_author")
+                references = item.get("references")
+                for reference in (references if isinstance(references, list) else []):
+                    if isinstance(reference, dict) and reference.get("type") == "source_url":
+                        source_url = _reddit_permalink(
+                            reference.get("value"),
+                            item.get("source_id"),
+                            comment=item.get("kind") == "comment",
+                        )
+                        if source_url:
+                            break
             resolved.append(
                 {
                     "item_id": item["id"],
                     "source": item["source"],
                     "excerpt": excerpt,
                     "resolved": True,
+                    "source_author": source_author,
+                    "source_url": source_url,
                 }
             )
         if len(resolved) != len(evidence):
@@ -462,6 +478,16 @@ def validate_response(response, items):
 
 
 def render_report(status, candidates, errors, source_coverage=None, duplicate_groups=None):
+    def attribution(citation):
+        source = markdown_literal(citation["source"])
+        if citation["source"] != "reddit":
+            return source
+        author = citation.get("source_author")
+        author = markdown_literal(author) if isinstance(author, str) and author.strip() else "unavailable"
+        url = citation.get("source_url")
+        backlink = f"[Reddit backlink]({url})" if url else "Reddit backlink unavailable"
+        return f"{source}; author: {author}; {backlink}"
+
     evidence_kind = source_coverage.get("evidence_kind") if isinstance(source_coverage, dict) else None
     recorded_inputs = isinstance(source_coverage, dict) and source_coverage.get("evidence_kind") == (
         "authentic_private_recording_offline_replay"
@@ -498,7 +524,7 @@ def render_report(status, candidates, errors, source_coverage=None, duplicate_gr
         for citation_index, citation in enumerate(candidate["evidence"], start=1):
             lines.append(
                 f"- [Evidence {candidate_index}-{citation_index}](#evidence-{candidate_index}-{citation_index}): "
-                f"{markdown_literal(citation['source'])}"
+                f"{attribution(citation)}"
             )
     if isinstance(source_coverage, dict):
         lines.extend(["", "## Source coverage"])
@@ -552,7 +578,7 @@ def render_report(status, candidates, errors, source_coverage=None, duplicate_gr
                     f"#### Evidence {candidate_index}-{citation_index}",
                     "",
                     f"> {markdown_literal(citation['excerpt'])}",
-                    f"> — {markdown_literal(citation['item_id'])} ({markdown_literal(citation['source'])})",
+                    f"> — {markdown_literal(citation['item_id'])} ({attribution(citation)})",
                 ])
     else:
         lines.append("Extraction did not produce a validated report.")

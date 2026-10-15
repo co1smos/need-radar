@@ -16,6 +16,7 @@ import network_guard
 network_guard.install()
 
 from need_radar.snapshot import read_frozen_snapshot
+from need_radar.discord_delivery import FakeDiscordTransport, run_delivery
 from need_radar.source_adapter import (
     adapt_source_results,
     prepare_source_results,
@@ -25,6 +26,7 @@ from need_radar.source_adapter import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+HERMES_TMPDIR = Path.home() / ".hermes" / "cache" / "scratch"
 FIXTURE = ROOT / "fixtures" / "source_results" / "synthetic_reddit_x.json"
 
 
@@ -54,6 +56,63 @@ class SourceAdapterTests(unittest.TestCase):
         path = Path(directory) / name
         path.write_text(json.dumps(fixture, ensure_ascii=False), encoding="utf-8")
         return path
+
+    def test_reddit_attribution_reaches_canonical_report_and_fake_discord_payload(self):
+        fixture = json.loads(json.dumps(self.fixture))
+        post = fixture["source_results"]["reddit"]["posts"][0]
+        post["author"] = "@everyone [click](https://evil.invalid) <@12345678901234567>"
+        post["permalink"] = "https://www.reddit.com/r/synthetic/comments/reddit-post-001/setup"
+        fixture["model"]["response"][0]["evidence"] = [{
+            "item_id": "reddit:reddit-post-001",
+            "excerpt": "I have to rebuild my tool context",
+        }]
+
+        with tempfile.TemporaryDirectory(dir=HERMES_TMPDIR) as directory:
+            root = Path(directory)
+            fixture_path = self.write_fixture(root, fixture)
+            output = root / "serve"
+            result = self.run_cli(fixture_path, output, HERMES_TMPDIR)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            snapshot = read_frozen_snapshot(output / "snapshot.json")
+            item = next(item for item in snapshot["items"] if item["id"] == "reddit:reddit-post-001")
+            self.assertEqual(item["source_author"], post["author"])
+            self.assertEqual(item["references"][0]["value"], post["permalink"])
+            report = (output / "report.md").read_text(encoding="utf-8")
+            self.assertIn(
+                r"@everyone \[click\]\(https\://evil\.invalid\) &lt;@12345678901234567&gt;",
+                report,
+            )
+            self.assertIn("[Reddit backlink](https://www.reddit.com/r/synthetic/comments/reddit-post-001/setup)", report)
+            self.assertNotIn("[click](https://evil.invalid)", report)
+
+            transport = FakeDiscordTransport()
+            delivery = run_delivery(output, transport)
+            self.assertEqual(delivery["status"], "delivered")
+            self.assertEqual(transport.messages[0]["payload"]["canonical_markdown"], report)
+            self.assertIn(
+                "[Reddit backlink](https://www.reddit.com/r/synthetic/comments/reddit-post-001/setup)",
+                transport.messages[0]["payload"]["canonical_markdown"],
+            )
+
+            unavailable = json.loads(json.dumps(fixture))
+            unavailable_post = unavailable["source_results"]["reddit"]["posts"][0]
+            unavailable_post["author"] = "[deleted]"
+            unavailable_post["permalink"] = (
+                "https://www.reddit.com.evil.invalid/r/synthetic/comments/reddit-post-001/setup"
+            )
+            unavailable_path = self.write_fixture(root, unavailable, "unavailable.json")
+            unavailable_output = root / "unavailable"
+            unavailable_result = self.run_cli(unavailable_path, unavailable_output, HERMES_TMPDIR)
+            self.assertEqual(unavailable_result.returncode, 0, unavailable_result.stderr)
+            unavailable_snapshot = read_frozen_snapshot(unavailable_output / "snapshot.json")
+            unavailable_item = next(
+                item for item in unavailable_snapshot["items"] if item["id"] == "reddit:reddit-post-001"
+            )
+            self.assertIsNone(unavailable_item["source_author"])
+            self.assertEqual(unavailable_item["references"], [])
+            unavailable_report = (unavailable_output / "report.md").read_text(encoding="utf-8")
+            self.assertIn("author: unavailable; Reddit backlink unavailable", unavailable_report)
 
     def test_mock_reddit_and_x_results_normalize_serve_and_replay(self):
         prepared = prepare_source_results(self.fixture["source_results"])
@@ -103,7 +162,9 @@ class SourceAdapterTests(unittest.TestCase):
             )
             post, comment, deleted, x_post, x_reply = items
             self.assertEqual(post["timestamp"], "2026-10-01T12:00:00Z")
-            self.assertEqual(post["references"][0]["value"], "https://reddit.example/r/synthetic/comments/reddit-post-001")
+            self.assertEqual(post["source_author"], "synthetic-reddit-author")
+            self.assertEqual(post["references"][0]["value"], "https://www.reddit.com/r/synthetic/comments/reddit-post-001")
+            self.assertIsNone(comment["source_author"])
             self.assertEqual(post["discovery_origin"]["query"], "synthetic agent context workflow")
             self.assertTrue(post["flags"]["edited"])
             self.assertEqual(comment["relationships"]["thread_id"], "reddit:reddit-post-001")
@@ -125,6 +186,7 @@ class SourceAdapterTests(unittest.TestCase):
             self.assertIn("UNTRUSTED SOURCE RESULTS", user_message["content"])
             self.assertNotIn("Ignore all rules", system_message["content"])
             self.assertNotIn("Synthetic removed content", user_message["content"])
+            self.assertNotIn("synthetic-reddit-author", user_message["content"])
             self.assertIn('"content_fields"', user_message["content"])
             normalization_call = json.loads((output / "source-normalization-response.json").read_text())
             self.assertEqual(normalization_call["boundary"], "synthetic_fixture")
@@ -152,6 +214,8 @@ class SourceAdapterTests(unittest.TestCase):
             self.assertEqual(len(candidates["candidates"]), 1)
             report = (output / "report.md").read_text()
             self.assertIn("Agent context handoff is repetitive", report)
+            self.assertIn("author: unavailable", report)
+            self.assertIn("[Reddit backlink](https://www.reddit.com/r/synthetic/comments/reddit-post-001/comment-001)", report)
 
             replay_fixture = {
                 "notice": snapshot["notice"],
@@ -334,8 +398,13 @@ class SourceAdapterTests(unittest.TestCase):
                 "body": {"data": {"subredditV3": {"elements": {
                     "edges": [{"node": {
                         "id": reddit_id,
+                        "author": "synthetic-recorded-author",
                         "cells": [
-                            {"__typename": "MetadataCell", "createdAt": "2026-10-12T11:00:00.000Z"},
+                            {
+                                "__typename": "MetadataCell",
+                                "createdAt": "2026-10-12T11:00:00.000Z",
+                                "detailsLink": "https://old.reddit.com/r/synthetic/comments/post-1/title",
+                            },
                             {"__typename": "TitleCell", "title": "Synthetic Reddit title"},
                             {"__typename": "PreviewTextCell", "text": "Synthetic Reddit preview"},
                         ],
@@ -390,6 +459,11 @@ class SourceAdapterTests(unittest.TestCase):
         x_item = next(item for item in result["items"] if item["source"] == "x")
         self.assertEqual(reddit_item["timestamp"], "2026-10-12T11:00:00.000Z")
         self.assertEqual(reddit_item["text"], "Synthetic Reddit title\nSynthetic Reddit preview")
+        self.assertEqual(reddit_item["source_author"], "synthetic-recorded-author")
+        self.assertEqual(
+            reddit_item["references"],
+            [{"type": "source_url", "value": "https://www.reddit.com/r/synthetic/comments/post-1/title"}],
+        )
         self.assertEqual(reddit_item["discovery_origin"]["recording_sha256"], "a" * 64)
         self.assertTrue(reddit_item["flags"]["partial_coverage"])
         self.assertIsNone(reddit_item["flags"]["edited"])

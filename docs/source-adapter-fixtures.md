@@ -2,7 +2,7 @@
 
 `fixtures/source_results/synthetic_reddit_x.json` is an offline-only contract example, not a provider recording. The assumed envelope is intentionally small and must not be treated as the actual Treg Reddit/X schema.
 
-- Reddit mock envelope: `partial`, a shared `origin`, and `posts[]`. Each post has `id`, `title`, `selftext`, `created_at`, `permalink`, `edited`, `deleted`, `partial`, optional `thread_id`/`parent_id`, and optional `comments[]` with corresponding comment fields (`body` instead of title/selftext).
+- Reddit mock envelope: `partial`, a shared `origin`, and `posts[]`. Each post has `id`, `title`, `selftext`, `created_at`, optional source-authoritative `author` and `permalink`, `edited`, `deleted`, `partial`, optional `thread_id`/`parent_id`, and optional `comments[]` with corresponding comment fields (`body` instead of title/selftext). Canonical evidence carries `source_author` and an allowlisted Reddit backlink; missing/deleted authors and invalid or missing links stay unavailable.
 - X mock envelope: `partial`, a shared `origin`, and `posts[]`. Each entry has `id`, `text`, `created_at`, `url`, `edited`, `deleted`, `partial`, `conversation_id`, and `in_reply_to_id`.
 - The fake semantic normalizer returns only `{results:[{record_id, normalized_text}]}`. Deterministic code binds each result to its input record and copies IDs, timestamps, references, origin, relationships, and flags; generated text cannot set those fields.
 - Canonical evidence preserves source text separately from `normalized_text`, uses source-qualified IDs, and records unknown metadata as unknown/incomplete rather than guessing. Deleted/empty records are withheld from the normalizer prompt.
