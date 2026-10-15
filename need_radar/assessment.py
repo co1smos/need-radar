@@ -63,7 +63,7 @@ def consolidate_within_arm(arm, candidates):
     }
 
 
-def build_judge_prompt(candidates, evidence_items):
+def build_judge_prompt(candidates, evidence_items, *, direct_product=False):
     if len(candidates) != 1:
         raise ValueError("judge context must contain exactly one candidate")
     items_by_id = {item["id"]: item for item in evidence_items}
@@ -95,8 +95,11 @@ def build_judge_prompt(candidates, evidence_items):
             "context_policy": "One candidate and only its cited items' frozen text and exact excerpts.",
             "requested_model": "DeepSeek V4.1 Flash",
             "model_id": "deepseek-flash",
-            "provider": "unresolved in offline mode",
-            "invocation_settings": "not resolved; no provider was invoked",
+            "provider": "deepseek-direct" if direct_product else "unresolved in offline mode",
+            "invocation_settings": (
+                {"max_output_tokens": 1024, "thinking": "disabled", "tools": "disabled", "browsing": "disabled"}
+                if direct_product else "not resolved; no provider was invoked"
+            ),
             "tools": "disabled",
         },
         "messages": [
@@ -110,11 +113,11 @@ def build_judge_prompt(candidates, evidence_items):
     }
 
 
-def build_isolated_judge_prompts(clusters, evidence_items):
+def build_isolated_judge_prompts(clusters, evidence_items, *, direct_product=False):
     return [
         {
             "cluster_id": cluster["cluster_id"],
-            "prompt": build_judge_prompt([cluster["candidate"]], evidence_items),
+            "prompt": build_judge_prompt([cluster["candidate"]], evidence_items, direct_product=direct_product),
         }
         for cluster in clusters
     ]

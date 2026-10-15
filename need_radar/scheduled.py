@@ -63,14 +63,31 @@ def _read_config(path):
         or config["timeout_seconds"] <= 0
     ):
         raise ValueError("timeout_seconds must be positive")
-    required_paths = ("state_db", "output_root", "serve_fixture", "shadow_fixture")
+    mode = config.get("mode", "fixture")
+    if mode not in {"fixture", "product"}:
+        raise ValueError("operation mode must be fixture or product")
+    required_paths = ("state_db", "output_root")
+    required_paths += ("serve_fixture", "shadow_fixture") if mode == "fixture" else ("activation_file", "product_budget_db")
     if any(not isinstance(config.get(key), str) or not config[key] for key in required_paths):
-        raise ValueError("configuration requires state_db, output_root, serve_fixture, and shadow_fixture paths")
+        raise ValueError("configuration paths are incomplete for the selected operation mode")
+    if mode == "product":
+        from need_radar.product import MAX_AGGREGATE_MODEL_TOKENS, MAX_TOTAL_REQUESTS, PRODUCT_BUDGET_DB
+
+        configured_budget_path = Path(config["product_budget_db"]).expanduser()
+        if configured_budget_path != PRODUCT_BUDGET_DB:
+            raise ValueError("product_budget_db must use the persistent canonical product ledger")
+        if budget != {"requests": MAX_TOTAL_REQUESTS, "tokens": MAX_AGGREGATE_MODEL_TOKENS}:
+            raise ValueError("product budget must use the fixed request and token ceilings")
+        if config["timeout_seconds"] > 300:
+            raise ValueError("product timeout_seconds must not exceed 300")
     resolved = dict(config)
     for key in required_paths:
-        value = Path(config[key])
+        value = Path(config[key]).expanduser()
+        if key == "product_budget_db":
+            resolved[key] = value.expanduser()
+            continue
         resolved[key] = (path.parent / value).resolve() if not value.is_absolute() else value.resolve()
-        if key in {"state_db", "output_root"} and resolved[key].is_relative_to(ROOT):
+        if key in {"state_db", "output_root", "product_budget_db", "activation_file"} and resolved[key].is_relative_to(ROOT):
             raise ValueError(f"{key} must be outside the repository")
     resolved["schedule"] = {
         "interval_seconds": schedule["interval_seconds"],
@@ -79,6 +96,7 @@ def _read_config(path):
     }
     resolved["budget"] = {"requests": budget["requests"], "tokens": budget["tokens"]}
     resolved["timeout_seconds"] = float(config["timeout_seconds"])
+    resolved["mode"] = mode
     resolved["config_path"] = path
     return resolved
 
@@ -114,6 +132,7 @@ def _ensure_hermes_tmpdir():
 def _database(path):
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=10)
+    os.chmod(path, 0o600)
     connection.execute(
         "CREATE TABLE IF NOT EXISTS run_records ("
         "record_id TEXT PRIMARY KEY, kind TEXT NOT NULL, scheduled_for TEXT NOT NULL, "
@@ -393,13 +412,18 @@ def _optional_statuses(serve_directory, shadow_status, delivery_status):
     }
 
 
-def run_cycle(config, scheduled_for=None):
+def run_cycle(config, scheduled_for=None, boundaries=None):
     if config.get("enabled") is not True:
         return {"record_id": None, "status": "disabled", "evidence_kind": "synthetic_offline"}
     hermes_tmpdir = _ensure_hermes_tmpdir()
     slot = _validate_slot(config, scheduled_for) if scheduled_for else _scheduled_for(config)
     database_path = Path(config["state_db"])
     output_root = Path(config["output_root"])
+    if config.get("mode", "fixture") == "product":
+        from need_radar.product import _private_dir
+
+        _private_dir(database_path.parent)
+        _private_dir(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     record_id = uuid.uuid4().hex
     output_directory = output_root / record_id
@@ -461,6 +485,43 @@ def run_cycle(config, scheduled_for=None):
             (linked_watchdog[0], record_id),
         )
         database.commit()
+    if config.get("mode", "fixture") == "product":
+        try:
+            from need_radar.product import run_product_cycle
+
+            output_directory.mkdir(parents=True, exist_ok=False, mode=0o700)
+            operation = run_product_cycle(
+                config, output_directory, record_id, slot, boundaries=boundaries,
+            )
+            result.update({
+                "status": operation["status"],
+                "evidence_kind": operation.get("evidence_kind", "synthetic_injected_boundary"),
+                "stages": {
+                    "serve": operation.get("serve_status", operation.get("error", "not_run")),
+                    "discord_delivery": operation.get("delivery_status", "not_run"),
+                    "shadow": operation.get("shadow_status", "not_run"),
+                },
+                "budget": operation.get("budget"),
+                "coverage": {"source_coverage": operation.get("source_status", "not_run")},
+                "children": {"product": {"output_path": str(output_directory), "stage": operation.get("stage")}},
+                "warnings": ([operation["error"]] if operation.get("error") else []) + operation.get("warnings", []),
+            })
+            dispatches = operation.get("dispatches", {})
+            authentic = operation.get("evidence_kind") == "authentic_live"
+            result["configuration"].update({
+                "provider_invoked": authentic and dispatches.get("model", 0) > 0,
+                "source_acquisition_invoked": authentic and dispatches.get("source", 0) > 0,
+                "real_delivery_invoked": authentic and dispatches.get("discord", 0) > 0,
+                "injected_boundary_dispatches": dispatches if operation.get("evidence_kind") == "synthetic_injected_boundary" else {},
+            })
+            if operation.get("serve_status") in {"success", "no_findings"}:
+                serve_ref = _accept_serve_exit(0, output_directory / "serve")
+                result["children"]["serve"] = {**serve_ref, "output_path": str(output_directory / "serve")}
+            return _finish(database, lock, record_path, result)
+        except Exception as error:
+            result["status"] = "failed"
+            result["error"] = type(error).__name__
+            return _finish(database, lock, record_path, result)
     try:
         output_directory.mkdir(parents=True, exist_ok=False)
         serve_fixture = _fixture(config["serve_fixture"])
@@ -718,20 +779,20 @@ def check_missed(config, scheduled_for=None, observed_at=None):
     return {"record_id": record_id, "status": status, "scheduled_for": slot, "linked_record_id": details["main_record_id"]}
 
 
-def main():
+def main(argv=None, boundaries=None):
     parser = argparse.ArgumentParser(description="Run or monitor a bounded Need Radar operation under Hermes Cron.")
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("run", "missed"):
         command = commands.add_parser(name)
         command.add_argument("--config", required=True, type=Path)
         command.add_argument("--scheduled-for")
-    arguments = parser.parse_args()
+    arguments = parser.parse_args(argv)
     try:
         config = _read_config(arguments.config)
         if not config.get("enabled"):
             result = {"record_id": None, "status": "disabled", "evidence_kind": "synthetic_offline"}
         else:
-            result = run_cycle(config, arguments.scheduled_for) if arguments.command == "run" else check_missed(
+            result = run_cycle(config, arguments.scheduled_for, boundaries=boundaries) if arguments.command == "run" else check_missed(
                 config, arguments.scheduled_for,
             )
     except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, json.JSONDecodeError) as error:

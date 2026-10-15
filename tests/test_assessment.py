@@ -175,6 +175,14 @@ class AssessmentTests(unittest.TestCase):
         self.assertIn("A builder repeatedly copies agent context after resets.", judge_input)
         self.assertEqual(prompt["config"]["rubric_version"], assessment.RUBRIC_VERSION)
         self.assertEqual(prompt["config"]["invocation_settings"], "not resolved; no provider was invoked")
+        self.assertEqual(prompt["config"]["provider"], "unresolved in offline mode")
+
+    def test_direct_product_judge_configuration_is_explicit(self):
+        prompt = assessment.build_judge_prompt(
+            [{**candidate(), "evidence": []}], [], direct_product=True,
+        )
+        self.assertEqual(prompt["config"]["provider"], "deepseek-direct")
+        self.assertEqual(prompt["config"]["invocation_settings"]["max_output_tokens"], 1024)
 
     def test_both_arms_share_rubric_without_cross_candidate_evidence(self):
         serve_item = {

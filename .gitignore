@@ -222,6 +222,7 @@ __marimo__/
 
 # Need Radar credentials
 /credentials.env
+/.need-radar/
 
 # Private reusable acquisition responses; never publish source recordings
 /artifacts/

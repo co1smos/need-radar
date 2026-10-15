@@ -134,6 +134,26 @@ class DeepSeekVerificationTests(unittest.TestCase):
         self.assertNotIn("synthetic-test-key", details["assistant_content"])
         self.assertIn("[REDACTED]", details["assistant_content"])
 
+    def test_invoke_prompt_redacts_credentials_echoed_in_provider_identity_and_request_id(self):
+        api_key = "synthetic-test-key"
+        result = verify.invoke_prompt(
+            verify.SYNTHETIC_PROMPT,
+            api_key,
+            transport=lambda *_args: (200, {"x-request-id": api_key}, response_body(model=api_key)),
+            max_input_tokens=1000,
+            max_output_tokens=256,
+            max_request_bytes=10_000,
+        )
+        self.assertEqual(result["status"], "failure")
+        self.assertEqual(result["returned_model"], "[REDACTED]")
+        self.assertEqual(result["request_id"], "[REDACTED]")
+        self.assertEqual(
+            {key: result["usage_details"][key] for key in ("prompt_tokens", "completion_tokens", "total_tokens")},
+            {"prompt_tokens": 50, "completion_tokens": 2, "total_tokens": 52},
+        )
+        self.assertEqual(result["usage_details"]["prompt_cache_hit_tokens"], 10)
+        self.assertNotIn(api_key, json.dumps(result))
+
     def test_model_mismatch_fails_without_retry(self):
         with mock.patch.object(
             verify, "_send", return_value=self.stub_response(body=response_body(model="other-model"))
