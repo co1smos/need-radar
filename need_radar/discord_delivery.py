@@ -86,11 +86,14 @@ def validate_payload(payload):
 
 
 class FakeDiscordTransport:
-    def __init__(self, fail_before_send=0, timeout_after_send=False, attachment_limit_bytes=None, readback_error=None):
+    def __init__(self, fail_before_send=0, timeout_after_send=False, attachment_limit_bytes=None, readback_error=None,
+                 delete_error=None, delete_timeout_after=False):
         self.fail_before_send = fail_before_send
         self.timeout_after_send = timeout_after_send
         self.attachment_limit_bytes = attachment_limit_bytes
         self.readback_error = readback_error
+        self.delete_error = delete_error
+        self.delete_timeout_after = delete_timeout_after
         self.messages = []
         self.events = []
 
@@ -106,10 +109,12 @@ class FakeDiscordTransport:
             self.fail_before_send -= 1
             raise TimeoutError("synthetic timeout before fake send")
 
-        message_id = f"fake-message-{len(self.messages) + 1:06d}"
+        message_id = f"145000000000000{len(self.messages) + 1:03d}"
         message = {
             "message_id": message_id,
+            "channel_id": payload["channel_id"],
             "payload_identity": payload["payload_identity"],
+            "bot_created": True,
             "payload": copy.deepcopy(payload),
         }
         self.messages.append(message)
@@ -126,6 +131,43 @@ class FakeDiscordTransport:
             (copy.deepcopy(message) for message in self.messages if message["payload_identity"] == payload_identity),
             None,
         )
+
+    def find_for_removal(self, payload_identity):
+        self.events.append("find_for_removal")
+        matches = [message for message in self.messages if message["payload_identity"] == payload_identity]
+        if not matches:
+            return {"status": "inconclusive"}
+        if len(matches) != 1:
+            return {"status": "ambiguous"}
+        message = matches[0]
+        return {
+            "status": "found",
+            "message_id": message["message_id"],
+            "channel_id": message["channel_id"],
+            "payload_identity": message["payload_identity"],
+            "bot_created": message["bot_created"],
+        }
+
+    def delete_message(self, channel_id, message_id, payload_identity):
+        self.events.append("delete")
+        if channel_id != CHANNEL_ID:
+            return {"status": "identity_mismatch"}
+        message = next((item for item in self.messages if item["message_id"] == message_id), None)
+        if message is None:
+            return {"status": "already_absent"}
+        if (
+            message["channel_id"] != channel_id
+            or message["payload_identity"] != payload_identity
+            or not message["bot_created"]
+        ):
+            return {"status": "identity_mismatch"}
+        if self.delete_error:
+            raise RuntimeError(self.delete_error)
+        self.messages.remove(message)
+        if self.delete_timeout_after:
+            self.delete_timeout_after = False
+            raise TimeoutError("synthetic Discord delete outcome is ambiguous")
+        return {"status": "deleted"}
 
 
 def deliver_payload(payload, transport, on_update=None, tracer=None):

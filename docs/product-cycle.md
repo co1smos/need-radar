@@ -24,7 +24,29 @@ The one-shot ledger persists reservations and refuses a second cycle after any c
 NEED_RADAR_OUTPUT_ROOT="$HOME/.local/state/need-radar/product-cycle/runs" scripts/hermes/need-radar-product-cleanup.sh
 ```
 
-An external scheduler may invoke cleanup at a chosen cadence. This change does not create or alter a schedule. To disable before a run, keep `enabled` false in the operation config or activation manifest. To disable after a run, pause only the specific Hermes run/watchdog jobs using the repository's existing disable procedure; do not remove unrelated jobs. Code and example changes can be reverted with `git revert <candidate-commit>`; local private outputs and the aggregate ledger need separate, deliberate retention handling.
+Cleanup expires local run data at its recorded deadline. Without `--discord`, Discord is reported as `not_requested` and any known removal identity stays in the private receipt for later reconciliation. For an explicit early removal, or to remove Discord copies during expiry cleanup, add `--run-id <32-character-run-id> --discord` or `--discord` respectively:
+
+```sh
+NEED_RADAR_OUTPUT_ROOT="$HOME/.local/state/need-radar/product-cycle/runs" \
+  scripts/hermes/need-radar-product-cleanup.sh --run-id "$RUN_ID" --discord
+NEED_RADAR_OUTPUT_ROOT="$HOME/.local/state/need-radar/product-cycle/runs" \
+  scripts/hermes/need-radar-product-cleanup.sh --discord
+```
+
+The first command removes only that validated pilot run before expiry; the second expires eligible runs and requests one verified Discord deletion per run. Discord deletion checks the saved run, channel, bot author, message ID and delivery nonce, then makes at most one DELETE request. A timeout or permission denial is reported as unresolved, never as deleted. A minimal content-free receipt in `.product-removals/` retains the delivery identity for a later explicit invocation; unresolved receipts are kept for reconciliation. Local and Discord results are reported separately. Source text, reports, and derived run copies are removed locally. Provider-held copies cannot be inspected or deleted by this application and remain unverified.
+
+The Hermes idle-time contract is to invoke cleanup only; it does not start a product cycle. If a separately authorized schedule is later chosen, install the wrapper under Hermes's required script directory and create a no-agent job in a paused state before explicitly activating it:
+
+```sh
+install -D -m 700 scripts/hermes/need-radar-product-cleanup.sh \
+  "$HOME/.hermes/scripts/need-radar-product-cleanup.sh"
+hermes cron create "every 24h" --name need-radar-product-cleanup \
+  --script "$HOME/.hermes/scripts/need-radar-product-cleanup.sh" \
+  --no-agent --deliver local --paused \
+  --paused-reason "Awaiting explicit cleanup schedule authorization"
+```
+
+No Hermes job is created by this ticket. Expiry-only cleanup does not call Discord; `--discord` is an explicit per-invocation gate. Actual Discord deletion and schedule creation or activation require their own authorization. To disable before a run, keep `enabled` false in the operation config or activation manifest. To disable after a run, pause only the specific Hermes run/watchdog jobs using the repository's existing disable procedure; do not remove unrelated jobs. Code and example changes can be reverted with `git revert <candidate-commit>`; local private outputs and the aggregate ledger need separate, deliberate retention handling.
 
 ## Remaining #16 checks
 
@@ -32,4 +54,4 @@ Before enabling a real one-shot run, verify and retain evidence for: (1) current
 
 ## Offline verification
 
-The focused product-cycle run passed 31 tests with Hermes `TMPDIR`, including subprocess checks with network, actual credential-file, and canonical-live-state access denied. Synthetic profile fixtures verify selected- and default-profile reuse, comments/export syntax, no inherited-token fallback, duplicate/malformed rejection, and no credential persistence. `npm test` passed 34 Ralph tests and 311 offline Python tests. `npm run typecheck:sandcastle-workflow` passed. These checks use synthetic HTTP/service responses and do not establish live access, billing, source rights, or Discord delivery.
+Focused product-cycle checks use Hermes `TMPDIR` and subprocesses with network, credential-file, and canonical-live-state access denied. Synthetic profile fixtures verify selected- and default-profile reuse, comments/export syntax, no inherited-token fallback, duplicate/malformed rejection, and no credential persistence. The injected product cycle and cleanup wrapper are also exercised in subprocesses. These checks use synthetic HTTP/service responses and do not establish live access, billing, source rights, or Discord delivery.

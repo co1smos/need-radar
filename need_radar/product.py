@@ -43,6 +43,7 @@ MAX_MODEL_TOKENS_PER_REQUEST = MODEL_INPUT_TOKENS + MODEL_OUTPUT_TOKENS
 MAX_AGGREGATE_MODEL_TOKENS = MAX_MODEL_CALLS * MAX_MODEL_TOKENS_PER_REQUEST
 MAX_MODEL_REQUEST_BYTES = MODEL_INPUT_TOKENS
 PRODUCT_BUDGET_DB = Path.home() / ".local" / "state" / "need-radar" / "product-cycle" / "budget.sqlite3"
+REMOVALS_DIRECTORY = ".product-removals"
 MODEL_SHARED_SETTINGS = {
     "provider": "deepseek-direct",
     "model": "deepseek-flash",
@@ -518,6 +519,100 @@ class DiscordRestTransport:
         if message is None:
             return {"status": "inconclusive"}
         return {"message_id": self._message_id(message.get("id")), "payload_identity": payload_identity}
+
+    def find_for_removal(self, payload_identity):
+        if not _valid_payload_identity(payload_identity):
+            return {"status": "identity_mismatch"}
+        # shortcut: scan the latest 100 messages; paginate if reconciliation must cover older posts.
+        query = urllib.parse.urlencode({"limit": 100})
+        try:
+            status, _headers, raw = self.request(
+                "GET", f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages?{query}",
+                {"Authorization": f"Bot {self.token}", "Accept": "application/json"},
+                None, 15, 2 * 1024 * 1024,
+            )
+        except Exception:
+            return {"status": "ambiguous"}
+        messages = _json_body(raw)
+        if status != 200 or not isinstance(messages, list):
+            return {"status": "denied" if status in {401, 403} else "ambiguous"}
+        matches = [item for item in messages if isinstance(item, dict) and item.get("nonce") == self._nonce(payload_identity)]
+        if not matches:
+            return {"status": "inconclusive"}
+        if len(matches) != 1:
+            return {"status": "ambiguous"}
+        message = matches[0]
+        author = message.get("author")
+        message_id = self._message_id(message.get("id"))
+        if (
+            message_id is None or message.get("channel_id") != CHANNEL_ID
+            or not isinstance(author, dict) or author.get("bot") is not True
+        ):
+            return {"status": "identity_mismatch"}
+        return {
+            "status": "found",
+            "message_id": message_id,
+            "channel_id": CHANNEL_ID,
+            "payload_identity": payload_identity,
+            "bot_created": True,
+        }
+
+    def delete_message(self, channel_id, message_id, payload_identity):
+        if (
+            channel_id != CHANNEL_ID or self._message_id(message_id) is None
+            or not _valid_payload_identity(payload_identity)
+        ):
+            return {"status": "identity_mismatch"}
+        headers = {"Authorization": f"Bot {self.token}", "Accept": "application/json"}
+        try:
+            status, _response_headers, raw = self.request(
+                "GET", "https://discord.com/api/v10/users/@me", headers, None, 15, 64 * 1024,
+            )
+        except Exception:
+            return {"status": "ambiguous"}
+        user = _json_body(raw)
+        bot_id = self._message_id(user.get("id")) if status == 200 and isinstance(user, dict) else None
+        if bot_id is None:
+            return {"status": "denied" if status in {401, 403} else "ambiguous"}
+        try:
+            status, _response_headers, raw = self.request(
+                "GET", f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages/{message_id}",
+                headers, None, 15, 256 * 1024,
+            )
+        except Exception:
+            return {"status": "ambiguous"}
+        if status == 404:
+            return {"status": "already_absent"}
+        message = _json_body(raw)
+        author = message.get("author") if isinstance(message, dict) else None
+        if status != 200 or not isinstance(message, dict):
+            return {"status": "denied" if status in {401, 403} else "ambiguous"}
+        if (
+            message.get("id") != message_id or message.get("channel_id") != channel_id
+            or message.get("nonce") != self._nonce(payload_identity)
+            or not isinstance(author, dict) or author.get("bot") is not True or author.get("id") != bot_id
+        ):
+            return {"status": "identity_mismatch"}
+        try:
+            status, _response_headers, _raw = self.request(
+                "DELETE", f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages/{message_id}",
+                headers, None, 15, 64 * 1024,
+            )
+        except Exception:
+            return {"status": "ambiguous"}
+        if status in {200, 204}:
+            return {"status": "deleted"}
+        if status == 404:
+            return {"status": "already_absent"}
+        return {"status": "denied" if status in {401, 403} else "ambiguous"}
+
+
+class UnavailableDiscordTransport:
+    def find_for_removal(self, _payload_identity):
+        return {"status": "unavailable"}
+
+    def delete_message(self, _channel_id, _message_id, _payload_identity):
+        return {"status": "unavailable"}
 
 
 def _json_body(raw):
@@ -1644,12 +1739,29 @@ def run_product_cycle(config, output, run_id, scheduled_for, boundaries=None):
     return ProductRunner(config, output, run_id, scheduled_for, boundaries).run()
 
 
-def cleanup(output_root, now=None):
+def _valid_payload_identity(value):
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _valid_discord_message_id(value):
+    return isinstance(value, str) and value.isascii() and value.isdigit() and 17 <= len(value) <= 20 and value[0] != "0"
+
+
+def _private_record(path):
+    path = Path(path)
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o077
+
+
+def _cleanup_root(output_root):
     root = Path(output_root).expanduser().absolute()
     if root.resolve().is_relative_to(ROOT) or root.is_symlink():
         raise ProductError("cleanup_root_must_be_private_and_outside_repository", "cleanup")
     if not root.exists():
-        return {"status": "success", "removed": 0}
+        raise ProductError("cleanup_root_unavailable", "cleanup")
     try:
         root_info = root.lstat()
         if not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != os.geteuid():
@@ -1657,9 +1769,395 @@ def cleanup(output_root, now=None):
         _private_dir(root)
     except OSError:
         raise ProductError("cleanup_root_unavailable", "cleanup") from None
+    return root
+
+
+def _validated_run_id(run_id):
+    if not isinstance(run_id, str) or re.fullmatch(r"[0-9a-f]{32}", run_id) is None:
+        raise ProductError("pilot_run_id_invalid", "cleanup")
+
+
+def _retention_marker(run_dir, run_id):
+    _validated_run_id(run_id)
+    if run_dir.is_symlink():
+        raise ProductError("pilot_run_directory_unsafe", "cleanup")
+    try:
+        info = run_dir.lstat()
+    except OSError:
+        raise ProductError("pilot_run_unavailable", "cleanup") from None
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise ProductError("pilot_run_directory_unsafe", "cleanup")
+    retention_path = run_dir / ".product-retention.json"
+    markers = (retention_path,) if retention_path.exists() or retention_path.is_symlink() else (run_dir / "product-health.json",)
+    for marker in markers:
+        if not _private_record(marker):
+            raise ProductError("pilot_run_retention_marker_unsafe", "cleanup")
+        try:
+            value = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            raise ProductError("pilot_run_retention_marker_invalid", "cleanup") from None
+        retention = value.get("retention") if isinstance(value, dict) else None
+        created = _created_datetime(retention.get("created_at")) if isinstance(retention, dict) else None
+        expires = _created_datetime(retention.get("expires_at")) if isinstance(retention, dict) else None
+        days = retention.get("retention_days") if isinstance(retention, dict) else None
+        if (
+            isinstance(value, dict) and value.get("operation") == "need-radar-product-cycle"
+            and value.get("schema_version") == 1 and value.get("run_id") == run_id
+            and created is not None and expires is not None and type(days) is int
+            and 1 <= days <= 7 and expires == created + timedelta(days=days)
+        ):
+            return marker, retention
+    raise ProductError("pilot_run_retention_marker_invalid", "cleanup")
+
+
+def _private_run_tree(run_dir):
+    for current, directories, files in os.walk(run_dir, followlinks=False):
+        current_path = Path(current)
+        info = current_path.lstat()
+        if (
+            not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.geteuid() or info.st_mode & 0o077 or current_path.is_mount()
+        ):
+            raise ProductError("pilot_run_path_unsafe", "cleanup")
+        for name in directories + files:
+            path = current_path / name
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or info.st_uid != os.geteuid():
+                raise ProductError("pilot_run_path_unsafe", "cleanup")
+            if stat.S_ISDIR(info.st_mode):
+                if info.st_mode & 0o077 or path.is_mount():
+                    raise ProductError("pilot_run_path_unsafe", "cleanup")
+            elif not stat.S_ISREG(info.st_mode):
+                raise ProductError("pilot_run_path_unsafe", "cleanup")
+
+
+def _removal_path(root, run_id, create=False):
+    _validated_run_id(run_id)
+    directory = root / REMOVALS_DIRECTORY
+    try:
+        info = directory.lstat()
+    except FileNotFoundError:
+        if not create:
+            return directory / f"{run_id}.json"
+        directory.mkdir(mode=0o700)
+        info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise ProductError("pilot_removal_directory_unsafe", "cleanup")
+    return directory / f"{run_id}.json"
+
+
+def _pilot_run(output_root, run_id):
+    _validated_run_id(run_id)
+    root = _cleanup_root(output_root)
+    child = root / run_id
+    marker, _retention = _retention_marker(child, run_id)
+    return root, child, marker
+
+
+def _delivery_removal_identity(run_dir, run_id):
+    delivery_path = run_dir / "serve" / "discord-delivery.json"
+    if not delivery_path.exists():
+        return None, True
+    serve_dir = run_dir / "serve"
+    try:
+        serve_info = serve_dir.lstat()
+    except OSError:
+        raise ProductError("pilot_delivery_path_unsafe", "cleanup") from None
+    if not stat.S_ISDIR(serve_info.st_mode) or serve_info.st_uid != os.geteuid() or serve_info.st_mode & 0o077:
+        raise ProductError("pilot_delivery_path_unsafe", "cleanup")
+    if not _private_record(delivery_path):
+        raise ProductError("pilot_delivery_artifact_unsafe", "cleanup")
+    try:
+        delivery = json.loads(delivery_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ProductError("pilot_delivery_artifact_invalid", "cleanup") from None
+    if not isinstance(delivery, dict):
+        raise ProductError("pilot_delivery_artifact_invalid", "cleanup")
+    destination = delivery.get("destination") if isinstance(delivery, dict) else None
+    lineage = delivery.get("lineage") if isinstance(delivery, dict) else None
+    message_id = delivery.get("message_id") if isinstance(delivery, dict) else None
+    identity = delivery.get("payload_identity") if isinstance(delivery, dict) else None
+    if delivery.get("status") not in ("delivered", "delivered_reconciled", "ambiguous", "pending", "sending", "retrying"):
+        return None, True
+    if (
+        not isinstance(destination, dict) or destination.get("platform") != "discord"
+        or destination.get("channel_id") != CHANNEL_ID
+        or not isinstance(lineage, dict) or lineage.get("stage") != "discord_delivery"
+        or lineage.get("input_stage") != "report"
+        or not _valid_payload_identity(identity)
+    ):
+        raise ProductError("pilot_delivery_identity_invalid", "cleanup")
+    payload = delivery.get("payload")
+    source = delivery.get("source")
+    lineage_db = run_dir / "serve" / "lineage.sqlite3"
+    report_path = run_dir / "serve" / "report.md"
+    if not _private_record(report_path):
+        raise ProductError("pilot_delivery_lineage_unsafe", "cleanup")
+    if not isinstance(source, dict) or not isinstance(payload, dict):
+        raise ProductError("pilot_delivery_lineage_invalid", "cleanup")
+    report_sha = serve.digest(report_path.read_bytes())
+    expected_identity = serve.digest(serve.json_bytes({
+        "channel_id": CHANNEL_ID,
+        "report_sha256": source.get("sha256"),
+    }))
+    if (
+        source.get("artifact_path") != "report.md" or source.get("sha256") != report_sha
+        or identity != expected_identity or payload.get("payload_identity") != identity
+        or payload.get("report_sha256") != report_sha
+    ):
+        raise ProductError("pilot_delivery_identity_invalid", "cleanup")
+    removal_identity = {
+        "channel_id": CHANNEL_ID,
+        "message_id": message_id if _valid_discord_message_id(message_id) else None,
+        "payload_identity": identity,
+    }
+    if not _private_record(lineage_db):
+        return removal_identity, False
+    try:
+        database_uri = f"file:{urllib.parse.quote(str(lineage_db))}?mode=ro"
+        with sqlite3.connect(database_uri, uri=True) as database:
+            report_row = database.execute(
+                "SELECT run_id, status, artifact_path, output_sha256, artifact_id "
+                "FROM stages WHERE stage='report' ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
+            delivery_row = database.execute(
+                "SELECT run_id, status, artifact_path, output_sha256, artifact_id, input_artifact_id, input_sha256 "
+                "FROM stages WHERE stage='discord_delivery' ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
+    except sqlite3.Error:
+        return removal_identity, False
+    artifact_sha = serve.digest(delivery_path.read_bytes())
+    if (
+        report_row is None or delivery_row is None
+        or report_row[1] not in {"success", "no_findings"} or report_row[2] != "report.md"
+        or report_row[3] != report_sha
+        or report_row[3] != source.get("sha256")
+        or source.get("artifact_path") != "report.md"
+        or report_row[4] != source.get("artifact_id")
+        or delivery_row[0] != report_row[0] or delivery_row[2] != "discord-delivery.json"
+        or delivery_row[1] != delivery.get("status")
+        or delivery_row[3] != artifact_sha or delivery_row[4] != lineage.get("artifact_id")
+        or delivery_row[5] != report_row[4] or delivery_row[6] != report_row[3]
+        or lineage.get("run_id") != report_row[0]
+        or lineage.get("input_artifact_id") != report_row[4]
+        or lineage.get("input_sha256") != report_row[3]
+        or payload.get("payload_identity") != identity or payload.get("report_sha256") != report_sha
+    ):
+        return removal_identity, False
+    return removal_identity, True
+
+
+def _read_removal_record(path, run_id):
+    if not path.exists():
+        return None
+    if not _private_record(path):
+        raise ProductError("pilot_removal_record_unsafe", "cleanup")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ProductError("pilot_removal_record_invalid", "cleanup") from None
+    if not isinstance(value, dict):
+        raise ProductError("pilot_removal_record_invalid", "cleanup")
+    allowed = {
+        "operation", "schema_version", "run_id", "requested_at", "last_attempt_at",
+        "channel_id", "message_id", "payload_identity", "retention", "local_status",
+        "discord_status", "provider_copy_deletion",
+    }
+    if set(value) - allowed or value.get("provider_copy_deletion") != "unverified_not_attempted":
+        raise ProductError("pilot_removal_record_invalid", "cleanup")
+    identity = {key: value.get(key) for key in ("channel_id", "message_id", "payload_identity")}
+    retention = value.get("retention")
+    created = _created_datetime(retention.get("created_at")) if isinstance(retention, dict) else None
+    expires = _created_datetime(retention.get("expires_at")) if isinstance(retention, dict) else None
+    days = retention.get("retention_days") if isinstance(retention, dict) else None
+    if (
+        not isinstance(value, dict) or value.get("operation") != "need-radar-product-removal"
+        or value.get("schema_version") != 1 or value.get("run_id") != run_id
+        or created is None or expires is None or type(days) is not int
+        or not isinstance(retention, dict) or set(retention) != {"created_at", "expires_at", "retention_days"}
+        or not 1 <= days <= 7 or expires != created + timedelta(days=days)
+        or _created_datetime(value.get("requested_at")) is None
+        or (value.get("last_attempt_at") is not None and _created_datetime(value["last_attempt_at"]) is None)
+        or value.get("local_status") not in ("pending", "removed", "partial")
+        or value.get("discord_status") not in (
+            "pending", "not_requested", "not_applicable", "unavailable", "inconclusive", "ambiguous",
+            "identity_mismatch", "denied", "deleted", "already_absent",
+        )
+        or identity["channel_id"] not in (None, CHANNEL_ID)
+        or (identity["message_id"] is not None and not _valid_discord_message_id(identity["message_id"]))
+        or (identity["payload_identity"] is not None and not _valid_payload_identity(identity["payload_identity"]))
+        or (identity["message_id"] is not None and identity["payload_identity"] is None)
+        or (identity["payload_identity"] is not None and identity["channel_id"] != CHANNEL_ID)
+        or (value.get("discord_status") in {"deleted", "already_absent"} and identity["message_id"] is not None)
+    ):
+        raise ProductError("pilot_removal_record_invalid", "cleanup")
+    return value
+
+
+def _save_removal_record(path, value):
+    if path.exists():
+        if not _private_record(path):
+            raise ProductError("pilot_removal_record_unsafe", "cleanup")
+        _replace_json(path, value)
+    else:
+        _write_json(path, value)
+    descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _remove_run_content(run_dir, retention_marker):
+    if not run_dir.exists():
+        return "removed"
+    try:
+        _private_run_tree(run_dir)
+        for child in sorted(run_dir.iterdir(), key=lambda path: path.name):
+            if child == retention_marker:
+                continue
+            if stat.S_ISDIR(child.lstat().st_mode):
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        retention_marker.unlink()
+        run_dir.rmdir()
+    except (OSError, ProductError):
+        return "partial"
+    return "removed"
+
+
+def remove_run(output_root, run_id, transport=None, now=None):
+    """Remove one validated pilot run locally and attempt one Discord deletion."""
+    _validated_run_id(run_id)
+    root = _cleanup_root(output_root)
+    removal_path = _removal_path(root, run_id)
+    removal = _read_removal_record(removal_path, run_id)
+    run_dir = root / run_id
+    delivery_metadata_unresolved = False
+    if removal is None:
+        _root, run_dir, retention_marker = _pilot_run(root, run_id)
+        _private_run_tree(run_dir)
+        retention = json.loads(retention_marker.read_text(encoding="utf-8"))["retention"]
+        try:
+            identity, lineage_valid = _delivery_removal_identity(run_dir, run_id)
+        except (OSError, ProductError):
+            identity, lineage_valid = None, False
+        delivery_metadata_unresolved = not lineage_valid
+        discord_status = "inconclusive" if delivery_metadata_unresolved else "pending" if identity else "not_applicable"
+        removal = {
+            "operation": "need-radar-product-removal",
+            "schema_version": 1,
+            "run_id": run_id,
+            "requested_at": (now or datetime.now(UTC)).astimezone(UTC).isoformat().replace("+00:00", "Z"),
+            "channel_id": identity["channel_id"] if identity else None,
+            "message_id": identity["message_id"] if identity else None,
+            "payload_identity": identity["payload_identity"] if identity else None,
+            "retention": {key: retention[key] for key in ("created_at", "expires_at", "retention_days")},
+            "local_status": "pending",
+            "discord_status": discord_status,
+            "provider_copy_deletion": "unverified_not_attempted",
+        }
+        removal_path = _removal_path(root, run_id, create=True)
+        _save_removal_record(removal_path, removal)
+    elif run_dir.exists() or run_dir.is_symlink():
+        if run_dir.is_symlink():
+            raise ProductError("pilot_run_directory_unsafe", "cleanup")
+        try:
+            info = run_dir.lstat()
+        except OSError:
+            raise ProductError("pilot_run_directory_unsafe", "cleanup") from None
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise ProductError("pilot_run_directory_unsafe", "cleanup")
+        marker_path = run_dir / ".product-retention.json"
+        health_path = run_dir / "product-health.json"
+        if not any(path.exists() or path.is_symlink() for path in (marker_path, health_path)):
+            raise ProductError("pilot_run_retention_marker_invalid", "cleanup")
+        retention_marker, marker_retention = _retention_marker(run_dir, run_id)
+        if {key: marker_retention[key] for key in ("created_at", "expires_at", "retention_days")} != removal["retention"]:
+            raise ProductError("pilot_removal_record_invalid", "cleanup")
+        _private_run_tree(run_dir)
+
+    if run_dir.exists():
+        removal["local_status"] = _remove_run_content(run_dir, retention_marker)
+        _save_removal_record(removal_path, removal)
+    elif not run_dir.exists():
+        removal["local_status"] = "removed"
+        _save_removal_record(removal_path, removal)
+
+    discord_status = removal["discord_status"]
+    if transport is None and discord_status == "pending":
+        discord_status = "not_requested"
+        removal["discord_status"] = discord_status
+        _save_removal_record(removal_path, removal)
+    if transport is not None and not delivery_metadata_unresolved and discord_status not in {"deleted", "already_absent", "not_applicable", "identity_mismatch"}:
+        if removal["payload_identity"] is None:
+            discord_status = "unavailable" if discord_status == "pending" else discord_status
+        else:
+            message_id = removal["message_id"]
+            if message_id is None:
+                finder = getattr(transport, "find_for_removal", None)
+                try:
+                    match = finder(removal["payload_identity"]) if callable(finder) else {"status": "unavailable"}
+                except Exception:
+                    match = {"status": "ambiguous"}
+                match_status = match.get("status") if isinstance(match, dict) else "ambiguous"
+                if not isinstance(match_status, str):
+                    match_status = "ambiguous"
+                if (
+                    match_status == "found" and match.get("channel_id") == CHANNEL_ID
+                    and match.get("payload_identity") == removal["payload_identity"]
+                    and match.get("bot_created") is True
+                    and _valid_discord_message_id(match.get("message_id"))
+                ):
+                    message_id = match["message_id"]
+                    removal["message_id"] = message_id
+                    removal["channel_id"] = CHANNEL_ID
+                    _save_removal_record(removal_path, removal)
+                else:
+                    discord_status = match_status if match_status in {
+                        "inconclusive", "ambiguous", "denied", "identity_mismatch", "unavailable",
+                    } else "ambiguous"
+            if message_id is not None:
+                deleter = getattr(transport, "delete_message", None)
+                try:
+                    result = deleter(removal["channel_id"], message_id, removal["payload_identity"]) if callable(deleter) else None
+                    discord_status = result.get("status") if isinstance(result, dict) else "unavailable"
+                except Exception:
+                    discord_status = "ambiguous"
+                if not isinstance(discord_status, str) or discord_status not in {
+                    "deleted", "already_absent", "identity_mismatch", "denied", "ambiguous", "unavailable",
+                }:
+                    discord_status = "ambiguous"
+        removal["discord_status"] = discord_status
+        removal["last_attempt_at"] = (now or datetime.now(UTC)).astimezone(UTC).isoformat().replace("+00:00", "Z")
+        if discord_status in {"deleted", "already_absent"}:
+            removal.update({"channel_id": None, "message_id": None, "payload_identity": None})
+        _save_removal_record(removal_path, removal)
+    outcome = {
+        "status": "success" if removal["local_status"] == "removed" and removal["discord_status"] in {"deleted", "already_absent", "not_applicable"} else "partial",
+        "run_id": run_id,
+        "local": {"status": removal["local_status"]},
+        "discord": {"status": removal["discord_status"]},
+        "provider_copy_deletion": "unverified_not_attempted",
+    }
+    return outcome
+
+
+def cleanup(output_root, now=None, transport=None):
+    root = Path(output_root).expanduser().absolute()
+    if root.resolve().is_relative_to(ROOT) or root.is_symlink():
+        raise ProductError("cleanup_root_must_be_private_and_outside_repository", "cleanup")
+    if not root.exists():
+        return {"status": "success", "removed": 0, "runs": []}
+    root = _cleanup_root(root)
     moment = now or datetime.now(UTC)
     removed = 0
+    partial = False
+    runs = []
     for child in root.iterdir():
+        if child.name == REMOVALS_DIRECTORY:
+            continue
         health_path = child / "product-health.json"
         marker_path = child / ".product-retention.json"
         if child.is_symlink() or not child.is_dir():
@@ -1694,25 +2192,49 @@ def cleanup(output_root, now=None):
                 ):
                     continue
                 if moment.astimezone(UTC) >= expires:
-                    shutil.rmtree(child)
-                    removed += 1
+                    if re.fullmatch(r"[0-9a-f]{32}", child.name):
+                        removal_path = _removal_path(root, child.name)
+                        run_transport = None if removal_path.exists() else transport
+                        outcome = remove_run(root, child.name, transport=run_transport, now=moment)
+                        runs.append(outcome)
+                        removed += outcome["local"]["status"] == "removed"
+                        partial = partial or outcome["status"] != "success"
+                    else:
+                        shutil.rmtree(child)
+                        removed += 1
                 break
-        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        except (OSError, KeyError, TypeError, ValueError, ProductError, json.JSONDecodeError):
             continue
-    return {"status": "success", "removed": removed}
+    return {"status": "partial" if partial else "success", "removed": removed, "runs": runs}
 
 
 def main(argv=None, boundaries=None):
-    parser = argparse.ArgumentParser(description="Run one enabled product cycle or expire its private artifacts.")
+    parser = argparse.ArgumentParser(description="Run one enabled product cycle or remove private pilot artifacts.")
     commands = parser.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run")
     run.add_argument("--config", required=True, type=Path)
     cleanup_parser = commands.add_parser("cleanup")
     cleanup_parser.add_argument("--output-root", required=True, type=Path)
+    cleanup_parser.add_argument("--run-id", help="remove or reconcile this UUID pilot run")
+    cleanup_parser.add_argument("--discord", action="store_true", help="request one Discord deletion using the configured bot")
     args = parser.parse_args(argv)
     try:
         if args.command == "cleanup":
-            result = cleanup(args.output_root)
+            transport = None
+            if args.discord:
+                transport = boundaries.get("discord_transport") if isinstance(boundaries, dict) else None
+                if transport is None:
+                    try:
+                        transport = DiscordRestTransport(
+                            _load_discord_token(Path.home() / ".config" / "need-radar" / "discord.env"),
+                            _default_http_request,
+                        )
+                    except ProductError:
+                        transport = UnavailableDiscordTransport()
+            result = (
+                remove_run(args.output_root, args.run_id, transport=transport)
+                if args.run_id else cleanup(args.output_root, transport=transport)
+            )
         else:
             from need_radar import scheduled
 
