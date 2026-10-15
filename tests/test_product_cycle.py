@@ -1,5 +1,6 @@
 import base64
 import contextlib
+import hashlib
 import http.client
 import io
 import json
@@ -279,6 +280,74 @@ def _config(directory):
 def _source_state_dirs(directory):
     root = Path(directory) / "source-accounting"
     return {"reddit": root / "reddit", "x": root / "x"}
+
+
+def _make_removable_run(output_root, run_id="a" * 32, *, created=NOW - timedelta(hours=1)):
+    from need_radar import __main__ as serve
+
+    output_root = Path(output_root)
+    output_root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    run_dir = output_root / run_id
+    run_dir.mkdir(mode=0o700)
+    retention = {
+        "created_at": created.isoformat().replace("+00:00", "Z"),
+        "retention_days": 3,
+        "expires_at": (created + timedelta(days=3)).isoformat().replace("+00:00", "Z"),
+    }
+    marker = {
+        "operation": "need-radar-product-cycle", "schema_version": 1,
+        "run_id": run_id, "retention": retention,
+    }
+    (run_dir / ".product-retention.json").write_text(json.dumps(marker), encoding="utf-8")
+    (run_dir / ".product-retention.json").chmod(0o600)
+    serve_dir = run_dir / "serve"
+    serve_dir.mkdir(mode=0o700)
+    report = "# Synthetic private report\n"
+    report_path = serve_dir / "report.md"
+    report_path.write_text(report, encoding="utf-8")
+    report_path.chmod(0o600)
+    report_sha = hashlib.sha256(report.encode()).hexdigest()
+    payload_identity = serve.digest(serve.json_bytes({
+        "channel_id": product.CHANNEL_ID,
+        "report_sha256": report_sha,
+    }))
+    message_id = "145000000000000001"
+    report_artifact_id = "synthetic-report-artifact"
+    delivery_artifact_id = "synthetic-delivery-artifact"
+    delivery = {
+        "status": "delivered",
+        "destination": {"platform": "discord", "channel_id": product.CHANNEL_ID},
+        "source": {"artifact_path": "report.md", "artifact_id": report_artifact_id, "sha256": report_sha},
+        "lineage": {
+            "run_id": "synthetic-serve-run", "stage": "discord_delivery",
+            "artifact_id": delivery_artifact_id, "input_stage": "report",
+            "input_artifact_id": report_artifact_id, "input_sha256": report_sha,
+        },
+        "payload_identity": payload_identity,
+        "payload": {
+            "payload_identity": payload_identity,
+            "report_sha256": report_sha,
+            "canonical_markdown": report,
+        },
+        "message_id": message_id,
+    }
+    delivery_path = serve_dir / "discord-delivery.json"
+    delivery_path.write_text(json.dumps(delivery), encoding="utf-8")
+    delivery_path.chmod(0o600)
+    with sqlite3.connect(serve_dir / "lineage.sqlite3") as database:
+        database.execute(
+            "CREATE TABLE stages (sequence INTEGER, run_id TEXT, stage TEXT, status TEXT, input_stage TEXT, input_sha256 TEXT, "
+            "artifact_path TEXT, output_sha256 TEXT, details TEXT, trace_id TEXT, span_id TEXT, artifact_id TEXT, input_artifact_id TEXT, call_id TEXT)"
+        )
+        database.executemany("INSERT INTO stages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+            (1, "synthetic-serve-run", "report", "success", None, None, "report.md", report_sha,
+             "{}", "trace", "report-span", report_artifact_id, None, None),
+            (2, "synthetic-serve-run", "discord_delivery", "delivered", "report", report_sha,
+             "discord-delivery.json", hashlib.sha256(delivery_path.read_bytes()).hexdigest(), "{}",
+             "trace", "delivery-span", delivery_artifact_id, report_artifact_id, None),
+        ])
+    (serve_dir / "lineage.sqlite3").chmod(0o600)
+    return run_dir, message_id, payload_identity
 
 
 def _seed_source_ledgers(directories):
@@ -922,6 +991,291 @@ class ProductCycleTests(unittest.TestCase):
         self.assertFalse(expired.exists())
         self.assertFalse(crashed.exists())
         self.assertTrue(unrelated.exists())
+
+    def test_early_removal_is_run_scoped_content_free_and_repeatable(self):
+        runs = self.directory / "runs"
+        run_dir, message_id, payload_identity = _make_removable_run(runs)
+        unrelated = runs / ("b" * 32)
+        unrelated.mkdir(mode=0o700)
+        (unrelated / "private.txt").write_text("keep", encoding="utf-8")
+        historical = runs / "historical-9-19-recordings"
+        historical.mkdir(mode=0o700)
+        (historical / "recording.json").write_text("retained", encoding="utf-8")
+        (historical / "recording.json").chmod(0o600)
+        safety_hold = runs / "source-safety-hold.json"
+        safety_hold.write_text("retain", encoding="utf-8")
+        safety_hold.chmod(0o600)
+        unrelated_file = self.directory / "aggregate-accounting.json"
+        unrelated_file.write_text("preserve", encoding="utf-8")
+        transport = product.FakeDiscordTransport()
+        transport.messages.append({
+            "message_id": message_id, "channel_id": product.CHANNEL_ID,
+            "payload_identity": payload_identity, "bot_created": True,
+        })
+
+        result = product.remove_run(runs, run_dir.name, transport=transport, now=NOW)
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["local"], {"status": "removed"})
+        self.assertEqual(result["discord"], {"status": "deleted"})
+        self.assertEqual(result["provider_copy_deletion"], "unverified_not_attempted")
+        self.assertFalse(run_dir.exists())
+        self.assertTrue(unrelated_file.is_file())
+        self.assertEqual(unrelated_file.read_text(), "preserve")
+        self.assertEqual((unrelated / "private.txt").read_text(), "keep")
+        self.assertEqual((historical / "recording.json").read_text(), "retained")
+        self.assertEqual(safety_hold.read_text(), "retain")
+        receipt = json.loads((runs / ".product-removals" / f"{run_dir.name}.json").read_text())
+        self.assertIsNone(receipt["message_id"])
+        self.assertNotIn("payload", receipt)
+        self.assertNotIn("report", json.dumps(receipt).casefold())
+        self.assertEqual(product.remove_run(runs, run_dir.name, transport=transport, now=NOW), result)
+        self.assertEqual(transport.events, ["delete"])
+
+    def test_already_absent_and_explicit_ambiguous_reconciliation(self):
+        runs = self.directory / "runs"
+        run_dir, _message_id, _identity = _make_removable_run(runs)
+        absent = product.remove_run(
+            runs, run_dir.name, transport=product.FakeDiscordTransport(), now=NOW,
+        )
+        self.assertEqual(absent["status"], "success")
+        self.assertEqual(absent["discord"]["status"], "already_absent")
+
+        retry_runs = self.directory / "retry-runs"
+        retry_dir, message_id, identity = _make_removable_run(retry_runs, run_id="c" * 32)
+        transport = product.FakeDiscordTransport(delete_error="synthetic denial")
+        transport.messages.append({
+            "message_id": message_id, "channel_id": product.CHANNEL_ID,
+            "payload_identity": identity, "bot_created": True,
+        })
+        first = product.remove_run(retry_runs, retry_dir.name, transport=transport, now=NOW)
+        self.assertEqual(first["status"], "partial")
+        self.assertEqual(first["discord"]["status"], "ambiguous")
+        self.assertEqual(transport.events, ["delete"])
+        receipt_path = retry_runs / ".product-removals" / f"{retry_dir.name}.json"
+        pending = json.loads(receipt_path.read_text())
+        self.assertEqual(pending["message_id"], message_id)
+        transport.delete_error = None
+        second = product.remove_run(retry_runs, retry_dir.name, transport=transport, now=NOW)
+        self.assertEqual(second["status"], "success")
+        self.assertEqual(second["discord"]["status"], "deleted")
+        self.assertEqual(transport.events, ["delete", "delete"])
+
+    def test_ambiguous_delivery_keeps_payload_identity_for_explicit_readback(self):
+        runs = self.directory / "unknown-message-runs"
+        run_dir, message_id, identity = _make_removable_run(runs, run_id="f" * 32)
+        delivery_path = run_dir / "serve" / "discord-delivery.json"
+        delivery = json.loads(delivery_path.read_text())
+        delivery.update({"status": "ambiguous", "message_id": None})
+        delivery_bytes = json.dumps(delivery).encode()
+        delivery_path.write_bytes(delivery_bytes)
+        delivery_path.chmod(0o600)
+        with sqlite3.connect(run_dir / "serve" / "lineage.sqlite3") as database:
+            database.execute(
+                "UPDATE stages SET status='ambiguous', output_sha256=? WHERE stage='discord_delivery'",
+                (hashlib.sha256(delivery_bytes).hexdigest(),),
+            )
+        transport = product.FakeDiscordTransport()
+        transport.messages.append({
+            "message_id": message_id, "channel_id": product.CHANNEL_ID,
+            "payload_identity": identity, "bot_created": True,
+        })
+
+        result = product.remove_run(runs, run_dir.name, transport=transport, now=NOW)
+
+        self.assertEqual(result["discord"]["status"], "deleted")
+        self.assertEqual(transport.events, ["find_for_removal", "delete"])
+
+    def test_discord_rest_deletion_verifies_bot_channel_nonce_and_single_delete(self):
+        message_id = "145000000000000001"
+        bot_id = "145000000000000099"
+        identity = "a" * 64
+        calls = []
+        delete_error = []
+
+        def request(method, url, _headers, _body, _timeout, _max_bytes):
+            calls.append((method, url))
+            if url.endswith("/users/@me"):
+                return 200, {}, json.dumps({"id": bot_id}).encode()
+            if method == "GET":
+                return 200, {}, json.dumps({
+                    "id": message_id, "channel_id": product.CHANNEL_ID,
+                    "nonce": identity[:25], "author": {"id": bot_id, "bot": True},
+                }).encode()
+            if delete_error:
+                raise TimeoutError("synthetic lost DELETE response")
+            return 204, {}, b""
+
+        transport = product.DiscordRestTransport("synthetic-token", request, injected=True)
+        self.assertEqual(
+            transport.delete_message(product.CHANNEL_ID, message_id, identity),
+            {"status": "deleted"},
+        )
+        self.assertEqual([method for method, _url in calls], ["GET", "GET", "DELETE"])
+        calls.clear()
+        delete_error.append(True)
+        self.assertEqual(
+            transport.delete_message(product.CHANNEL_ID, message_id, identity),
+            {"status": "ambiguous"},
+        )
+        self.assertEqual([method for method, _url in calls], ["GET", "GET", "DELETE"])
+        calls.clear()
+        self.assertEqual(
+            transport.delete_message("wrong-channel", message_id, identity),
+            {"status": "identity_mismatch"},
+        )
+        self.assertEqual(calls, [])
+
+    def test_wrong_discord_identity_or_channel_is_never_deleted(self):
+        for index, wrong in enumerate(("identity", "channel")):
+            with self.subTest(wrong=wrong):
+                runs = self.directory / f"runs-{index}"
+                run_dir, message_id, identity = _make_removable_run(runs, run_id=hex(index + 11)[2:] * 32)
+                transport = product.FakeDiscordTransport()
+                transport.messages.append({
+                    "message_id": message_id,
+                    "channel_id": "wrong-channel" if wrong == "channel" else product.CHANNEL_ID,
+                    "payload_identity": "f" * 64 if wrong == "identity" else identity,
+                    "bot_created": True,
+                })
+                result = product.remove_run(runs, run_dir.name, transport=transport, now=NOW)
+                self.assertEqual(result["status"], "partial")
+                self.assertEqual(result["discord"]["status"], "identity_mismatch")
+                self.assertEqual(len(transport.messages), 1)
+                self.assertFalse(run_dir.exists())
+
+    def test_malicious_run_markers_and_symlinked_paths_fail_closed(self):
+        runs = self.directory / "runs"
+        run_dir, _message_id, _identity = _make_removable_run(runs)
+        marker_path = run_dir / ".product-retention.json"
+        marker = json.loads(marker_path.read_text())
+        marker["run_id"] = "d" * 32
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+        marker_path.chmod(0o600)
+        with self.assertRaisesRegex(product.ProductError, "retention_marker_invalid"):
+            product.remove_run(runs, run_dir.name, transport=product.FakeDiscordTransport(), now=NOW)
+        self.assertTrue((run_dir / "serve" / "report.md").is_file())
+
+        wrong_delivery_root = self.directory / "wrong-delivery-runs"
+        wrong_delivery_dir, _message_id, _identity = _make_removable_run(wrong_delivery_root, run_id="7" * 32)
+        delivery_path = wrong_delivery_dir / "serve" / "discord-delivery.json"
+        delivery = json.loads(delivery_path.read_text())
+        delivery["destination"]["channel_id"] = "wrong-channel"
+        delivery_bytes = json.dumps(delivery).encode()
+        delivery_path.write_bytes(delivery_bytes)
+        delivery_path.chmod(0o600)
+        with sqlite3.connect(wrong_delivery_dir / "serve" / "lineage.sqlite3") as database:
+            database.execute(
+                "UPDATE stages SET output_sha256=? WHERE stage='discord_delivery'",
+                (hashlib.sha256(delivery_bytes).hexdigest(),),
+            )
+        with self.assertRaisesRegex(product.ProductError, "delivery_identity_invalid"):
+            product.remove_run(wrong_delivery_root, wrong_delivery_dir.name, transport=product.FakeDiscordTransport(), now=NOW)
+        self.assertTrue((wrong_delivery_dir / "serve" / "report.md").is_file())
+
+        target = self.directory / "outside"
+        target.mkdir(mode=0o700)
+        symlink_root = self.directory / "linked-runs"
+        symlink_root.symlink_to(runs, target_is_directory=True)
+        with self.assertRaisesRegex(product.ProductError, "cleanup_root_must_be_private"):
+            product.cleanup(symlink_root, now=NOW + timedelta(days=4))
+        self.assertTrue(target.is_dir())
+
+    def test_expiry_removes_run_and_keeps_unresolved_discord_identity(self):
+        runs = self.directory / "runs"
+        created = NOW - timedelta(days=3)
+        run_dir, message_id, identity = _make_removable_run(runs, created=created)
+        transport = product.FakeDiscordTransport(delete_timeout_after=True)
+        transport.messages.append({
+            "message_id": message_id, "channel_id": product.CHANNEL_ID,
+            "payload_identity": identity, "bot_created": True,
+        })
+        result = product.cleanup(runs, now=NOW, transport=transport)
+        self.assertEqual(result["removed"], 1)
+        self.assertEqual(result["status"], "partial")
+        self.assertFalse(run_dir.exists())
+        receipt = json.loads((runs / ".product-removals" / f"{run_dir.name}.json").read_text())
+        self.assertEqual(receipt["discord_status"], "ambiguous")
+        self.assertEqual(receipt["message_id"], message_id)
+        reconciled = product.remove_run(runs, run_dir.name, transport=transport, now=NOW)
+        self.assertEqual(reconciled["discord"]["status"], "already_absent")
+
+    def test_expiry_schedule_does_not_retry_ambiguous_discord_automatically(self):
+        runs = self.directory / "retry-scheduled-runs"
+        run_dir, message_id, identity = _make_removable_run(runs, run_id="8" * 32, created=NOW - timedelta(days=3))
+        transport = product.FakeDiscordTransport(delete_error="synthetic timeout")
+        transport.messages.append({
+            "message_id": message_id, "channel_id": product.CHANNEL_ID,
+            "payload_identity": identity, "bot_created": True,
+        })
+        with patch.object(product, "_remove_run_content", return_value="partial"):
+            first = product.cleanup(runs, now=NOW, transport=transport)
+        self.assertEqual(first["runs"][0]["discord"]["status"], "ambiguous")
+        self.assertEqual(transport.events, ["delete"])
+        second = product.cleanup(runs, now=NOW, transport=transport)
+        self.assertEqual(transport.events, ["delete"])
+        self.assertFalse(run_dir.exists())
+        transport.delete_error = None
+        reconciled = product.remove_run(runs, run_dir.name, transport=transport, now=NOW)
+        self.assertEqual(reconciled["discord"]["status"], "deleted")
+        self.assertEqual(transport.events, ["delete", "delete"])
+
+    def test_hermes_cleanup_wrapper_expires_runs_without_starting_a_cycle(self):
+        import network_guard
+
+        network_guard.install()
+        runs = self.directory / "scheduled-runs"
+        run_dir, _message_id, _identity = _make_removable_run(runs, created=NOW - timedelta(days=3))
+        (run_dir / "serve" / "discord-delivery.json").unlink()
+        environment = {
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONPATH": os.pathsep.join((str(ROOT / "tests"), str(ROOT))),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "TMPDIR": str(HERMES_TMPDIR),
+            "NEED_RADAR_PROJECT_ROOT": str(ROOT),
+            "NEED_RADAR_OUTPUT_ROOT": str(runs),
+        }
+        result = subprocess.run(
+            [str(ROOT / "scripts" / "hermes" / "need-radar-product-cleanup.sh")],
+            cwd=ROOT, env=environment, capture_output=True, text=True, timeout=20, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary["status"], "success")
+        self.assertEqual(summary["removed"], 1)
+        self.assertFalse(run_dir.exists())
+        receipt = json.loads((runs / ".product-removals" / f"{run_dir.name}.json").read_text())
+        self.assertEqual(receipt["discord_status"], "not_applicable")
+        self.assertIsNone(receipt["message_id"])
+
+    def test_discord_removal_command_keeps_local_result_when_credentials_are_denied(self):
+        import network_guard
+
+        network_guard.install()
+        runs = self.directory / "denied-runs"
+        run_dir, message_id, _identity = _make_removable_run(runs, run_id="e" * 32)
+        environment = {
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONPATH": os.pathsep.join((str(ROOT / "tests"), str(ROOT))),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "TMPDIR": str(HERMES_TMPDIR),
+            "NEED_RADAR_PROJECT_ROOT": str(ROOT),
+            "NEED_RADAR_OUTPUT_ROOT": str(runs),
+        }
+        result = subprocess.run(
+            [str(ROOT / "scripts" / "hermes" / "need-radar-product-cleanup.sh"),
+             "--run-id", run_dir.name, "--discord"],
+            cwd=ROOT, env=environment, capture_output=True, text=True, timeout=20, check=False,
+        )
+        summary = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(summary["status"], "partial")
+        self.assertEqual(summary["local"]["status"], "removed")
+        self.assertEqual(summary["discord"]["status"], "unavailable")
+        self.assertFalse(run_dir.exists())
+        receipt = json.loads((runs / ".product-removals" / f"{run_dir.name}.json").read_text())
+        self.assertEqual(receipt["message_id"], message_id)
+        self.assertNotIn(DISCORD_KEY, result.stdout)
 
     def test_live_state_credentials_and_network_denials_apply_in_process_and_subprocess(self):
         import network_guard
