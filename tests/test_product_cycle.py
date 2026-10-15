@@ -1015,6 +1015,14 @@ class ProductCycleTests(unittest.TestCase):
     def test_live_state_credentials_and_network_denials_apply_in_process_and_subprocess(self):
         import network_guard
 
+        selected_profile = self.directory / "custom-hermes-profile"
+        selected_profile.mkdir(mode=0o700)
+        selected_credentials = selected_profile / ".env"
+        selected_credentials.write_text("DISCORD_BOT_TOKEN=synthetic-only\n", encoding="utf-8")
+        selected_credentials.chmod(0o600)
+        previous_selected_credentials = network_guard.HERMES_CREDENTIALS_PATH
+        network_guard.HERMES_CREDENTIALS_PATH = str(selected_credentials)
+        self.addCleanup(setattr, network_guard, "HERMES_CREDENTIALS_PATH", previous_selected_credentials)
         network_guard.install()
         probes = (
             lambda: socket.socket(),
@@ -1034,6 +1042,7 @@ class ProductCycleTests(unittest.TestCase):
             "PYTHONPATH": os.pathsep.join((str(ROOT / "tests"), str(ROOT))),
             "PYTHONDONTWRITEBYTECODE": "1",
             "TMPDIR": str(HERMES_TMPDIR),
+            "HERMES_HOME": str(selected_profile),
         }
         with tempfile.TemporaryDirectory(dir=HERMES_TMPDIR) as child_directory:
             product_probe = f'''import network_guard
