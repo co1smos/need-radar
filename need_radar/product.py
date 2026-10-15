@@ -2226,7 +2226,7 @@ def main(argv=None, boundaries=None):
                 if transport is None:
                     try:
                         transport = DiscordRestTransport(
-                            _load_discord_token(Path.home() / ".config" / "need-radar" / "discord.env"),
+                            _load_discord_token(),
                             _default_http_request,
                         )
                     except ProductError:
