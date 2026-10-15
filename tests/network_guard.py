@@ -5,6 +5,11 @@ import sys
 CREDENTIALS_PATH = "/home/ubuntu/projects/need-radar/credentials.env"
 DEEPSEEK_CREDENTIALS_PATH = "/home/ubuntu/.config/need-radar/deepseek.env"
 DISCORD_CREDENTIALS_PATH = "/home/ubuntu/.config/need-radar/discord.env"
+HERMES_CREDENTIALS_PATH = os.path.abspath(os.path.expanduser(os.path.join(
+    os.environ.get("HERMES_HOME", "").strip() or "~/.hermes", ".env",
+)))
+HERMES_DEFAULT_CREDENTIALS_PATH = os.path.expanduser("~/.hermes/.env")
+HERMES_PROFILES_PATH = os.path.expanduser("~/.hermes/profiles")
 LIVE_STATE_PATH = "/home/ubuntu/.local/state/need-radar"
 
 
@@ -27,7 +32,10 @@ def _deny(event, arguments):
             continue
         if denied_path and path == os.path.abspath(denied_path):
             raise PermissionError("credential access is disabled in tests")
-        if path in {CREDENTIALS_PATH, DEEPSEEK_CREDENTIALS_PATH, DISCORD_CREDENTIALS_PATH}:
+        if path in {
+            CREDENTIALS_PATH, DEEPSEEK_CREDENTIALS_PATH, DISCORD_CREDENTIALS_PATH,
+            HERMES_CREDENTIALS_PATH, HERMES_DEFAULT_CREDENTIALS_PATH,
+        } or (path.startswith(HERMES_PROFILES_PATH + os.sep) and path.endswith(os.sep + ".env")):
             raise PermissionError("credential access is disabled in tests")
         if path == LIVE_STATE_PATH or path.startswith(LIVE_STATE_PATH + os.sep):
             raise PermissionError("live state access is disabled in tests")

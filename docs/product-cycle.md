@@ -9,7 +9,7 @@ install -D -m 600 config/product-activation.example.json ~/.config/need-radar/pr
 
 The cycle config must retain the fixed canonical aggregate ledger path and fixed request/token limits. Its output, scheduler database, and activation manifest must remain outside the repository. Real dispatch requires every activation gate to be verified with evidence. An enabled config alone does not satisfy those gates.
 
-Runtime credentials use the existing Treg and DeepSeek loaders plus `DISCORD_BOT_TOKEN` from `~/.config/need-radar/discord.env`; do not put secrets in either JSON file.
+Runtime credentials use the existing Treg and DeepSeek loaders. Discord reuses `DISCORD_BOT_TOKEN` from the selected Hermes profile's private `.env` (`$HERMES_HOME/.env`, or `~/.hermes/.env` when unset). No project-level Discord credential file or token copy is needed. Hermes cron supplies the owning profile's `HERMES_HOME`; the runner loads only that profile's token in memory after activation checks. A missing, empty, duplicate, malformed, symlinked or group/world-accessible credential file fails closed, without falling back to an inherited token or another profile. Literal bot tokens support bare/quoted values, bare/single- or double-quoted keys, optional `export` with horizontal whitespace, whitespace around `=`, inline comments and a UTF-8 BOM. Unsupported value forms are rejected rather than guessed; do not put secrets in either JSON file. This does not change Hermes settings or grant channel permissions.
 
 Use the existing Hermes run and missed-run entry points with `NEED_RADAR_CONFIG` set to the private cycle config:
 
@@ -32,4 +32,4 @@ Before enabling a real one-shot run, verify and retain evidence for: (1) current
 
 ## Offline verification
 
-The focused run passed 50 tests with Hermes `TMPDIR`, including a subprocess run of the injected product cycle with network, credential-file, and canonical-live-state access denied. `npm test` passed 34 Ralph tests and 300 offline Python tests. `npm run typecheck:sandcastle-workflow` passed. These checks use synthetic HTTP/service responses and do not establish live access, billing, source rights, or Discord delivery.
+The focused product-cycle run passed 31 tests with Hermes `TMPDIR`, including subprocess checks with network, actual credential-file, and canonical-live-state access denied. Synthetic profile fixtures verify selected- and default-profile reuse, comments/export syntax, no inherited-token fallback, duplicate/malformed rejection, and no credential persistence. `npm test` passed 34 Ralph tests and 311 offline Python tests. `npm run typecheck:sandcastle-workflow` passed. These checks use synthetic HTTP/service responses and do not establish live access, billing, source rights, or Discord delivery.
