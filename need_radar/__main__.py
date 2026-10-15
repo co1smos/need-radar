@@ -211,7 +211,7 @@ def make_prompt(items, version="v0", shared_settings=None):
     }
 
 
-def resolve_shared_settings(fixture):
+def resolve_shared_settings(fixture, allow_direct=False):
     experiment = fixture.get("experiment") if isinstance(fixture, dict) else None
     if not isinstance(experiment, dict):
         return None, ["experiment settings are missing"]
@@ -256,8 +256,9 @@ def resolve_shared_settings(fixture):
         value = settings.get(key)
         if type(value) is not int or value < 0:
             errors.append(f"shared setting {key} must be a non-negative integer")
-    if settings.get("provider") != "synthetic_fixture":
-        errors.append("offline extraction requires provider synthetic_fixture")
+    providers = {"synthetic_fixture", "deepseek-direct"} if allow_direct else {"synthetic_fixture"}
+    if settings.get("provider") not in providers:
+        errors.append("extraction provider is not enabled for this run mode")
     return (None, errors) if errors else (settings, [])
 
 
@@ -268,6 +269,7 @@ def execute_extraction(
     *,
     boundary="synthetic_fixture",
     success_status="synthetic_response",
+    evidence_kind=None,
 ):
     call_prevented = shared_settings is not None and shared_settings["request_limit"] < 1
     if call_prevented:
@@ -321,9 +323,15 @@ def execute_extraction(
             "attempted_requests",
             "usage_derived_estimated_cost_micro_usd",
             "account_billed_usd",
+            "requested_model",
+            "returned_model",
+            "product_call_id",
+            "unknown_charge_or_outcome",
         ):
             if key in model:
                 artifact[key] = model[key]
+    if evidence_kind is not None:
+        artifact["evidence_kind"] = evidence_kind
     limited_response = response
     candidate_limit_applied = False
     if shared_settings is not None and isinstance(response, list):
@@ -454,19 +462,27 @@ def validate_response(response, items):
 
 
 def render_report(status, candidates, errors, source_coverage=None, duplicate_groups=None):
+    evidence_kind = source_coverage.get("evidence_kind") if isinstance(source_coverage, dict) else None
     recorded_inputs = isinstance(source_coverage, dict) and source_coverage.get("evidence_kind") == (
         "authentic_private_recording_offline_replay"
     )
-    input_label = "private recorded inputs" if recorded_inputs else "synthetic fixture inputs"
-    run_label = "private recorded/offline replay" if recorded_inputs else "synthetic/offline only"
+    live_inputs = evidence_kind == "authentic_live"
+    injected_inputs = evidence_kind == "synthetic_injected_boundary"
+    input_label = "bounded live source inputs" if live_inputs else "private recorded inputs" if recorded_inputs else "injected synthetic responses" if injected_inputs else "synthetic fixture inputs"
+    run_label = "bounded live execution" if live_inputs else "private recorded/offline replay" if recorded_inputs else "synthetic injected-boundary proof" if injected_inputs else "synthetic/offline only"
     model_label = (
-        "Model responses use predetermined local fixtures."
+        "Model responses came from the configured DeepSeek boundary."
+        if live_inputs else "Model responses use injected synthetic service responses."
+        if injected_inputs else "Model responses use predetermined local fixtures."
         if recorded_inputs else "The model response is predetermined synthetic fixture data."
     )
     lines = [
         "# Need Radar",
         "",
-        f"Status: {status} ({run_label}; no live source or model verification)",
+        f"Status: {status} ({run_label}; " + (
+            "live account, rights, and billing remain independently verified gates)"
+            if live_inputs or injected_inputs else "no live source or model verification)"
+        ),
         "",
         model_label,
         "Citation validation checks exact excerpt substrings only; it does not assess semantic support.",
@@ -490,7 +506,7 @@ def render_report(status, candidates, errors, source_coverage=None, duplicate_gr
             omission_note = ", additional omissions unknown" if source_result["omissions_unknown"] else ""
             lines.append(
                 f"- {markdown_literal(source)}: {markdown_literal(source_result['status'])}; "
-                f"{('recorded' if recorded_inputs else 'synthetic')} inputs {source_result['input_count']}, normalized returns "
+                f"{('recorded' if recorded_inputs else 'bounded live' if live_inputs else 'injected synthetic' if injected_inputs else 'synthetic')} inputs {source_result['input_count']}, normalized returns "
                 f"{source_result['returned_count']}, omissions {source_result['omitted_count']}, "
                 f"failures {source_result['failure_count']}{omission_note}."
             )
@@ -498,10 +514,14 @@ def render_report(status, candidates, errors, source_coverage=None, duplicate_gr
                 lines.append(f"  - Omission: {markdown_literal(reason)}")
             for reason in source_result["failure_reasons"]:
                 lines.append(f"  - Failure: {markdown_literal(reason)}")
-        lines.append(
-            "Private recorded replay only; live source completeness is unverified."
-            if recorded_inputs else "Synthetic fixture coverage only; live source completeness is unverified."
-        )
+        if recorded_inputs:
+            lines.append("Private recorded replay only; live source completeness is unverified.")
+        elif live_inputs:
+            lines.append("Bounded live responses only; source completeness and rights remain unverified.")
+        elif injected_inputs:
+            lines.append("Injected synthetic boundary responses; no live access or billing is verified.")
+        else:
+            lines.append("Synthetic fixture coverage only; live source completeness is unverified.")
     if duplicate_groups:
         lines.extend(["", "## Cross-source duplicate evidence"])
         lines.append(
@@ -583,7 +603,11 @@ def run_fixture_assessment(
     validation_meta,
     snapshot_meta,
     report_meta,
+    invoke=None,
+    boundary="synthetic_fixture",
+    evidence_kind=None,
 ):
+    evidence_kind = evidence_kind or ("authentic_live" if boundary == "deepseek_direct" else "synthetic_offline")
     with tracer.span(
         "consolidation",
         inputs={"validation_id": validation_meta["artifact_id"], "candidates": candidates},
@@ -610,6 +634,7 @@ def run_fixture_assessment(
         prompts = assessment.build_isolated_judge_prompts(
             consolidation["clusters"],
             snapshot_items,
+            direct_product=boundary == "deepseek_direct",
         )
     except Exception as error:
         prompt_errors = [f"{type(error).__name__}: judge prompt failed"]
@@ -656,11 +681,36 @@ def run_fixture_assessment(
             details={"prompt_version": assessment.PROMPT_VERSION, "prompt_count": len(prompts or [])},
         )
 
+    if invoke is not None and prompts is not None:
+        responses, usages, call_ids, call_errors = [], [], [], []
+        for entry in prompts:
+            try:
+                value = invoke("serve_judge", entry["prompt"])
+            except Exception as error:
+                value = {"status": "failure", "error": type(error).__name__}
+            if isinstance(value, dict) and isinstance(value.get("product_call_id"), str):
+                call_ids.append(value["product_call_id"])
+            if not isinstance(value, dict) or value.get("status") != "provider_response":
+                call_errors.append(value.get("error", "judge call failed") if isinstance(value, dict) else "judge call failed")
+                continue
+            responses.append(value.get("response"))
+            if isinstance(value.get("usage"), dict):
+                usages.append(value["usage"])
+        raw_judge = {
+            "status": "provider_response" if not call_errors and len(responses) == len(prompts) else "failure",
+            "response": responses,
+            "usage": {
+                "requests": sum(item.get("requests", 0) for item in usages),
+                "tokens": sum(item.get("tokens", 0) for item in usages),
+            } if len(usages) == len(prompts) else None,
+            "product_call_ids": call_ids,
+            "error": "; ".join(str(error) for error in call_errors) if call_errors else None,
+        }
     reported_status = raw_judge.get("status") if isinstance(raw_judge, dict) else None
     if prompts is None:
         judge_status = "failure"
         judge_error = "judge prompt could not be built from frozen evidence"
-    elif reported_status == "synthetic_response":
+    elif reported_status == ("provider_response" if boundary == "deepseek_direct" else "synthetic_response"):
         judge_status = "success"
         judge_error = None
     else:
@@ -673,17 +723,19 @@ def run_fixture_assessment(
             judge_error = f"unsupported synthetic judge status: {reported_status!r}"
     judge_call_id = uuid.uuid4().hex
     judge_artifact = {
-        "boundary": "synthetic_fixture",
+        "boundary": boundary,
+        "evidence_kind": evidence_kind,
         "status": judge_status,
         "reported_status": reported_status,
         "response": raw_judge.get("response") if isinstance(raw_judge, dict) else None,
         "usage": raw_judge.get("usage") if isinstance(raw_judge, dict) else None,
+        "product_call_ids": raw_judge.get("product_call_ids", []) if isinstance(raw_judge, dict) else [],
         "error": judge_error,
     }
     with tracer.span(
         "judge_call",
         inputs={"call_id": judge_call_id, "prompts": prompts},
-        attributes={"call_id": judge_call_id, "boundary": "synthetic_fixture", "result_status": judge_status},
+        attributes={"call_id": judge_call_id, "boundary": boundary, "result_status": judge_status},
     ) as span:
         if judge_status != "success":
             span["status"] = "failed"
@@ -700,7 +752,7 @@ def run_fixture_assessment(
             span,
             prompt_meta,
             judge_call_id,
-            {"boundary": "synthetic_fixture"},
+            {"boundary": boundary},
         )
 
     if judge_status == "success":
@@ -724,11 +776,11 @@ def run_fixture_assessment(
         "source_artifacts": source_artifacts,
         "frozen_report": source_artifacts["frozen_report"],
         "coverage": {
-            "kind": "synthetic_offline",
+            "kind": "provider_execution" if evidence_kind == "authentic_live" else evidence_kind,
             "fixture_assessment_complete": result_status == "success",
             "candidate_count": len(consolidation["clusters"]),
-            "live_verification": "not performed",
-            "provider_invoked": False,
+            "live_verification": "not independently verified" if evidence_kind == "authentic_live" else "not performed",
+            "provider_invoked": evidence_kind == "authentic_live",
         },
     }
     with tracer.span(
@@ -761,7 +813,7 @@ def run_fixture_assessment(
     return result_status, consolidation_meta, assessment_meta
 
 
-def run(fixture_path, output):
+def run(fixture_path, output, *, invoke=None, mode="synthetic_offline"):
     if output.exists() and any(output.iterdir()):
         raise ValueError(f"output directory is not empty: {output}")
     output.mkdir(parents=True, exist_ok=True)
@@ -787,7 +839,7 @@ def run(fixture_path, output):
             "CREATE TABLE stages (sequence INTEGER, run_id TEXT, stage TEXT, status TEXT, input_stage TEXT, input_sha256 TEXT, artifact_path TEXT, output_sha256 TEXT, details TEXT, trace_id TEXT, span_id TEXT, artifact_id TEXT, input_artifact_id TEXT, call_id TEXT, PRIMARY KEY (run_id, stage))"
         )
         try:
-            with tracer.span("run", inputs={"mode": "synthetic_offline"}, attributes={"run_id": run_id}) as run_span:
+            with tracer.span("run", inputs={"mode": mode}, attributes={"run_id": run_id}) as run_span:
                 try:
                     raw_fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
@@ -849,7 +901,14 @@ def run(fixture_path, output):
                     normalizer = fixture.get("normalization_model")
                     if not isinstance(normalizer, dict):
                         normalizer = {}
-                    normalizer_status = "success" if normalizer.get("status") == "synthetic_response" else "failure"
+                    if invoke is not None:
+                        try:
+                            normalizer = invoke("source_normalization", prompt)
+                        except Exception as error:
+                            normalizer = {"status": "failure", "error": type(error).__name__}
+                    boundary = "deepseek_direct" if mode == "product" else "synthetic_fixture"
+                    accepted_status = "provider_response" if mode == "product" else "synthetic_response"
+                    normalizer_status = "success" if normalizer.get("status") == accepted_status else "failure"
                     normalizer_error = normalizer.get("error")
                     if normalizer_status == "failure" and not normalizer_error:
                         normalizer_error = "synthetic normalizer failure"
@@ -862,7 +921,7 @@ def run(fixture_path, output):
                         inputs={"call_id": normalization_call_id, "prompt": prompt},
                         attributes={
                             "call_id": normalization_call_id,
-                            "boundary": "synthetic_fixture",
+                            "boundary": boundary,
                             "result_status": normalizer_status,
                         },
                     ) as span:
@@ -876,17 +935,24 @@ def run(fixture_path, output):
                             normalizer_status,
                             Path("source-normalization-response.json"),
                             {
-                                "boundary": "synthetic_fixture",
+                                "boundary": boundary,
+                                "evidence_kind": fixture.get("evidence_kind", "authentic_live" if mode == "product" else "synthetic_offline"),
                                 "status": normalizer_status,
                                 "reported_status": normalizer.get("status"),
                                 "response": normalization_response,
                                 "usage": normalizer.get("usage"),
                                 "error": normalizer_error,
+                                "requested_model": normalizer.get("requested_model"),
+                                "returned_model": normalizer.get("returned_model"),
+                                "product_call_id": normalizer.get("product_call_id"),
+                                "usage_derived_estimated_cost_micro_usd": normalizer.get("usage_derived_estimated_cost_micro_usd"),
+                                "account_billed_usd": normalizer.get("account_billed_usd"),
+                                "unknown_charge_or_outcome": normalizer.get("unknown_charge_or_outcome"),
                             },
                             span,
                             prompt_meta,
                             normalization_call_id,
-                            {"boundary": "synthetic_fixture"},
+                            {"boundary": boundary},
                         )
 
                     if normalizer_status == "failure":
@@ -939,6 +1005,7 @@ def run(fixture_path, output):
                     }
                     normalized_fixture = {
                         "notice": fixture.get("notice", "synthetic offline source-result fixture"),
+                        "evidence_kind": fixture.get("evidence_kind", "synthetic_offline"),
                         "items": normalization["items"],
                         "model": fixture.get("model"),
                         **({"judge": fixture["judge"]} if "judge" in fixture else {}),
@@ -978,7 +1045,7 @@ def run(fixture_path, output):
 
                 shared_settings = None
                 if "experiment" in fixture:
-                    shared_settings, setting_errors = resolve_shared_settings(fixture)
+                    shared_settings, setting_errors = resolve_shared_settings(fixture, allow_direct=mode == "product")
                     with tracer.span(
                         "shared_extraction_configuration",
                         inputs={"experiment": fixture.get("experiment")},
@@ -1127,15 +1194,18 @@ def run(fixture_path, output):
 
                 model_status, model_error, model_artifact, model_response, _ = execute_extraction(
                     prompt,
-                    lambda _prompt: raw_fixture["model"],
+                    (lambda model_prompt: invoke("serve_extraction", model_prompt)) if invoke is not None else (lambda _prompt: raw_fixture["model"]),
                     shared_settings,
+                    boundary="deepseek_direct" if mode == "product" else "synthetic_fixture",
+                    success_status="provider_response" if mode == "product" else "synthetic_response",
+                    evidence_kind=fixture.get("evidence_kind", "authentic_live" if mode == "product" else "synthetic_offline"),
                 )
                 call_id = uuid.uuid4().hex
                 ids["call_id"] = call_id
                 with tracer.span(
                     "model_call",
                     inputs={"call_id": call_id, "prompt": prompt},
-                    attributes={"call_id": call_id, "boundary": "synthetic_fixture", "result_status": model_status},
+                    attributes={"call_id": call_id, "boundary":"deepseek_direct" if mode == "product" else "synthetic_fixture", "result_status": model_status},
                 ) as span:
                     model_meta = persist_stage(
                         output,
@@ -1150,7 +1220,7 @@ def run(fixture_path, output):
                         span,
                         prompt_meta,
                         call_id,
-                        {"boundary": "synthetic_fixture"},
+                        {"boundary": "deepseek_direct" if mode == "product" else "synthetic_fixture"},
                     )
 
                 with tracer.span(
@@ -1222,6 +1292,7 @@ def run(fixture_path, output):
                     )
                 ids["report_id"] = report_meta["artifact_id"]
                 if "judge" in fixture and candidates:
+                    boundary = "deepseek_direct" if mode == "product" else "synthetic_fixture"
                     try:
                         assessment_status, consolidation_meta, assessment_meta = run_fixture_assessment(
                             "serve",
@@ -1237,6 +1308,9 @@ def run(fixture_path, output):
                             validation_meta,
                             snapshot_meta,
                             report_meta,
+                            invoke=invoke,
+                            boundary=boundary,
+                            evidence_kind=fixture.get("evidence_kind", "authentic_live" if mode == "product" else "synthetic_offline"),
                         )
                         ids["consolidation_id"] = consolidation_meta["artifact_id"]
                     except Exception as error:
@@ -1266,10 +1340,10 @@ def run(fixture_path, output):
                             },
                             "source_artifacts": assessment_sources,
                             "coverage": {
-                                "kind": "synthetic_offline",
+                                "kind": "provider_execution" if fixture.get("evidence_kind") == "authentic_live" else fixture.get("evidence_kind", "synthetic_offline"),
                                 "fixture_assessment_complete": False,
-                                "live_verification": "not performed",
-                                "provider_invoked": False,
+                                "live_verification": "not independently verified" if fixture.get("evidence_kind") == "authentic_live" else "not performed",
+                                "provider_invoked": fixture.get("evidence_kind") == "authentic_live",
                             },
                         }
                         with tracer.span(

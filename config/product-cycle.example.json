@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "enabled": false,
+  "mode": "product",
+  "schedule": {
+    "interval_seconds": 86400,
+    "anchor_at": "2026-10-14T00:00:00Z",
+    "grace_seconds": 0
+  },
+  "budget": {
+    "requests": 25,
+    "tokens": 400384
+  },
+  "timeout_seconds": 300,
+  "state_db": "~/.local/state/need-radar/product-cycle/scheduler.sqlite3",
+  "output_root": "~/.local/state/need-radar/product-cycle/runs",
+  "product_budget_db": "~/.local/state/need-radar/product-cycle/budget.sqlite3",
+  "activation_file": "~/.config/need-radar/product-activation.json"
+}

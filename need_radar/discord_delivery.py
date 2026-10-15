@@ -160,7 +160,10 @@ def deliver_payload(payload, transport, on_update=None, tracer=None):
         span_context = tracer.span(
             "discord_delivery_attempt",
             inputs={"payload_identity": payload["payload_identity"], "attempt": attempt_number},
-            attributes={"channel_id": CHANNEL_ID, "transport": "fake"},
+            attributes={
+                "channel_id": CHANNEL_ID,
+                "transport": getattr(transport, "name", "injected_transport"),
+            },
         ) if tracer else nullcontext(None)
         with span_context as span:
             try:
@@ -328,8 +331,11 @@ def run_delivery(run_directory, transport=None):
     payload = build_payload(source["markdown"])
     if transport is None:
         transport = FakeDiscordTransport(timeout_after_send=True)
-    if type(transport) is not FakeDiscordTransport:
-        raise ValueError("offline delivery accepts only the injected fake transport")
+    if not callable(getattr(transport, "send", None)) or not callable(getattr(transport, "find_by_payload_identity", None)):
+        raise ValueError("delivery transport must implement send and payload read-back")
+    transport_name = getattr(transport, "name", "injected_fake" if isinstance(transport, FakeDiscordTransport) else "injected_transport")
+    fake_transport = isinstance(transport, FakeDiscordTransport)
+    injected_transport = bool(getattr(transport, "injected", False))
     database = sqlite3.connect(run_directory / "lineage.sqlite3")
     artifact_id = uuid.uuid4().hex
     tracer = Tracer(
@@ -349,25 +355,33 @@ def run_delivery(run_directory, transport=None):
             "sha256": source["sha256"],
         },
         "configuration": {
-            "transport": "injected_fake",
-            "fake_transport": {
+            "transport": transport_name,
+            **({"fake_transport": {
                 "planned_pre_send_timeouts": transport.fail_before_send,
                 "timeout_after_send": transport.timeout_after_send,
                 "attachment_limit_bytes": transport.attachment_limit_bytes,
                 "readback_error": redact(transport.readback_error),
-            },
+            }} if isinstance(transport, FakeDiscordTransport) else {}),
             "message_character_limit": MAX_MESSAGE_CHARACTERS,
             "max_attempts": MAX_ATTEMPTS,
             "schedule_activated": False,
         },
         "hermes_interface": {
-            "installation": "confirmed_by_read_only_help",
-            "observed_command": "hermes send",
-            "target_option": "--to discord:<channel_id>",
-            "file_option": "--file",
-            "attachment_syntax": "MEDIA:<path>",
-            "delivery_compatibility": "unverified",
-            "send_invoked": False,
+            **({
+                "installation": "confirmed_by_read_only_help",
+                "observed_command": "hermes send",
+                "target_option": "--to discord:<channel_id>",
+                "file_option": "--file",
+                "attachment_syntax": "MEDIA:<path>",
+                "delivery_compatibility": "unverified",
+                "send_invoked": False,
+            } if fake_transport else {
+                "transport": transport_name,
+                "installation": "not used by the configured transport",
+                "observed_command": None,
+                "delivery_compatibility": "Discord REST boundary; external permission and read-back remain unverified",
+                "send_invoked": not injected_transport,
+            }),
         },
         "payload_identity": payload["payload_identity"],
         "payload": payload,
@@ -380,16 +394,16 @@ def run_delivery(run_directory, transport=None):
             "attachment_sizes_bytes": [
                 len(attachment["content"].encode("utf-8")) for attachment in payload["attachments"]
             ],
-            "fake_transport_attachment_limit_bytes": transport.attachment_limit_bytes,
+            "fake_transport_attachment_limit_bytes": transport.attachment_limit_bytes if isinstance(transport, FakeDiscordTransport) else None,
             "source_text_treated_as_untrusted_data": True,
         },
         "attempts": [],
         "message_id": None,
         "exactly_once_claimed": False,
         "verification": {
-            "mode": "synthetic_fake_transport_only",
-            "real_discord_send": "not_performed",
-            "real_discord_readback": "not_performed",
+            "mode": "synthetic_fake_transport_only" if fake_transport else "synthetic_injected_boundary" if injected_transport else "configured_discord_transport",
+            "real_discord_send": "not_performed" if fake_transport or injected_transport else "attempted only if delivery stage is reached",
+            "real_discord_readback": "not_performed" if fake_transport or injected_transport else "performed by configured transport after ambiguous outcomes",
             "external_links_verified": False,
         },
         "coverage": {
@@ -414,7 +428,7 @@ def run_delivery(run_directory, transport=None):
         with tracer.span(
             "discord_delivery",
             inputs={"report": delivery["source"], "payload": payload, "configuration": delivery["configuration"]},
-            attributes={"channel_id": CHANNEL_ID, "transport": "injected_fake"},
+            attributes={"channel_id": CHANNEL_ID, "transport": transport_name},
         ) as delivery_span:
             result = deliver_payload(payload, transport, on_update=save, tracer=tracer)
             delivery.update(result)

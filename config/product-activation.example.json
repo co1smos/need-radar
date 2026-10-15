@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "enabled": false,
+  "retention_days": 7,
+  "routes": {
+    "reddit": "tikhub.x.reddit-app-fetch-subreddit-feed",
+    "x": "x.x.search-posts-recent"
+  },
+  "model": "deepseek-flash",
+  "channel_id": "1557157266824634469",
+  "budget": {
+    "aggregate_limit_micro_usd": 250000
+  },
+  "source_reservations_micro_usd": {
+    "reddit": 1000,
+    "x": 50000
+  },
+  "gates": {
+    "one_shot_execution": {"verified": false, "evidence": ""},
+    "reddit_route_schema": {"verified": false, "evidence": ""},
+    "x_route_schema": {"verified": false, "evidence": ""},
+    "provider_access": {"verified": false, "evidence": ""},
+    "source_use_rights": {"verified": false, "evidence": ""},
+    "source_billing_caps": {"verified": false, "evidence": ""},
+    "existing_source_holds": {"verified": false, "evidence": ""},
+    "model_access_and_data_use": {"verified": false, "evidence": ""},
+    "discord_permission_and_readback": {"verified": false, "evidence": ""},
+    "retention_and_cleanup": {"verified": false, "evidence": ""}
+  }
+}

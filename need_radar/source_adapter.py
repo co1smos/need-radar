@@ -305,6 +305,8 @@ def prepare_source_results(source_results):
         return prepared
     if source_results.get("evidence_kind") == "authentic_private_recording_offline_replay":
         prepared["evidence_kind"] = "authentic_private_recording_offline_replay"
+    elif source_results.get("evidence_kind") in {"authentic_live", "synthetic_injected_boundary"}:
+        prepared["evidence_kind"] = source_results["evidence_kind"]
 
     for source in SOURCES:
         envelope = source_results.get(source)
@@ -314,6 +316,13 @@ def prepare_source_results(source_results):
         prepared["source_envelopes"][source] = True
         prepared["source_partial"][source] = envelope.get("partial") is True
         source_error_start = len(prepared["errors"])
+        source_errors = envelope.get("errors", [])
+        if isinstance(source_errors, list):
+            prepared["errors"].extend(
+                f"{source}: acquisition {error}"
+                for error in source_errors
+                if isinstance(error, str) and error in {"request_failed", "response_invalid", "charge_unknown", "deadline_exceeded"}
+            )
         if not isinstance(envelope.get("partial"), bool):
             _source_error(prepared["errors"], source, "envelope partial flag must be boolean")
         if not isinstance(envelope.get("origin"), dict):
@@ -404,7 +413,11 @@ def prepare_source_results(source_results):
 def source_coverage(prepared, returned_ids, errors):
     coverage = {
         "evidence_kind": prepared.get("evidence_kind", "synthetic_normalized_fixture"),
-        "live_source_verification": "not performed",
+        "live_source_verification": "bounded requests completed; access, rights, and completeness remain unverified"
+        if prepared.get("evidence_kind") == "authentic_live"
+        else "injected synthetic source responses; no live access or billing verified"
+        if prepared.get("evidence_kind") == "synthetic_injected_boundary"
+        else "not performed",
         "sources": {},
     }
     for source in SOURCES:

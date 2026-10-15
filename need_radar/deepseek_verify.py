@@ -340,6 +340,120 @@ def _request_body(prompt):
     return payload, body
 
 
+def invoke_prompt(prompt, api_key, *, transport=None, max_input_tokens=4096,
+                  max_output_tokens=1024, timeout=20, max_request_bytes=262144,
+                  temperature=None):
+    """One reusable, bounded direct chat-completion request; caller owns reservations."""
+    if not isinstance(api_key, str) or not api_key or not isinstance(prompt, dict):
+        return {"status": "failure", "error": "request_input_invalid", "attempted_requests": 0}
+    if any(type(value) is not int or value < 1 for value in (max_input_tokens, max_output_tokens)):
+        return {"status": "failure", "error": "request_limits_invalid", "attempted_requests": 0}
+    payload = {
+        "model": MODEL,
+        "messages": prompt.get("messages"),
+        "max_tokens": max_output_tokens,
+        "thinking": {"type": "disabled"},
+        "stream": False,
+    }
+    if temperature is not None:
+        if type(temperature) not in {int, float} or not 0 <= temperature <= 2:
+            return {"status": "failure", "error": "temperature_limit_invalid", "attempted_requests": 0}
+        payload["temperature"] = temperature
+    try:
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    except (TypeError, ValueError):
+        return {"status": "failure", "error": "request_json_invalid", "attempted_requests": 0}
+    if not isinstance(payload["messages"], list) or len(body) > max_request_bytes:
+        return {"status": "failure", "error": "request_size_or_messages_invalid", "attempted_requests": 0}
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "Connection": "close",
+        "Content-Type": "application/json",
+    }
+    try:
+        if transport is None:
+            status, response_headers, raw = _direct_send(body, api_key, timeout, MAX_RESPONSE_BYTES)
+        else:
+            status, response_headers, raw = transport(ENDPOINT, headers, body, timeout, MAX_RESPONSE_BYTES)
+        if not isinstance(status, int) or not isinstance(response_headers, dict) or not isinstance(raw, bytes):
+            raise ValueError("response_boundary_invalid")
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise ValueError("response_size_limit_exceeded")
+    except Exception as error:
+        return {
+            "status": "failure", "error": type(error).__name__, "attempted_requests": 1,
+            "unknown_charge_or_outcome": True, "requested_model": MODEL, "returned_model": None,
+            "usage": None, "account_billed_usd": None,
+        }
+    try:
+        decoded = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        decoded = None
+    usage = _safe_usage(decoded.get("usage")) if isinstance(decoded, dict) else None
+    choices = decoded.get("choices") if isinstance(decoded, dict) else None
+    choice = choices[0] if isinstance(choices, list) and len(choices) == 1 else None
+    message = choice.get("message") if isinstance(choice, dict) else None
+    content = message.get("content") if isinstance(message, dict) else None
+    returned_model = decoded.get("model") if isinstance(decoded, dict) else None
+    response = None
+    try:
+        if isinstance(content, str):
+            response = json.loads(content.replace(api_key, "[REDACTED]"))
+    except (json.JSONDecodeError, TypeError):
+        pass
+    cost = _cost_micro_usd(usage["prompt_tokens"], usage["completion_tokens"]) if usage else None
+    valid = (
+        status == 200 and returned_model == MODEL and usage is not None
+        and usage["prompt_tokens"] <= max_input_tokens
+        and usage["completion_tokens"] <= max_output_tokens
+        and isinstance(choice, dict) and choice.get("finish_reason") == "stop"
+        and isinstance(message, dict) and message.get("role") == "assistant"
+        and response is not None
+    )
+    if valid:
+        error_code = None
+    elif usage is None:
+        error_code = "usage_unavailable"
+    elif returned_model != MODEL:
+        error_code = "provider_model_mismatch"
+    elif usage["prompt_tokens"] > max_input_tokens or usage["completion_tokens"] > max_output_tokens:
+        error_code = "provider_usage_exceeded_ceiling"
+    else:
+        error_code = f"invalid_provider_response_{status}"
+    return {
+        "status": "provider_response" if valid else "failure",
+        "error": error_code,
+        "response": response if valid else None,
+        "usage": {"requests": 1, "tokens": usage["total_tokens"]} if usage else None,
+        "requested_model": MODEL,
+        "returned_model": returned_model,
+        "attempted_requests": 1,
+        "usage_derived_estimated_cost_micro_usd": cost,
+        "account_billed_usd": None,
+        "unknown_charge_or_outcome": usage is None,
+        "http_status": status,
+        "request_id": redact(str(response_headers.get("x-request-id", "")))[:128] or None,
+    }
+
+
+def _direct_send(body, api_key, timeout, response_limit):
+    connection = http.client.HTTPSConnection(HOST, timeout=timeout)
+    try:
+        connection.request(
+            "POST", "/chat/completions", body=body,
+            headers={
+                "Accept": "application/json", "Authorization": f"Bearer {api_key}",
+                "Connection": "close", "Content-Type": "application/json",
+            },
+        )
+        response = connection.getresponse()
+        raw = response.read(response_limit + 1)
+        return response.status, {"x-request-id": response.getheader("x-request-id")}, raw
+    finally:
+        connection.close()
+
+
 def _safe_usage(value):
     if not isinstance(value, dict):
         return None

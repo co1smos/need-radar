@@ -63,7 +63,10 @@ def _validate_serve_assessment(artifacts, snapshot_items, stage_refs):
     if scored.get("rubric_version") != assessment.RUBRIC_VERSION or scored.get("prompt_version") != assessment.PROMPT_VERSION:
         errors.append("serve rubric or judge prompt version differs")
     try:
-        prompts = assessment.build_isolated_judge_prompts(consolidation.get("clusters", []), snapshot_items)
+        prompts = assessment.build_isolated_judge_prompts(
+            consolidation.get("clusters", []), snapshot_items,
+            direct_product=judge_response.get("boundary") == "deepseek_direct",
+        )
     except (KeyError, TypeError, ValueError):
         prompts = None
         errors.append("serve assessment evidence does not resolve to the frozen snapshot")
@@ -87,7 +90,8 @@ def _validate_serve_assessment(artifacts, snapshot_items, stage_refs):
 
 def _run_v1_assessment(
     raw_judge, v1_result, context, snapshot_ref, report_ref, output,
-    database, tracer, run_id, trace_id, sequence,
+    database, tracer, run_id, trace_id, sequence, invoke=None, mode="synthetic_offline",
+    evidence_kind="synthetic_offline",
 ):
     (output / "v1").mkdir(parents=True, exist_ok=True)
     _, validation = _read_artifact(output / "v1" / "candidates.json")
@@ -101,7 +105,9 @@ def _run_v1_assessment(
         )
     prompt_errors = []
     try:
-        prompts = assessment.build_isolated_judge_prompts(consolidation["clusters"], context["items"])
+        prompts = assessment.build_isolated_judge_prompts(
+            consolidation["clusters"], context["items"], direct_product=mode == "product",
+        )
     except (KeyError, TypeError, ValueError):
         prompts = None
         prompt_errors.append("judge evidence does not resolve to the frozen context")
@@ -122,23 +128,55 @@ def _run_v1_assessment(
         )
     judge_input = redact(raw_judge) if isinstance(raw_judge, dict) else None
     response = judge_input.get("response") if isinstance(judge_input, dict) else None
-    judge_status = "success" if prompts is not None and isinstance(judge_input, dict) and judge_input.get("status") == "synthetic_response" else "unavailable"
-    judge_error = None if judge_status == "success" else "pre-assessed shadow fixture is missing or unsupported"
+    if invoke is not None and prompts is not None:
+        response, usages, call_ids, failures = [], [], [], []
+        for entry in prompts:
+            try:
+                value = invoke("shadow_judge", entry["prompt"])
+            except Exception as error:
+                value = {"status": "failure", "error": type(error).__name__}
+            if isinstance(value, dict) and isinstance(value.get("product_call_id"), str):
+                call_ids.append(value["product_call_id"])
+            if not isinstance(value, dict) or value.get("status") != "provider_response":
+                failures.append(value.get("error", "judge call failed") if isinstance(value, dict) else "judge call failed")
+                continue
+            response.append(value.get("response"))
+            if isinstance(value.get("usage"), dict):
+                usages.append(value["usage"])
+        judge_input = {
+            "status": "provider_response" if not failures and len(response) == len(prompts) else "failure",
+            "response": response,
+            "usage": {
+                "requests": sum(item.get("requests", 0) for item in usages),
+                "tokens": sum(item.get("tokens", 0) for item in usages),
+            } if len(usages) == len(prompts) else None,
+            "product_call_ids": call_ids,
+            "error": "; ".join(str(error) for error in failures) if failures else None,
+        }
+    accepted_statuses = {"provider_response"} if invoke is not None else {"synthetic_response"}
+    judge_status = "success" if prompts is not None and isinstance(judge_input, dict) and judge_input.get("status") in accepted_statuses else "unavailable"
+    judge_error = None if judge_status == "success" else (
+        judge_input.get("error") or "DeepSeek judge response unavailable"
+        if invoke is not None else "pre-assessed shadow fixture is missing or unsupported"
+    )
     judge_id = uuid.uuid4().hex
     judge_value = {
-        "boundary": "synthetic_fixture_pre_assessed_input",
-        "provider_invoked": False,
+        "boundary": "deepseek_direct" if invoke is not None else "synthetic_fixture_pre_assessed_input",
+        "evidence_kind": evidence_kind,
+        "provider_invoked": evidence_kind == "authentic_live",
         "status": judge_status,
         "response": response,
+        "usage": judge_input.get("usage") if isinstance(judge_input, dict) else None,
+        "product_call_ids": judge_input.get("product_call_ids", []) if isinstance(judge_input, dict) else [],
         "error": judge_error,
     }
-    with tracer.span("v1_assessment_input", inputs={"prompts": prompts}, attributes={"provider_invoked": False}) as span:
+    with tracer.span("v1_assessment_input", inputs={"prompts": prompts}, attributes={"provider_invoked": evidence_kind == "authentic_live"}) as span:
         if judge_status != "success":
             span["status"] = "failed"
         judge_meta = persist_stage(
             output, database, run_id, trace_id, sequence + 2, "v1_assessment_input", judge_status,
             Path("v1/assessment-input.json"), judge_value, span, prompt_meta, judge_id,
-            {"provider_invoked": False},
+            {"provider_invoked": evidence_kind == "authentic_live"},
         )
     if judge_status == "success":
         result = assessment.validate_assessments(response, consolidation["clusters"])
@@ -151,10 +189,10 @@ def _run_v1_assessment(
         "coverage": {
             "assessment_complete": result["status"] == "success",
             "candidate_count": len(consolidation["clusters"]),
-            "kind": "synthetic_pre_assessed_input",
-            "live_verification": "not performed",
+            "kind": "provider_execution" if evidence_kind == "authentic_live" else evidence_kind,
+            "live_verification": "not independently verified" if evidence_kind == "authentic_live" else "not performed",
         },
-        "provider_invoked": False,
+        "provider_invoked": evidence_kind == "authentic_live",
     })
     with tracer.span("v1_assessment", inputs={"input_artifact_id": judge_meta["artifact_id"], "result": result}) as span:
         if result["status"] != "success":
@@ -180,9 +218,10 @@ def _stage_duration(trace_path, artifact_id):
     return None
 
 
-def _comparison_arm(status, snapshot_items, processed_item_ids, processing_complete, settings, validation, consolidation, scored, usage, refs, latency):
+def _comparison_arm(status, snapshot_items, processed_item_ids, processing_complete, settings, validation, consolidation, scored, usage, refs, latency, *, direct_product=False):
     judge_configuration = assessment.build_judge_prompt(
         [{"title": "", "friction": "", "evidence": []}], [],
+        direct_product=direct_product,
     )["config"]
     return {
         "status": status,
@@ -365,7 +404,7 @@ def _persist_missing_serve_artifact_comparison(output, serve_dir, missing_artifa
 
 def _run_v1(
     model_fixture, context, settings, truncation_meta, output, database, tracer, run_id, trace_id,
-    not_run_reason=None,
+    not_run_reason=None, invoke=None, mode="synthetic_offline", evidence_kind="synthetic_offline",
 ):
     (output / "v1").mkdir(parents=True, exist_ok=True)
     call_id = uuid.uuid4().hex
@@ -384,14 +423,15 @@ def _run_v1(
     with tracer.span(
         "v1_model_call",
         inputs={"call_id": call_id, "prompt": prompt},
-        attributes={"arm": "v1", "call_id": call_id, "boundary": "synthetic_fixture"},
+        attributes={"arm": "v1", "call_id": call_id, "boundary": "deepseek_direct" if mode == "product" else "synthetic_fixture", "evidence_kind": evidence_kind},
     ) as span:
         if not_run_reason:
             model_status, model_error, response, candidate_limit_applied = (
                 "not_run_parity_failure", not_run_reason, None, False
             )
             model_artifact = {
-                "boundary": "synthetic_fixture",
+                "boundary": "deepseek_direct" if mode == "product" else "synthetic_fixture",
+                "evidence_kind": evidence_kind,
                 "execution_seam": None,
                 "invoked": False,
                 "attempted_requests": 0,
@@ -408,7 +448,12 @@ def _run_v1(
             }
         else:
             model_status, model_error, model_artifact, response, candidate_limit_applied = execute_extraction(
-                prompt, lambda _prompt: model_fixture, settings
+                prompt,
+                (lambda model_prompt: invoke("shadow_extraction", model_prompt)) if invoke is not None else (lambda _prompt: model_fixture),
+                settings,
+                boundary="deepseek_direct" if mode == "product" else "synthetic_fixture",
+                success_status="provider_response" if mode == "product" else "synthetic_response",
+                evidence_kind=evidence_kind,
             )
         model_artifact["call_id"] = call_id
         model_artifact["arm"] = "v1"
@@ -416,7 +461,7 @@ def _run_v1(
         model_meta = persist_stage(
             output, database, run_id, trace_id, 2, "v1_model_call", model_status,
             Path("v1/model-response.json"), model_artifact, span, prompt_meta, call_id,
-            {"boundary": "synthetic_fixture", "shared_settings": settings},
+            {"boundary": "deepseek_direct" if mode == "product" else "synthetic_fixture", "evidence_kind": evidence_kind, "shared_settings": settings},
         )
 
     with tracer.span(
@@ -456,15 +501,17 @@ def _run_v1(
     }, prompt
 
 
-def run(serve_dir, fixture_path, output):
+def run(serve_dir, fixture_path, output, *, invoke=None, mode="synthetic_offline"):
     if output.exists() and any(output.iterdir()):
         raise ValueError(f"output directory is not empty: {output}")
     raw_fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
     fixture = redact(raw_fixture)
-    if not isinstance(fixture, dict) or fixture.get("provider") != "synthetic_fixture":
-        raise ValueError("shadow runner supports synthetic_fixture input only")
+    accepted_providers = {"synthetic_fixture", "deepseek-direct"} if mode == "product" else {"synthetic_fixture"}
+    if not isinstance(fixture, dict) or fixture.get("provider") not in accepted_providers:
+        raise ValueError("shadow provider is not enabled for this run mode")
+    evidence_kind = fixture.get("evidence_kind", "authentic_live" if mode == "product" else "synthetic_offline")
     experiment = fixture.get("experiment")
-    settings, setting_errors = resolve_shared_settings(fixture)
+    settings, setting_errors = resolve_shared_settings(fixture, allow_direct=mode == "product")
     raw_experiment = raw_fixture.get("experiment") if isinstance(raw_fixture, dict) else None
     shadow_model = raw_experiment.get("shadow_model") if isinstance(raw_experiment, dict) else None
     shadow_assessment = experiment.get("shadow_assessment") if isinstance(experiment, dict) else None
@@ -674,6 +721,7 @@ def run(serve_dir, fixture_path, output):
                     shadow_model, context, settings, truncation_meta, output,
                     database, tracer, run_id, trace_id,
                     not_run_reason="; ".join(pre_run_parity_errors) if pre_run_parity_errors else None,
+                    invoke=invoke, mode=mode, evidence_kind=evidence_kind,
                 )
                 settings_identical = (
                     v0_response.get("resolved_shared_settings") == settings
@@ -708,6 +756,9 @@ def run(serve_dir, fixture_path, output):
                     run_id,
                     trace_id,
                     4,
+                    invoke=invoke,
+                    mode=mode,
+                    evidence_kind=evidence_kind,
                 )
                 complete = (
                     not parity_errors
@@ -745,6 +796,7 @@ def run(serve_dir, fixture_path, output):
                         for key in ("candidate_validation", "snapshot", "consolidation", "frozen_report")
                     },
                     _stage_duration(serve_dir / "trace.jsonl", lineage["v0_response"].get("artifact_id")),
+                    direct_product=mode == "product",
                 )
                 v1_arm = _comparison_arm(
                     v1_result.get("status"), snapshot["items"],
@@ -760,6 +812,7 @@ def run(serve_dir, fixture_path, output):
                         "frozen_report": serve_stage_refs.get("frozen_report", {}),
                     },
                     _stage_duration(output / "trace.jsonl", v1_result["model_call"]["artifact_id"]),
+                    direct_product=mode == "product",
                 )
                 assessment_comparison = (
                     comparison.compare_assessed_arms(v0_arm, v1_arm)
@@ -781,8 +834,8 @@ def run(serve_dir, fixture_path, output):
                 assessment_report = comparison.render_markdown(assessment_comparison)
                 result = {
                     "status": "complete" if complete else "incomplete",
-                    "evidence_kind": "synthetic_offline",
-                    "verification_limit": "synthetic fixture only; no live source or provider verification",
+                    "evidence_kind": evidence_kind,
+                    "verification_limit": "source rights, account access, and billing require independent verification" if evidence_kind == "authentic_live" else "injected service responses; no live access or billing is verified" if evidence_kind == "synthetic_injected_boundary" else "synthetic fixture only; no live source or provider verification",
                     "arms": {
                         "v0": {
                             "status": v0_candidates.get("status", "unknown"),
@@ -821,7 +874,7 @@ def run(serve_dir, fixture_path, output):
                     "serve_substitution": False,
                     "browsing": False,
                     "evidence_enrichment": False,
-                    "judge": "pre-assessed fixture only; no provider invoked",
+                    "judge": "DeepSeek direct responses; no tools or browsing" if evidence_kind == "authentic_live" else "injected synthetic DeepSeek protocol responses" if evidence_kind == "synthetic_injected_boundary" else "pre-assessed fixture only; no provider invoked",
                 }
                 root_span["attributes"]["result_status"] = result["status"]
                 with tracer.span(
