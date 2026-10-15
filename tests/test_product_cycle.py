@@ -1205,9 +1205,15 @@ class ProductCycleTests(unittest.TestCase):
                 "UPDATE stages SET output_sha256=? WHERE stage='discord_delivery'",
                 (hashlib.sha256(delivery_bytes).hexdigest(),),
             )
-        with self.assertRaisesRegex(product.ProductError, "delivery_identity_invalid"):
-            product.remove_run(wrong_delivery_root, wrong_delivery_dir.name, transport=product.FakeDiscordTransport(), now=NOW)
-        self.assertTrue((wrong_delivery_dir / "serve" / "report.md").is_file())
+        wrong_delivery_transport = product.FakeDiscordTransport()
+        wrong_delivery = product.remove_run(
+            wrong_delivery_root, wrong_delivery_dir.name,
+            transport=wrong_delivery_transport, now=NOW,
+        )
+        self.assertEqual(wrong_delivery["local"]["status"], "removed")
+        self.assertEqual(wrong_delivery["discord"]["status"], "inconclusive")
+        self.assertFalse(wrong_delivery_dir.exists())
+        self.assertEqual(wrong_delivery_transport.events, [])
 
         target = self.directory / "outside"
         target.mkdir(mode=0o700)
@@ -1235,6 +1241,61 @@ class ProductCycleTests(unittest.TestCase):
         self.assertEqual(receipt["message_id"], message_id)
         reconciled = product.remove_run(runs, run_dir.name, transport=transport, now=NOW)
         self.assertEqual(reconciled["discord"]["status"], "already_absent")
+
+    def test_interrupted_delivery_persistence_keeps_local_removal_and_reconciliation(self):
+        def interrupt_after_artifact_replace(run_dir):
+            delivery_path = run_dir / "serve" / "discord-delivery.json"
+            delivery = json.loads(delivery_path.read_text())
+            delivery["status"] = "delivered_reconciled"
+            replacement = delivery_path.with_name(".interrupted-discord-delivery.json")
+            replacement.write_text(json.dumps(delivery), encoding="utf-8")
+            replacement.chmod(0o600)
+            os.replace(replacement, delivery_path)
+            # The artifact replace succeeded, but the matching SQLite commit did not.
+
+        early_runs = self.directory / "early-interrupted-runs"
+        early_dir, early_message_id, early_identity = _make_removable_run(early_runs)
+        interrupt_after_artifact_replace(early_dir)
+        transport = product.FakeDiscordTransport()
+        transport.messages.append({
+            "message_id": early_message_id, "channel_id": product.CHANNEL_ID,
+            "payload_identity": early_identity, "bot_created": True,
+        })
+
+        early = product.remove_run(early_runs, early_dir.name, transport=transport, now=NOW)
+
+        self.assertEqual(early["status"], "partial")
+        self.assertEqual(early["local"]["status"], "removed")
+        self.assertEqual(early["discord"]["status"], "inconclusive")
+        self.assertFalse(early_dir.exists())
+        self.assertEqual(transport.events, [])
+        early_receipt_path = early_runs / ".product-removals" / f"{early_dir.name}.json"
+        early_receipt = json.loads(early_receipt_path.read_text())
+        self.assertEqual(early_receipt["message_id"], early_message_id)
+        self.assertEqual(early_receipt["payload_identity"], early_identity)
+        self.assertNotIn("payload", early_receipt)
+
+        reconciled = product.remove_run(early_runs, early_dir.name, transport=transport, now=NOW)
+        self.assertEqual(reconciled["discord"]["status"], "deleted")
+        self.assertEqual(transport.events, ["delete"])
+
+        expiry_runs = self.directory / "expiry-interrupted-runs"
+        expiry_dir, expiry_message_id, expiry_identity = _make_removable_run(
+            expiry_runs, run_id="9" * 32, created=NOW - timedelta(days=3),
+        )
+        interrupt_after_artifact_replace(expiry_dir)
+
+        expired = product.cleanup(expiry_runs, now=NOW)
+
+        self.assertEqual(expired["status"], "partial")
+        self.assertEqual(expired["removed"], 1)
+        self.assertEqual(expired["runs"][0]["discord"]["status"], "inconclusive")
+        self.assertFalse(expiry_dir.exists())
+        expiry_receipt = json.loads(
+            (expiry_runs / ".product-removals" / f"{expiry_dir.name}.json").read_text()
+        )
+        self.assertEqual(expiry_receipt["message_id"], expiry_message_id)
+        self.assertEqual(expiry_receipt["payload_identity"], expiry_identity)
 
     def test_expiry_schedule_does_not_retry_ambiguous_discord_automatically(self):
         runs = self.directory / "retry-scheduled-runs"

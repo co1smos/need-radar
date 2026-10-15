@@ -1838,7 +1838,7 @@ def _pilot_run(output_root, run_id):
 def _delivery_removal_identity(run_dir, run_id):
     delivery_path = run_dir / "serve" / "discord-delivery.json"
     if not delivery_path.exists():
-        return None
+        return None, True
     serve_dir = run_dir / "serve"
     try:
         serve_info = serve_dir.lstat()
@@ -1859,7 +1859,7 @@ def _delivery_removal_identity(run_dir, run_id):
     message_id = delivery.get("message_id") if isinstance(delivery, dict) else None
     identity = delivery.get("payload_identity") if isinstance(delivery, dict) else None
     if delivery.get("status") not in ("delivered", "delivered_reconciled", "ambiguous", "pending", "sending", "retrying"):
-        return None
+        return None, True
     if (
         not isinstance(destination, dict) or destination.get("platform") != "discord"
         or destination.get("channel_id") != CHANNEL_ID
@@ -1872,8 +1872,28 @@ def _delivery_removal_identity(run_dir, run_id):
     source = delivery.get("source")
     lineage_db = run_dir / "serve" / "lineage.sqlite3"
     report_path = run_dir / "serve" / "report.md"
-    if not _private_record(lineage_db) or not _private_record(report_path):
+    if not _private_record(report_path):
         raise ProductError("pilot_delivery_lineage_unsafe", "cleanup")
+    if not isinstance(source, dict) or not isinstance(payload, dict):
+        raise ProductError("pilot_delivery_lineage_invalid", "cleanup")
+    report_sha = serve.digest(report_path.read_bytes())
+    expected_identity = serve.digest(serve.json_bytes({
+        "channel_id": CHANNEL_ID,
+        "report_sha256": source.get("sha256"),
+    }))
+    if (
+        source.get("artifact_path") != "report.md" or source.get("sha256") != report_sha
+        or identity != expected_identity or payload.get("payload_identity") != identity
+        or payload.get("report_sha256") != report_sha
+    ):
+        raise ProductError("pilot_delivery_identity_invalid", "cleanup")
+    removal_identity = {
+        "channel_id": CHANNEL_ID,
+        "message_id": message_id if _valid_discord_message_id(message_id) else None,
+        "payload_identity": identity,
+    }
+    if not _private_record(lineage_db):
+        return removal_identity, False
     try:
         database_uri = f"file:{urllib.parse.quote(str(lineage_db))}?mode=ro"
         with sqlite3.connect(database_uri, uri=True) as database:
@@ -1886,10 +1906,7 @@ def _delivery_removal_identity(run_dir, run_id):
                 "FROM stages WHERE stage='discord_delivery' ORDER BY sequence DESC LIMIT 1"
             ).fetchone()
     except sqlite3.Error:
-        raise ProductError("pilot_delivery_lineage_invalid", "cleanup") from None
-    if not isinstance(source, dict) or not isinstance(payload, dict):
-        raise ProductError("pilot_delivery_lineage_invalid", "cleanup")
-    report_sha = serve.digest(report_path.read_bytes())
+        return removal_identity, False
     artifact_sha = serve.digest(delivery_path.read_bytes())
     if (
         report_row is None or delivery_row is None
@@ -1907,18 +1924,8 @@ def _delivery_removal_identity(run_dir, run_id):
         or lineage.get("input_sha256") != report_row[3]
         or payload.get("payload_identity") != identity or payload.get("report_sha256") != report_sha
     ):
-        raise ProductError("pilot_delivery_lineage_invalid", "cleanup")
-    expected_identity = serve.digest(serve.json_bytes({
-        "channel_id": CHANNEL_ID,
-        "report_sha256": source.get("sha256") if isinstance(source, dict) else None,
-    }))
-    if identity != expected_identity:
-        raise ProductError("pilot_delivery_identity_invalid", "cleanup")
-    return {
-        "channel_id": CHANNEL_ID,
-        "message_id": message_id if _valid_discord_message_id(message_id) else None,
-        "payload_identity": identity,
-    }
+        return removal_identity, False
+    return removal_identity, True
 
 
 def _read_removal_record(path, run_id):
@@ -2008,12 +2015,17 @@ def remove_run(output_root, run_id, transport=None, now=None):
     removal_path = _removal_path(root, run_id)
     removal = _read_removal_record(removal_path, run_id)
     run_dir = root / run_id
+    delivery_metadata_unresolved = False
     if removal is None:
         _root, run_dir, retention_marker = _pilot_run(root, run_id)
         _private_run_tree(run_dir)
         retention = json.loads(retention_marker.read_text(encoding="utf-8"))["retention"]
-        identity = _delivery_removal_identity(run_dir, run_id)
-        discord_status = "pending" if identity else "not_applicable"
+        try:
+            identity, lineage_valid = _delivery_removal_identity(run_dir, run_id)
+        except (OSError, ProductError):
+            identity, lineage_valid = None, False
+        delivery_metadata_unresolved = not lineage_valid
+        discord_status = "inconclusive" if delivery_metadata_unresolved else "pending" if identity else "not_applicable"
         removal = {
             "operation": "need-radar-product-removal",
             "schema_version": 1,
@@ -2059,7 +2071,7 @@ def remove_run(output_root, run_id, transport=None, now=None):
         discord_status = "not_requested"
         removal["discord_status"] = discord_status
         _save_removal_record(removal_path, removal)
-    if transport is not None and discord_status not in {"deleted", "already_absent", "not_applicable", "identity_mismatch"}:
+    if transport is not None and not delivery_metadata_unresolved and discord_status not in {"deleted", "already_absent", "not_applicable", "identity_mismatch"}:
         if removal["payload_identity"] is None:
             discord_status = "unavailable" if discord_status == "pending" else discord_status
         else:
@@ -2167,7 +2179,7 @@ def cleanup(output_root, now=None, transport=None):
                         outcome = remove_run(root, child.name, transport=run_transport, now=moment)
                         runs.append(outcome)
                         removed += outcome["local"]["status"] == "removed"
-                        partial = partial or (transport is not None and outcome["status"] != "success")
+                        partial = partial or outcome["status"] != "success"
                     else:
                         shutil.rmtree(child)
                         removed += 1
