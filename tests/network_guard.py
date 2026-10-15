@@ -4,6 +4,7 @@ import sys
 
 CREDENTIALS_PATH = "/home/ubuntu/projects/need-radar/credentials.env"
 DEEPSEEK_CREDENTIALS_PATH = "/home/ubuntu/.config/need-radar/deepseek.env"
+DISCORD_CREDENTIALS_PATH = "/home/ubuntu/.config/need-radar/discord.env"
 LIVE_STATE_PATH = "/home/ubuntu/.local/state/need-radar"
 
 
@@ -26,7 +27,7 @@ def _deny(event, arguments):
             continue
         if denied_path and path == os.path.abspath(denied_path):
             raise PermissionError("credential access is disabled in tests")
-        if path in {CREDENTIALS_PATH, DEEPSEEK_CREDENTIALS_PATH}:
+        if path in {CREDENTIALS_PATH, DEEPSEEK_CREDENTIALS_PATH, DISCORD_CREDENTIALS_PATH}:
             raise PermissionError("credential access is disabled in tests")
         if path == LIVE_STATE_PATH or path.startswith(LIVE_STATE_PATH + os.sep):
             raise PermissionError("live state access is disabled in tests")

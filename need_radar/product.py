@@ -19,6 +19,7 @@ import uuid
 
 from need_radar import __main__ as serve
 from need_radar import deepseek_verify, shadow
+from need_radar.discord_delivery import MAX_ATTEMPTS as DISCORD_MAX_ATTEMPTS
 from need_radar.discord_delivery import CHANNEL_ID, FakeDiscordTransport, run_delivery, validate_payload
 from need_radar.observability import JsonlSpanSink, LangfuseBoundary, Tracer
 from need_radar.source_adapter import prepare_source_results
@@ -123,7 +124,12 @@ class ProductBudget:
                 status TEXT NOT NULL, reservation_micro_usd INTEGER NOT NULL,
                 charged_micro_usd INTEGER, request_sha256 TEXT NOT NULL,
                 token_reservation INTEGER NOT NULL,
-                tokens INTEGER, error_code TEXT, created_at TEXT NOT NULL)""")
+                tokens INTEGER, error_code TEXT, created_at TEXT NOT NULL,
+                provider_call_id TEXT, provider_request_id TEXT, accounting_evidence TEXT)""")
+            columns = {row[1] for row in database.execute("PRAGMA table_info(attempts)")}
+            for name in ("provider_call_id", "provider_request_id", "accounting_evidence"):
+                if name not in columns:
+                    database.execute(f"ALTER TABLE attempts ADD COLUMN {name} TEXT")
             database.execute("CREATE TABLE IF NOT EXISTS cycles (run_id TEXT PRIMARY KEY, claimed_at TEXT NOT NULL)")
             current = database.execute("SELECT value FROM metadata WHERE key='policy_sha256'").fetchone()
             if current is None:
@@ -173,17 +179,30 @@ class ProductBudget:
                 database.rollback()
                 raise ProductError("aggregate_token_ceiling_reached", stage)
             database.execute(
-                "INSERT INTO attempts VALUES (?, ?, ?, 'reserved', ?, NULL, ?, ?, NULL, NULL, ?)",
+                """INSERT INTO attempts (
+                    attempt_id, run_id, stage, status, reservation_micro_usd,
+                    charged_micro_usd, request_sha256, token_reservation, tokens,
+                    error_code, created_at, provider_call_id, provider_request_id,
+                    accounting_evidence
+                ) VALUES (?, ?, ?, 'reserved', ?, NULL, ?, ?, NULL, NULL, ?, NULL, NULL, NULL)""",
                 (attempt_id, run_id, stage, amount_micro_usd, request_sha256, token_reservation, _now()),
             )
             database.commit()
         return attempt_id
 
-    def settle(self, attempt_id, charge_micro_usd=None, tokens=None, error_code=None, *, stop_on_failure=False):
+    def settle(
+        self, attempt_id, charge_micro_usd=None, tokens=None, error_code=None, *,
+        stop_on_failure=False, provider_call_id=None, provider_request_id=None,
+        accounting_evidence=None,
+    ):
         if charge_micro_usd is not None and (type(charge_micro_usd) is not int or charge_micro_usd < 0):
             raise ProductError("reported_charge_invalid")
         if tokens is not None and (type(tokens) is not int or tokens < 0):
             raise ProductError("reported_token_usage_invalid")
+        for value in (provider_call_id, provider_request_id):
+            if value is not None and (not isinstance(value, str) or not value or len(value) > 256):
+                raise ProductError("provider_accounting_identity_invalid")
+        evidence = json.dumps(serve.redact(accounting_evidence), ensure_ascii=False, sort_keys=True) if accounting_evidence is not None else None
         with self._database() as database:
             database.execute("BEGIN IMMEDIATE")
             row = database.execute(
@@ -195,14 +214,16 @@ class ProductBudget:
                 raise ProductError("budget_reservation_missing")
             if charge_micro_usd is None:
                 database.execute(
-                    "UPDATE attempts SET status='unknown', error_code=? WHERE attempt_id=?",
-                    (error_code or "charge_or_outcome_unknown", attempt_id),
+                    """UPDATE attempts SET status='unknown', error_code=?, provider_call_id=?,
+                    provider_request_id=?, accounting_evidence=? WHERE attempt_id=?""",
+                    (error_code or "charge_or_outcome_unknown", provider_call_id, provider_request_id, evidence, attempt_id),
                 )
             else:
                 status = "over_limit" if charge_micro_usd > row[0] else "failed" if stop_on_failure and error_code else "settled"
                 database.execute(
-                    "UPDATE attempts SET status=?, charged_micro_usd=?, tokens=?, error_code=? WHERE attempt_id=?",
-                    (status, charge_micro_usd, tokens, error_code, attempt_id),
+                    """UPDATE attempts SET status=?, charged_micro_usd=?, tokens=?, error_code=?,
+                    provider_call_id=?, provider_request_id=?, accounting_evidence=? WHERE attempt_id=?""",
+                    (status, charge_micro_usd, tokens, error_code, provider_call_id, provider_request_id, evidence, attempt_id),
                 )
             database.commit()
 
@@ -236,14 +257,18 @@ class ProductBudget:
     def attempts(self):
         with self._database() as database:
             rows = database.execute(
-                "SELECT attempt_id, run_id, stage, status, reservation_micro_usd, charged_micro_usd, request_sha256, token_reservation, tokens, error_code, created_at FROM attempts ORDER BY created_at"
+                "SELECT attempt_id, run_id, stage, status, reservation_micro_usd, charged_micro_usd, request_sha256, token_reservation, tokens, error_code, created_at, provider_call_id, provider_request_id, accounting_evidence FROM attempts ORDER BY created_at"
             ).fetchall()
         fields = (
             "attempt_id", "run_id", "stage", "status", "reservation_micro_usd",
             "charged_micro_usd", "request_sha256", "model_units_reserved", "tokens",
-            "error_code", "created_at",
+            "error_code", "created_at", "provider_call_id", "provider_request_id", "accounting_evidence",
         )
-        return [dict(zip(fields, row)) for row in rows]
+        attempts = [dict(zip(fields, row)) for row in rows]
+        for attempt in attempts:
+            if attempt["accounting_evidence"] is not None:
+                attempt["accounting_evidence"] = json.loads(attempt["accounting_evidence"])
+        return attempts
 
 
 def _now():
@@ -510,43 +535,192 @@ def _source_origin(source, route, params, run_id, acquired_at, call_id=None):
     return origin
 
 
-def _check_existing_holds():
-    """Read canonical acquisition ledgers only after explicit execution gates pass."""
+def _source_state_dirs(injected=None):
     from scripts import collect_reddit, collect_x
 
-    reddit_path = collect_reddit.STATE_DEFAULT / "state.json"
+    defaults = {"reddit": collect_reddit.STATE_DEFAULT, "x": collect_x.DEFAULT_STATE_DIR}
+    if injected is None:
+        return defaults
+    if not isinstance(injected, dict) or set(injected) != set(defaults):
+        raise ProductError("isolated_source_accounting_directories_required", "source_accounting")
+    resolved = {}
+    for source, value in injected.items():
+        path = Path(value).expanduser().absolute()
+        canonical = defaults[source].absolute()
+        unsafe_link = collect_reddit.path_has_symlink(path) if source == "reddit" else collect_x._has_symlink_component(path)
+        if (
+            unsafe_link or path == canonical or path in canonical.parents or canonical in path.parents
+            or path.resolve(strict=False).is_relative_to(ROOT)
+        ):
+            raise ProductError("isolated_source_accounting_directories_required", "source_accounting")
+        resolved[source] = path
+    if resolved["reddit"] == resolved["x"] or resolved["reddit"] in resolved["x"].parents or resolved["x"] in resolved["reddit"].parents:
+        raise ProductError("isolated_source_accounting_directories_required", "source_accounting")
+    return resolved
+
+
+def _check_existing_holds(state_dirs=None):
+    """Check source ledgers under their collector locks before credentials load."""
+    from scripts import collect_reddit, collect_x
+
+    paths = _source_state_dirs(state_dirs)
     try:
-        reddit_state, _ = collect_reddit.load_state(reddit_path)
+        with collect_reddit.locked_state(paths["reddit"]) as (_state_path, reddit_state):
+            try:
+                collect_reddit.require_incident_reconciled(reddit_state)
+            except Exception:
+                raise ProductError("reddit_canonical_accounting_hold_unresolved", "existing_source_holds") from None
+            if reddit_state.get("pending") is not None or reddit_state.get("limit_breach") is True:
+                raise ProductError("reddit_canonical_accounting_hold_unresolved", "existing_source_holds")
+            if collect_reddit.MAX_SPEND_MICRO_USD - reddit_state["spent_micro_usd"] - reddit_state["reserved_micro_usd"] < REDDIT_RESERVATION_MICRO_USD:
+                raise ProductError("reddit_cumulative_source_budget_exhausted", "existing_source_holds")
+            if reddit_state["successful_requests"] + reddit_state["reserved_success_slots"] >= collect_reddit.MAX_SUCCESSFUL_REQUESTS:
+                raise ProductError("reddit_cumulative_request_limit_exhausted", "existing_source_holds")
+    except ProductError:
+        raise
     except Exception:
         raise ProductError("reddit_canonical_accounting_state_unreadable", "existing_source_holds") from None
     try:
-        collect_reddit.require_incident_reconciled(reddit_state)
-    except Exception:
-        raise ProductError("reddit_canonical_accounting_hold_unresolved", "existing_source_holds") from None
-    if reddit_state.get("pending") is not None or reddit_state.get("limit_breach") is True:
-        raise ProductError("reddit_canonical_accounting_hold_unresolved", "existing_source_holds")
-    reddit_headroom = (
-        collect_reddit.MAX_SPEND_MICRO_USD
-        - reddit_state["spent_micro_usd"]
-        - reddit_state["reserved_micro_usd"]
-    )
-    if reddit_headroom < REDDIT_RESERVATION_MICRO_USD:
-        raise ProductError("reddit_cumulative_source_budget_exhausted", "existing_source_holds")
-    if reddit_state["successful_requests"] + reddit_state["reserved_success_slots"] >= collect_reddit.MAX_SUCCESSFUL_REQUESTS:
-        raise ProductError("reddit_cumulative_request_limit_exhausted", "existing_source_holds")
-    try:
-        x_state = collect_x.load_state(collect_x.DEFAULT_STATE_DIR)
+        with collect_x._ticket_lock(paths["x"]):
+            x_state = collect_x.load_state(paths["x"])
+            if any(item.get("status") in {"reserved", "unknown", "cap_violation"} for item in x_state["attempts"]):
+                raise ProductError("x_canonical_accounting_hold_unresolved", "existing_source_holds")
+            if x_state["charged_micro_usd"] + X_RESERVATION_MICRO_USD > collect_x.BUDGET_MICRO_USD:
+                raise ProductError("x_cumulative_source_budget_exhausted", "existing_source_holds")
+            if x_state["successful_requests"] >= collect_x.SUCCESS_LIMIT:
+                raise ProductError("x_cumulative_request_limit_exhausted", "existing_source_holds")
+    except ProductError:
+        raise
     except Exception:
         raise ProductError("x_canonical_accounting_state_unreadable", "existing_source_holds") from None
-    if any(
-        item.get("status") in {"reserved", "unknown", "cap_violation"}
-        for item in x_state.get("attempts", []) if isinstance(item, dict)
-    ):
-        raise ProductError("x_canonical_accounting_hold_unresolved", "existing_source_holds")
-    if x_state["charged_micro_usd"] + X_RESERVATION_MICRO_USD > collect_x.BUDGET_MICRO_USD:
-        raise ProductError("x_cumulative_source_budget_exhausted", "existing_source_holds")
-    if x_state["successful_requests"] >= collect_x.SUCCESS_LIMIT:
-        raise ProductError("x_cumulative_request_limit_exhausted", "existing_source_holds")
+
+
+def _reserve_source_accounting(source, state_dir, attempt_id, run_id, route, params, reservation, now, retention_days):
+    from scripts import collect_reddit, collect_x
+
+    if source == "reddit":
+        try:
+            with collect_reddit.locked_state(state_dir, now=now) as (state_path, state):
+                try:
+                    collect_reddit.require_incident_reconciled(state)
+                except Exception:
+                    raise ProductError("reddit_canonical_accounting_hold_unresolved", "source_acquisition") from None
+                if state.get("pending") is not None or state.get("limit_breach") is True:
+                    raise ProductError("reddit_canonical_accounting_hold_unresolved", "source_acquisition")
+                if state["successful_requests"] + state["reserved_success_slots"] >= collect_reddit.MAX_SUCCESSFUL_REQUESTS:
+                    raise ProductError("reddit_cumulative_request_limit_exhausted", "source_acquisition")
+                if state["spent_micro_usd"] + state["reserved_micro_usd"] + reservation > collect_reddit.MAX_SPEND_MICRO_USD:
+                    raise ProductError("reddit_cumulative_source_budget_exhausted", "source_acquisition")
+                safe_params = collect_reddit.sanitize(params, [])
+                state["attempts"] += 1
+                state["reserved_micro_usd"] += reservation
+                state["reserved_success_slots"] += 1
+                state["pending"] = {
+                    "attempt": state["attempts"], "product_attempt_id": attempt_id,
+                    "route": "feed", "endpoint": route, "reserved_micro_usd": reservation,
+                    "success_slot_reserved": True, "started_at": collect_reddit.timestamp(now),
+                    "request_parameters_expires_at": collect_reddit.timestamp(now + timedelta(days=retention_days)),
+                    "request_parameters": safe_params,
+                    "request_parameters_sha256": hashlib.sha256(json.dumps(safe_params, sort_keys=True).encode()).hexdigest(),
+                    "run_id": run_id,
+                }
+                collect_reddit.atomic_json(state_path, state)
+        except ProductError:
+            raise
+        except Exception:
+            raise ProductError("reddit_canonical_accounting_reservation_failed", "source_acquisition") from None
+        return
+
+    try:
+        with collect_x._ticket_lock(state_dir):
+            state = collect_x.load_state(state_dir)
+            if any(item.get("status") in {"reserved", "unknown", "cap_violation"} for item in state["attempts"]):
+                raise ProductError("x_canonical_accounting_hold_unresolved", "source_acquisition")
+            if state["successful_requests"] >= collect_x.SUCCESS_LIMIT:
+                raise ProductError("x_cumulative_request_limit_exhausted", "source_acquisition")
+            if state["charged_micro_usd"] + reservation > collect_x.BUDGET_MICRO_USD:
+                raise ProductError("x_cumulative_source_budget_exhausted", "source_acquisition")
+            request = {"method": "GET", "endpoint": route, "parameters": params, "run_id": run_id}
+            state["attempt_count"] += 1
+            state["attempts"].append(collect_x._attempt_record(attempt_id, request, reservation))
+            collect_x._save_state(state_dir, state)
+    except ProductError:
+        raise
+    except Exception:
+        raise ProductError("x_canonical_accounting_reservation_failed", "source_acquisition") from None
+
+
+def _settle_source_accounting(source, state_dir, attempt_id, status, reservation, charge, call_id, now):
+    from scripts import collect_reddit, collect_x
+
+    if source == "reddit":
+        try:
+            with collect_reddit.locked_state(state_dir, now=now) as (state_path, state):
+                pending = state.get("pending")
+                if not isinstance(pending, dict) or pending.get("product_attempt_id") != attempt_id:
+                    raise ProductError("reddit_canonical_accounting_reservation_missing", "source_acquisition")
+                successful = isinstance(status, int) and not isinstance(status, bool) and 200 <= status < 300
+                if successful:
+                    state["successful_requests"] += 1
+                state["reserved_success_slots"] -= 1
+                if charge is None:
+                    pending.update({"charge_known": False, "call_id": call_id, "http_status": status, "success_slot_reserved": False, "http_success": successful})
+                    settlement = "unknown_charge"
+                else:
+                    state["spent_micro_usd"] += charge
+                    over_limit = charge > pending["reserved_micro_usd"] or state["spent_micro_usd"] + state["reserved_micro_usd"] - pending["reserved_micro_usd"] > collect_reddit.MAX_SPEND_MICRO_USD
+                    if over_limit:
+                        state["limit_breach"] = True
+                        pending.update({"charge_known": True, "known_charge_micro_usd": charge, "call_id": call_id, "http_status": status, "http_success": successful, "success_slot_reserved": False, "reconciliation_evidence_required": True})
+                        settlement = "budget_violation"
+                    elif not call_id:
+                        state["reserved_micro_usd"] -= pending["reserved_micro_usd"]
+                        pending.update({"charge_known": True, "known_charge_micro_usd": charge, "http_status": status, "http_success": successful, "success_slot_reserved": False, "reconciliation_evidence_required": True})
+                        settlement = "call_id_missing"
+                    else:
+                        state["reserved_micro_usd"] -= pending["reserved_micro_usd"]
+                        state["pending"] = None
+                        settlement = "settled"
+                collect_reddit.atomic_json(state_path, state)
+                return settlement
+        except ProductError:
+            raise
+        except Exception:
+            raise ProductError("reddit_canonical_accounting_settlement_failed", "source_acquisition") from None
+
+    try:
+        with collect_x._ticket_lock(state_dir):
+            state = collect_x.load_state(state_dir)
+            attempt = next((item for item in state["attempts"] if item.get("id") == attempt_id), None)
+            if attempt is None or attempt.get("status") != "reserved":
+                raise ProductError("x_canonical_accounting_reservation_missing", "source_acquisition")
+            successful = isinstance(status, int) and not isinstance(status, bool) and 200 <= status < 300
+            attempt["http_status"] = status
+            if successful:
+                state["successful_requests"] += 1
+            if charge is None:
+                attempt.update({"status": "unknown", "failure": "billing or call identity unavailable"})
+                settlement = "unknown_charge"
+            else:
+                attempt["cost_micro_usd"] = charge
+                state["charged_micro_usd"] += charge
+                if charge > reservation or state["charged_micro_usd"] > collect_x.BUDGET_MICRO_USD:
+                    attempt["status"] = "cap_violation"
+                    settlement = "budget_violation"
+                elif not call_id:
+                    attempt.update({"status": "unknown", "failure": "call identity unavailable"})
+                    settlement = "call_id_missing"
+                else:
+                    attempt["call_id"] = call_id
+                    attempt["reserved_micro_usd"] = 0
+                    attempt["status"] = "success" if successful else "failed"
+                    settlement = "settled"
+            collect_x._save_state(state_dir, state)
+            return settlement
+    except ProductError:
+        raise
+    except Exception:
+        raise ProductError("x_canonical_accounting_settlement_failed", "source_acquisition") from None
 
 
 def _created_datetime(value):
@@ -675,9 +849,10 @@ class ProductRunner:
         self.boundaries = boundaries or {}
         self.request = self.boundaries.get("http_request") or _default_http_request
         self.invalid_boundaries = bool(self.boundaries) and not {
-            "http_request", "credential_loader",
+            "http_request", "credential_loader", "source_state_dirs",
         } <= self.boundaries.keys()
         self.dispatches = {"source": 0, "model": 0, "discord": 0}
+        self.source_state_dirs = None
         self.trace_id = uuid.uuid4().hex
         self.tracer = Tracer(
             run_id,
@@ -691,15 +866,24 @@ class ProductRunner:
         self.injected = "http_request" in self.boundaries
         self.started = time.monotonic()
         self.deadline = self.started + config["timeout_seconds"]
+        self.delivery_reserve_seconds = min(90, config["timeout_seconds"] / 2)
+        self.delivery_complete = False
 
-    def _remaining(self, maximum):
+    def _remaining(self, maximum, *, delivery=False):
         remaining = self.deadline - time.monotonic()
+        if delivery:
+            requests_left = max(1, DISCORD_MAX_ATTEMPTS * 2 - self.dispatches["discord"])
+            return min(maximum, remaining / requests_left) if remaining > 0 else 0
+        if not self.delivery_complete:
+            remaining -= self.delivery_reserve_seconds
         if remaining <= 0:
-            raise ProductError("operation_deadline_exceeded", "deadline")
+            raise ProductError("operation_deadline_reserved_for_delivery", "deadline")
         return min(maximum, remaining)
 
     def _request(self, kind, method, url, headers, body, timeout, max_bytes):
-        timeout = self._remaining(timeout)
+        timeout = self._remaining(timeout, delivery=kind == "discord")
+        if timeout <= 0:
+            raise ProductError("operation_deadline_exceeded", "deadline")
         self.dispatches[kind] += 1
         return self.request(method, url, headers, body, timeout, max_bytes)
 
@@ -788,11 +972,24 @@ class ProductRunner:
             if self.invalid_boundaries:
                 raise ProductError("injected_http_and_credential_boundaries_required")
             activation = self._load_activation()
+            self.source_state_dirs = _source_state_dirs(
+                self.boundaries.get("source_state_dirs") if self.injected else None
+            )
+            if self.injected:
+                output_root = Path(self.config["output_root"]).expanduser().absolute()
+                if any(
+                    state_dir == output_root or state_dir in output_root.parents or output_root in state_dir.parents
+                    for state_dir in self.source_state_dirs.values()
+                ):
+                    raise ProductError("source_accounting_must_outlive_retained_product_artifacts", "source_accounting")
             budget_path = Path(self.boundaries.get("product_budget_db", self.config["product_budget_db"])).expanduser().absolute()
+            output_root = Path(self.config["output_root"]).expanduser().absolute()
+            if budget_path == output_root or budget_path in output_root.parents or output_root in budget_path.parents:
+                raise ProductError("product_budget_must_outlive_retained_product_artifacts", "source_accounting")
             if not self.injected and budget_path != PRODUCT_BUDGET_DB:
                 raise ProductError("product_budget_path_must_use_persistent_canonical_ledger")
             if not self.injected:
-                _check_existing_holds()
+                _check_existing_holds(self.source_state_dirs)
             _private_dir(self.config["output_root"])
             ledger = ProductBudget(budget_path)
             ledger.claim_one_shot(self.run_id)
@@ -877,24 +1074,41 @@ class ProductRunner:
             artifacts["input"] = input_path.name
             model_call = lambda kind, prompt: self._model_call(kind, prompt, credentials, ledger, evidence_kind)
             stage = "serve"
+            delivery = {"status": "skipped_serve_failed"}
+            delivery_started = False
+
+            def deliver_canonical_report(_report_meta):
+                nonlocal delivery, delivery_started, stage
+                if delivery_started:
+                    return
+                delivery_started = True
+                stage = "delivery"
+                try:
+                    transport = self.boundaries.get("discord_transport") or DiscordRestTransport(
+                        credentials["discord_bot_token"],
+                        lambda method, url, headers, body, timeout, max_bytes: self._request(
+                            "discord", method, url, headers, body, timeout, max_bytes,
+                        ),
+                        injected=self.injected,
+                    )
+                    delivery = run_delivery(self.output / "serve", transport=transport)
+                    artifacts["delivery"] = "serve/discord-delivery.json"
+                except Exception as error:
+                    delivery = {"status": "failed", "error": type(error).__name__}
+                finally:
+                    self.delivery_complete = True
+
             old_mask = os.umask(0o077)
             try:
-                serve_status = serve.run(input_path, self.output / "serve", invoke=model_call, mode="product")
+                serve_status = serve.run(
+                    input_path, self.output / "serve", invoke=model_call, mode="product",
+                    after_report=deliver_canonical_report,
+                )
             finally:
                 os.umask(old_mask)
             artifacts["serve"] = "serve"
-            delivery = {"status": "skipped_serve_failed"}
-            if serve_status in {"success", "no_findings"}:
-                stage = "delivery"
-                transport = self.boundaries.get("discord_transport") or DiscordRestTransport(
-                    credentials["discord_bot_token"],
-                    lambda method, url, headers, body, timeout, max_bytes: self._request(
-                        "discord", method, url, headers, body, self._remaining(timeout), max_bytes,
-                    ),
-                    injected=self.injected,
-                )
-                delivery = run_delivery(self.output / "serve", transport=transport)
-                artifacts["delivery"] = "serve/discord-delivery.json"
+            if serve_status in {"success", "no_findings"} and not delivery_started:
+                delivery = {"status": "failed", "error": "canonical_report_delivery_hook_not_reached"}
             shadow_status = "skipped_serve_failed"
             if serve_status in {"success", "no_findings"}:
                 stage = "shadow"
@@ -1063,6 +1277,16 @@ class ProductRunner:
                 }
                 break
             try:
+                _reserve_source_accounting(
+                    source, self.source_state_dirs[source], attempt, self.run_id,
+                    route, params, reservation, self.now().astimezone(UTC), activation["retention_days"],
+                )
+            except ProductError as error:
+                ledger.settle(attempt, 0, error_code=error.code)
+                raise
+            source_settlement = None
+            product_settled = False
+            try:
                 status, headers, raw, url = _route_request(
                     lambda method, request_url, request_headers, body, timeout, max_bytes: self._request(
                         "source", method, request_url, request_headers, body, timeout, max_bytes,
@@ -1071,11 +1295,6 @@ class ProductRunner:
                     reservation, request_timeout, 8 * 1024 * 1024 if source == "reddit" else 1 * 1024 * 1024,
                 )
                 charge = _charge(headers.get("x-treg-cost-micro"))
-                if charge is None:
-                    ledger.settle(attempt, error_code="source_charge_unknown")
-                    unknown = True
-                    sources[source] = {"partial": True, "origin": _source_origin(source, route, params, self.run_id, now_text), "posts": [], "errors": ["charge_unknown"]}
-                    continue
                 from scripts import collect_reddit, collect_x
                 safe_headers = (
                     collect_reddit.sanitize(headers, (credentials["treg_token"], credentials.get("treg_org", "")))
@@ -1084,21 +1303,16 @@ class ProductRunner:
                 )
                 call_id = headers.get("x-treg-call-id")
                 safe_call_id = safe_headers.get("x-treg-call-id") if isinstance(safe_headers, dict) else None
-                if not isinstance(call_id, str) or not call_id.strip() or safe_call_id != call_id:
+                if not isinstance(call_id, str) or not call_id.strip() or len(call_id) > 256 or safe_call_id != call_id:
                     call_id = None
-                ledger.settle(
-                    attempt, charge,
-                    error_code="source_call_id_missing" if not call_id else f"http_{status}" if status != 200 else None,
-                    stop_on_failure=not call_id,
-                )
                 served_via = headers.get("x-treg-served-via", "")
                 served_by = headers.get("x-treg-served-by", "")
                 expected_provider = "tikhub" if source == "reddit" else "x"
-                origin = _source_origin(source, route, params, self.run_id, now_text, call_id)
                 body, body_error = None, None
                 try:
                     decoded = json.loads(raw)
-                    body = collect_reddit.sanitize(decoded, (credentials["treg_token"],)) if source == "reddit" else collect_x._safe_value(decoded, (credentials["treg_token"],))
+                    secrets = (credentials["treg_token"], credentials.get("treg_org", ""))
+                    body = collect_reddit.sanitize(decoded, secrets) if source == "reddit" else collect_x._safe_value(decoded, secrets)
                     if collect_reddit.contains_withheld(body) if source == "reddit" else body is None:
                         raise ValueError("response_sanitization_failed")
                 except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
@@ -1113,6 +1327,59 @@ class ProductRunner:
                     "body": body,
                     "error": body_error,
                 }
+                try:
+                    source_settlement = _settle_source_accounting(
+                        source, self.source_state_dirs[source], attempt, status, reservation,
+                        charge, call_id, self.now().astimezone(UTC),
+                    )
+                except ProductError as error:
+                    ledger.settle(
+                        attempt, charge, error_code=error.code, stop_on_failure=True,
+                        provider_call_id=call_id,
+                        accounting_evidence={
+                            "provider": "tikhub" if source == "reddit" else "x",
+                            "route": route, "http_status": status,
+                            "charged_micro_usd": charge, "reservation_micro_usd": reservation,
+                            "request_sha256": _sha(params),
+                        },
+                    )
+                    raise
+                ledger.settle(
+                    attempt, charge,
+                    error_code=(
+                        "source_charge_unknown" if charge is None else
+                        "source_call_id_missing" if not call_id else
+                        f"source_accounting_{source_settlement}" if source_settlement != "settled" else
+                        f"http_{status}" if status != 200 else None
+                    ),
+                    stop_on_failure=source_settlement != "settled",
+                    provider_call_id=call_id,
+                    accounting_evidence={
+                        "provider": "tikhub" if source == "reddit" else "x",
+                        "route": route, "http_status": status,
+                        "charged_micro_usd": charge, "reservation_micro_usd": reservation,
+                        "request_sha256": _sha(params),
+                        "account_billed_usd": None,
+                    },
+                )
+                product_settled = True
+                if charge is None:
+                    unknown = True
+                    sources[source] = {"partial": True, "origin": _source_origin(source, route, params, self.run_id, now_text), "posts": [], "errors": ["charge_unknown"]}
+                    continue
+                if source_settlement != "settled":
+                    if source_settlement == "budget_violation":
+                        budget_violation = True
+                        errors[source] = "source_budget_violation"
+                    elif source_settlement == "call_id_missing":
+                        accounting_unresolved = True
+                        errors[source] = "source_accounting_unresolved"
+                    else:
+                        unknown = True
+                        errors[source] = "unknown_charge_or_outcome"
+                    sources[source] = {"partial": True, "origin": _source_origin(source, route, params, self.run_id, now_text, call_id), "posts": [], "errors": ["response_invalid"]}
+                    break
+                origin = _source_origin(source, route, params, self.run_id, now_text, call_id)
                 if (
                     charge > reservation
                     or served_via.lower().startswith("overflow:")
@@ -1142,11 +1409,43 @@ class ProductRunner:
                 sources[source] = {"partial": True, "origin": origin, "posts": rows, "errors": parse_errors}
                 if parse_errors:
                     errors[source] = "response_invalid"
+            except ProductError:
+                raise
             except Exception as error:
-                ledger.settle(attempt, error_code=type(error).__name__)
+                if product_settled:
+                    raise
+                if source_settlement is None:
+                    try:
+                        _settle_source_accounting(
+                            source, self.source_state_dirs[source], attempt, None, reservation,
+                            None, None, self.now().astimezone(UTC),
+                        )
+                    except ProductError as accounting_error:
+                        ledger.settle(
+                            attempt, error_code=accounting_error.code, stop_on_failure=True,
+                            accounting_evidence={"provider": "tikhub" if source == "reddit" else "x", "route": route, "request_sha256": _sha(params)},
+                        )
+                        raise
+                ledger.settle(
+                    attempt, error_code=type(error).__name__,
+                    accounting_evidence={
+                        "provider": "tikhub" if source == "reddit" else "x",
+                        "route": route, "outcome": "unknown",
+                        "reservation_micro_usd": reservation, "request_sha256": _sha(params),
+                    },
+                )
                 unknown = True
                 errors[source] = "charge_unknown"
                 sources[source] = {"partial": True, "origin": _source_origin(source, route, params, self.run_id, now_text), "posts": [], "errors": ["charge_unknown"]}
+        for source, route, params, _reservation in routes:
+            if source not in sources:
+                sources[source] = {
+                    "partial": True,
+                    "origin": _source_origin(source, route, params, self.run_id, now_text),
+                    "posts": [],
+                    "errors": ["not_attempted_after_source_hold"],
+                }
+                errors[source] = "not_attempted_after_source_hold"
         source_results = {"evidence_kind": evidence_kind, **sources}
         _write_json(self.output / "acquisition.json", {
             "schema_version": 1, "run_id": self.run_id, "window": window,
@@ -1204,6 +1503,7 @@ class ProductRunner:
                 "returned_model": result.get("returned_model"),
                 "result_status": result.get("status"),
                 "usage": result.get("usage"),
+                "usage_details": result.get("usage_details"),
                 "usage_derived_estimated_cost_micro_usd": result.get("usage_derived_estimated_cost_micro_usd"),
                 "unknown_charge_or_outcome": result.get("unknown_charge_or_outcome"),
             })
@@ -1212,6 +1512,7 @@ class ProductRunner:
                 "requested_model": result.get("requested_model"),
                 "returned_model": result.get("returned_model"),
                 "usage": result.get("usage"),
+                "usage_details": result.get("usage_details"),
                 "usage_derived_estimated_cost_micro_usd": result.get("usage_derived_estimated_cost_micro_usd"),
                 "account_billed_usd": None,
                 "unknown_charge_or_outcome": result.get("unknown_charge_or_outcome"),
@@ -1226,6 +1527,16 @@ class ProductRunner:
             usage.get("tokens") if isinstance(usage, dict) else None,
             result.get("error"),
             stop_on_failure=result.get("status") != "provider_response",
+            provider_request_id=result.get("request_id"),
+            accounting_evidence={
+                "provider": "deepseek-direct",
+                "requested_model": result.get("requested_model"),
+                "returned_model": result.get("returned_model"),
+                "http_status": result.get("http_status"),
+                "usage": result.get("usage_details"),
+                "usage_derived_estimated_cost_micro_usd": cost,
+                "account_billed_usd": None,
+            },
         )
         if isinstance(cost, int) and cost > MODEL_RESERVATION_MICRO_USD:
             result = {**result, "status": "failure", "error": "reported_usage_cost_exceeds_reservation"}
@@ -1235,7 +1546,8 @@ class ProductRunner:
             "prompt_sha256": _sha(serve.json_bytes(prompt)), "request": request_payload,
             "requested_model": result.get("requested_model", "deepseek-flash"),
             "returned_model": result.get("returned_model"), "status": result.get("status"),
-            "usage": usage, "usage_derived_estimated_cost_micro_usd": cost,
+            "usage": usage, "usage_details": result.get("usage_details"),
+            "usage_derived_estimated_cost_micro_usd": cost,
             "account_billed_usd": None, "unknown_charge_or_outcome": unknown,
             "response": result.get("response"), "error": result.get("error"),
             "request_id": result.get("request_id"),

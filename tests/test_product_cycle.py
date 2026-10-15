@@ -99,6 +99,7 @@ class InjectedHTTP:
         self.model_calls = 0
         self.judge_calls = 0
         self.model_requests = []
+        self.events = []
 
     def __call__(self, method, url, headers, body, timeout, max_bytes):
         parsed = urlsplit(url)
@@ -175,20 +176,26 @@ class InjectedHTTP:
             if self.mode == "model_unknown":
                 raise TimeoutError("synthetic model outcome unavailable")
             system = request["messages"][0]["content"]
+            self.events.append("judge" if system.startswith("Assess one candidate") else "model")
             if system.startswith("Assess one candidate"):
                 self.judge_calls += 1
+                if self.mode == "judge_deadline":
+                    time.sleep(timeout + 0.05)
+                    raise TimeoutError("synthetic judge deadline expired")
             result = _model_result(request, self.mode, self.judge_calls)
-            returned_model = "wrong-model" if self.mode == "bad_identity" else "deepseek-flash"
+            returned_model = MODEL_KEY if self.mode == "echo_credential" else "wrong-model" if self.mode == "bad_identity" else "deepseek-flash"
             content = json.dumps(result) if result is not None else "not-json"
             model_response = {
                 "model": returned_model,
                 "usage": {"prompt_tokens": 40, "completion_tokens": 20, "total_tokens": 60},
                 "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": content}}],
             }
-            return 200, {"x-request-id": "synthetic-deepseek-request"}, json.dumps(model_response).encode()
+            request_id = MODEL_KEY if self.mode == "echo_credential" else "synthetic-deepseek-request"
+            return 200, {"x-request-id": request_id}, json.dumps(model_response).encode()
 
         assert parsed.hostname == "discord.com"
         if method == "POST":
+            self.events.append("discord_send")
             assert parsed.path == f"/api/v10/channels/{product.CHANNEL_ID}/messages"
             assert headers["Authorization"] == f"Bot {DISCORD_KEY}"
             if "multipart/form-data" in headers["Content-Type"]:
@@ -202,6 +209,7 @@ class InjectedHTTP:
                 return 500, {}, b'{"error":"synthetic lost response"}'
             return 200, {}, json.dumps(self.discord_messages[-1]).encode()
         assert method == "GET" and parsed.path == f"/api/v10/channels/{product.CHANNEL_ID}/messages"
+        self.events.append("discord_readback")
         assert headers["Authorization"] == f"Bot {DISCORD_KEY}"
         if self.mode == "readback_failure":
             return 503, {}, b'{"error":"synthetic read-back unavailable"}'
@@ -243,6 +251,26 @@ def _config(directory):
     }
 
 
+def _source_state_dirs(directory):
+    root = Path(directory) / "source-accounting"
+    return {"reddit": root / "reddit", "x": root / "x"}
+
+
+def _seed_source_ledgers(directories):
+    reddit_dir = directories["reddit"]
+    reddit_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+    reddit = collect_reddit.default_state()
+    reddit["incident_hold"]["disposition"] = {
+        "classification": collect_reddit.INCIDENT_CLASSIFICATION,
+        "evidence_ref": collect_reddit.INCIDENT_EVIDENCE_REF,
+        "evidence_sha256": collect_reddit.INCIDENT_EVIDENCE_SHA256,
+    }
+    collect_reddit.atomic_json(reddit_dir / "state.json", reddit)
+    x_dir = directories["x"]
+    x_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+    collect_x._save_state(x_dir, collect_x._new_state())
+
+
 def _run(directory, *, http=None, activation=None, mode="success", partial_reddit=False, ambiguous_discord=False, timeout_seconds=60, budget_exhausted=False):
     directory = Path(directory)
     activation_path = directory / "activation.json"
@@ -253,6 +281,8 @@ def _run(directory, *, http=None, activation=None, mode="success", partial_reddi
     config["timeout_seconds"] = timeout_seconds
     config_path.write_text(json.dumps(config), encoding="utf-8")
     config_path.chmod(0o600)
+    source_state_dirs = _source_state_dirs(directory)
+    _seed_source_ledgers(source_state_dirs)
     service = http or InjectedHTTP(mode=mode, partial_reddit=partial_reddit, ambiguous_discord=ambiguous_discord)
     calls = {"credentials": 0}
 
@@ -264,6 +294,7 @@ def _run(directory, *, http=None, activation=None, mode="success", partial_reddi
         "http_request": service,
         "credential_loader": credentials,
         "product_budget_db": directory / "private-budget.sqlite3",
+        "source_state_dirs": source_state_dirs,
         "now": lambda: NOW,
     }
     if budget_exhausted:
@@ -363,6 +394,24 @@ class ProductCycleTests(unittest.TestCase):
         x_query = parse_qs(urlsplit(requests[1]).query)
         self.assertEqual(x_query["query"], [product.X_QUERY])
         self.assertEqual(x_query["max_results"], ["10"])
+        source_dirs = _source_state_dirs(self.directory)
+        reddit_state, _ = collect_reddit.load_state(source_dirs["reddit"] / "state.json")
+        x_state = collect_x.load_state(source_dirs["x"])
+        self.assertEqual((reddit_state["attempts"], reddit_state["spent_micro_usd"], reddit_state["successful_requests"]), (1, 500, 0))
+        self.assertIsNone(reddit_state["pending"])
+        self.assertEqual((x_state["attempt_count"], x_state["charged_micro_usd"], x_state["successful_requests"]), (1, 1000, 1))
+        self.assertEqual(x_state["attempts"][0]["call_id"], "call-x-success")
+        budget_attempts = product.ProductBudget(self.directory / "private-budget.sqlite3").attempts()
+        self.assertEqual(budget_attempts[0]["provider_call_id"], "call-reddit-partial")
+        self.assertEqual(budget_attempts[1]["provider_call_id"], "call-x-success")
+        self.assertEqual(budget_attempts[0]["accounting_evidence"]["charged_micro_usd"], 500)
+        self.assertEqual(budget_attempts[2]["provider_request_id"], "synthetic-deepseek-request")
+        product._check_existing_holds(source_dirs)
+        self.assertEqual(product.cleanup(output.parent, now=NOW + timedelta(days=4))["removed"], 1)
+        self.assertTrue(any(
+            item["provider_call_id"] == "call-reddit-partial"
+            for item in product.ProductBudget(self.directory / "private-budget.sqlite3").attempts()
+        ))
 
     def test_unverified_gate_blocks_before_credentials_and_requests(self):
         code, result, service, calls, _output = _run(
@@ -412,6 +461,23 @@ class ProductCycleTests(unittest.TestCase):
                 self.assertEqual(sum(method == "POST" and "discord.com" in url for method, url in service.calls), 0)
                 self.assertIn(health["serve_status"], {"normalization_failure", "invalid_model_output", "invalid_output", "extraction_failure"})
 
+    def test_provider_echoed_credential_is_redacted_from_all_product_artifacts(self):
+        _code, result, _service, _calls, output = _run(self.directory, mode="echo_credential")
+        self.assertNotEqual(result["status"], "success")
+        self.assertNotIn(MODEL_KEY, json.dumps(product.ProductBudget(self.directory / "private-budget.sqlite3").attempts()))
+        for artifact in output.rglob("*"):
+            if artifact.is_file():
+                self.assertNotIn(MODEL_KEY.encode(), artifact.read_bytes(), artifact.name)
+
+    def test_judge_deadline_cannot_consume_frozen_report_delivery_time(self):
+        _code, result, service, _calls, output = _run(self.directory, mode="judge_deadline", timeout_seconds=2)
+        health = json.loads((output / "product-health.json").read_text())
+        self.assertEqual(result["status"], "success")
+        self.assertIn(health["delivery_status"], {"delivered", "delivered_reconciled"})
+        self.assertEqual(sum(method == "POST" and "discord.com" in url for method, url in service.calls), 1)
+        self.assertLess(service.events.index("discord_send"), service.events.index("judge"))
+        self.assertTrue((output / "serve" / "report.md").is_file())
+
     def test_known_partial_source_failure_keeps_other_source_evidence(self):
         _code, result, _service, _calls, output = _run(self.directory, partial_reddit=True)
         self.assertEqual(result["status"], "success")
@@ -439,6 +505,8 @@ class ProductCycleTests(unittest.TestCase):
         self.assertEqual(health["stage"], "source_acquisition")
         self.assertEqual(service.model_calls, 0)
         self.assertFalse(any("api.deepseek.com" in url or "discord.com" in url for _method, url in service.calls))
+        with self.assertRaisesRegex(product.ProductError, "x_canonical_accounting_hold_unresolved"):
+            product._check_existing_holds(_source_state_dirs(self.directory))
 
     def test_source_charge_over_reservation_stops_and_retains_acquisition_evidence(self):
         _code, result, service, _calls, output = _run(self.directory, mode="source_over_cap")
@@ -492,6 +560,7 @@ class ProductCycleTests(unittest.TestCase):
             "http_request": service,
             "credential_loader": lambda: credentials_called.append(True),
             "product_budget_db": self.directory / "private-budget.sqlite3",
+            "source_state_dirs": _source_state_dirs(self.directory),
             "now": lambda: NOW,
         }
         resolved = scheduled._read_config(config_path)
@@ -565,24 +634,57 @@ class ProductCycleTests(unittest.TestCase):
         with self.assertRaisesRegex(product.ProductError, "aggregate_spend_ceiling_reached"):
             capped.reserve("run", "model", "e" * 64, 1)
 
+        legacy_path = self.directory / "legacy-budget.sqlite3"
+        with sqlite3.connect(legacy_path) as database:
+            database.execute("""CREATE TABLE attempts (
+                attempt_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, stage TEXT NOT NULL,
+                status TEXT NOT NULL, reservation_micro_usd INTEGER NOT NULL,
+                charged_micro_usd INTEGER, request_sha256 TEXT NOT NULL,
+                token_reservation INTEGER NOT NULL, tokens INTEGER, error_code TEXT,
+                created_at TEXT NOT NULL)""")
+            database.execute("CREATE TABLE cycles (run_id TEXT PRIMARY KEY, claimed_at TEXT NOT NULL)")
+            database.execute(
+                "INSERT INTO attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("legacy", "prior-run", "source_x", "settled", 1000, 100, "f" * 64, 0, None, None, "2026-10-13T00:00:00Z"),
+            )
+        migrated = product.ProductBudget(legacy_path).attempts()
+        self.assertEqual(len(migrated), 1)
+        self.assertEqual(migrated[0]["charged_micro_usd"], 100)
+        self.assertIsNone(migrated[0]["provider_call_id"])
+
     def test_existing_source_ledgers_keep_unresolved_holds_and_cumulative_caps(self):
+        paths = _source_state_dirs(self.directory / "checked-ledgers")
+        _seed_source_ledgers(paths)
+        product._check_existing_holds(paths)
         reddit_state = collect_reddit.default_state()
-        x_state = collect_x._new_state()
-        with (
-            patch.object(collect_reddit, "load_state", return_value=(reddit_state, False)),
-            patch.object(collect_reddit, "require_incident_reconciled"),
-            patch.object(collect_x, "load_state", return_value=x_state),
-        ):
-            product._check_existing_holds()
+        reddit_state["incident_hold"]["disposition"] = {
+            "classification": collect_reddit.INCIDENT_CLASSIFICATION,
+            "evidence_ref": collect_reddit.INCIDENT_EVIDENCE_REF,
+            "evidence_sha256": collect_reddit.INCIDENT_EVIDENCE_SHA256,
+        }
         reddit_state["spent_micro_usd"] = collect_reddit.MAX_SPEND_MICRO_USD - 500
-        with patch.object(collect_reddit, "load_state", return_value=(reddit_state, False)), patch.object(collect_reddit, "require_incident_reconciled"), patch.object(collect_x, "load_state", return_value=x_state):
-            with self.assertRaisesRegex(product.ProductError, "reddit_cumulative_source_budget_exhausted"):
-                product._check_existing_holds()
+        collect_reddit.atomic_json(paths["reddit"] / "state.json", reddit_state)
+        with self.assertRaisesRegex(product.ProductError, "reddit_cumulative_source_budget_exhausted"):
+            product._check_existing_holds(paths)
         reddit_state = collect_reddit.default_state()
+        reddit_state["incident_hold"]["disposition"] = {
+            "classification": collect_reddit.INCIDENT_CLASSIFICATION,
+            "evidence_ref": collect_reddit.INCIDENT_EVIDENCE_REF,
+            "evidence_sha256": collect_reddit.INCIDENT_EVIDENCE_SHA256,
+        }
+        collect_reddit.atomic_json(paths["reddit"] / "state.json", reddit_state)
+        x_state = collect_x._new_state()
         x_state["charged_micro_usd"] = collect_x.BUDGET_MICRO_USD - product.X_RESERVATION_MICRO_USD + 1
-        with patch.object(collect_reddit, "load_state", return_value=(reddit_state, False)), patch.object(collect_reddit, "require_incident_reconciled"), patch.object(collect_x, "load_state", return_value=x_state):
-            with self.assertRaisesRegex(product.ProductError, "x_cumulative_source_budget_exhausted"):
-                product._check_existing_holds()
+        prior = collect_x._attempt_record("prior", {"endpoint": "synthetic"}, x_state["charged_micro_usd"])
+        prior.update({"status": "success", "reserved_micro_usd": 0, "cost_micro_usd": x_state["charged_micro_usd"], "http_status": 200, "call_id": "synthetic-prior-call"})
+        x_state.update({"attempt_count": 1, "successful_requests": 1, "attempts": [prior]})
+        collect_x._save_state(paths["x"], x_state)
+        with self.assertRaisesRegex(product.ProductError, "x_cumulative_source_budget_exhausted"):
+            product._check_existing_holds(paths)
+        x_state["attempts"][0]["status"] = "unknown"
+        collect_x._save_state(paths["x"], x_state)
+        with self.assertRaisesRegex(product.ProductError, "x_canonical_accounting_hold_unresolved"):
+            product._check_existing_holds(paths)
 
     def test_cleanup_enforces_short_retention_and_keeps_other_directories(self):
         runs = self.directory / "runs"
@@ -629,6 +731,7 @@ class ProductCycleTests(unittest.TestCase):
             lambda: socket.socket(),
             lambda: open(network_guard.CREDENTIALS_PATH, "rb"),
             lambda: open(network_guard.DEEPSEEK_CREDENTIALS_PATH, "rb"),
+            lambda: open(network_guard.DISCORD_CREDENTIALS_PATH, "rb"),
             lambda: open(network_guard.LIVE_STATE_PATH + "/assessment/state.json", "rb"),
         )
         for probe in probes:
@@ -659,6 +762,7 @@ print(result["status"])
             "import socket; socket.socket()",
             f"open({network_guard.CREDENTIALS_PATH!r}, 'rb')",
             f"open({network_guard.DEEPSEEK_CREDENTIALS_PATH!r}, 'rb')",
+            f"open({network_guard.DISCORD_CREDENTIALS_PATH!r}, 'rb')",
             f"open({str(Path(network_guard.LIVE_STATE_PATH) / 'assessment/state.json')!r}, 'rb')",
         )
         for command in commands:

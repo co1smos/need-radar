@@ -395,7 +395,8 @@ def invoke_prompt(prompt, api_key, *, transport=None, max_input_tokens=4096,
     choice = choices[0] if isinstance(choices, list) and len(choices) == 1 else None
     message = choice.get("message") if isinstance(choice, dict) else None
     content = message.get("content") if isinstance(message, dict) else None
-    returned_model = decoded.get("model") if isinstance(decoded, dict) else None
+    raw_returned_model = decoded.get("model") if isinstance(decoded, dict) else None
+    returned_model = _provider_text(raw_returned_model, api_key)
     response = None
     try:
         if isinstance(content, str):
@@ -404,7 +405,7 @@ def invoke_prompt(prompt, api_key, *, transport=None, max_input_tokens=4096,
         pass
     cost = _cost_micro_usd(usage["prompt_tokens"], usage["completion_tokens"]) if usage else None
     valid = (
-        status == 200 and returned_model == MODEL and usage is not None
+        status == 200 and raw_returned_model == MODEL and usage is not None
         and usage["prompt_tokens"] <= max_input_tokens
         and usage["completion_tokens"] <= max_output_tokens
         and isinstance(choice, dict) and choice.get("finish_reason") == "stop"
@@ -415,7 +416,7 @@ def invoke_prompt(prompt, api_key, *, transport=None, max_input_tokens=4096,
         error_code = None
     elif usage is None:
         error_code = "usage_unavailable"
-    elif returned_model != MODEL:
+    elif raw_returned_model != MODEL:
         error_code = "provider_model_mismatch"
     elif usage["prompt_tokens"] > max_input_tokens or usage["completion_tokens"] > max_output_tokens:
         error_code = "provider_usage_exceeded_ceiling"
@@ -426,6 +427,7 @@ def invoke_prompt(prompt, api_key, *, transport=None, max_input_tokens=4096,
         "error": error_code,
         "response": response if valid else None,
         "usage": {"requests": 1, "tokens": usage["total_tokens"]} if usage else None,
+        "usage_details": usage,
         "requested_model": MODEL,
         "returned_model": returned_model,
         "attempted_requests": 1,
@@ -433,7 +435,7 @@ def invoke_prompt(prompt, api_key, *, transport=None, max_input_tokens=4096,
         "account_billed_usd": None,
         "unknown_charge_or_outcome": usage is None,
         "http_status": status,
-        "request_id": redact(str(response_headers.get("x-request-id", "")))[:128] or None,
+        "request_id": (_provider_text(response_headers.get("x-request-id"), api_key) or "")[:128] or None,
     }
 
 

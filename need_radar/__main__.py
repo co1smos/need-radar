@@ -813,7 +813,7 @@ def run_fixture_assessment(
     return result_status, consolidation_meta, assessment_meta
 
 
-def run(fixture_path, output, *, invoke=None, mode="synthetic_offline"):
+def run(fixture_path, output, *, invoke=None, mode="synthetic_offline", after_report=None):
     if output.exists() and any(output.iterdir()):
         raise ValueError(f"output directory is not empty: {output}")
     output.mkdir(parents=True, exist_ok=True)
@@ -1291,6 +1291,8 @@ def run(fixture_path, output, *, invoke=None, mode="synthetic_offline"):
                         {"canonical": True},
                     )
                 ids["report_id"] = report_meta["artifact_id"]
+                if after_report is not None and status in {"success", "no_findings"}:
+                    after_report(report_meta)
                 if "judge" in fixture and candidates:
                     boundary = "deepseek_direct" if mode == "product" else "synthetic_fixture"
                     try:
