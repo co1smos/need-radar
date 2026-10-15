@@ -1982,12 +1982,20 @@ def _save_removal_record(path, value):
         os.close(descriptor)
 
 
-def _remove_run_content(run_dir):
+def _remove_run_content(run_dir, retention_marker):
     if not run_dir.exists():
         return "removed"
     try:
         _private_run_tree(run_dir)
-        shutil.rmtree(run_dir)
+        for child in sorted(run_dir.iterdir(), key=lambda path: path.name):
+            if child == retention_marker:
+                continue
+            if stat.S_ISDIR(child.lstat().st_mode):
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        retention_marker.unlink()
+        run_dir.rmdir()
     except (OSError, ProductError):
         return "partial"
     return "removed"
@@ -2001,9 +2009,9 @@ def remove_run(output_root, run_id, transport=None, now=None):
     removal = _read_removal_record(removal_path, run_id)
     run_dir = root / run_id
     if removal is None:
-        _root, run_dir, _marker = _pilot_run(root, run_id)
+        _root, run_dir, retention_marker = _pilot_run(root, run_id)
         _private_run_tree(run_dir)
-        retention = json.loads(_marker.read_text(encoding="utf-8"))["retention"]
+        retention = json.loads(retention_marker.read_text(encoding="utf-8"))["retention"]
         identity = _delivery_removal_identity(run_dir, run_id)
         discord_status = "pending" if identity else "not_applicable"
         removal = {
@@ -2034,13 +2042,13 @@ def remove_run(output_root, run_id, transport=None, now=None):
         health_path = run_dir / "product-health.json"
         if not any(path.exists() or path.is_symlink() for path in (marker_path, health_path)):
             raise ProductError("pilot_run_retention_marker_invalid", "cleanup")
-        _marker, marker_retention = _retention_marker(run_dir, run_id)
+        retention_marker, marker_retention = _retention_marker(run_dir, run_id)
         if {key: marker_retention[key] for key in ("created_at", "expires_at", "retention_days")} != removal["retention"]:
             raise ProductError("pilot_removal_record_invalid", "cleanup")
         _private_run_tree(run_dir)
 
     if run_dir.exists():
-        removal["local_status"] = _remove_run_content(run_dir)
+        removal["local_status"] = _remove_run_content(run_dir, retention_marker)
         _save_removal_record(removal_path, removal)
     elif not run_dir.exists():
         removal["local_status"] = "removed"
