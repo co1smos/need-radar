@@ -446,6 +446,19 @@ class DiscordRestTransport:
     def _nonce(payload_identity):
         return payload_identity[:25]
 
+    def _message_id(self, value):
+        if (
+            isinstance(value, str)
+            and value.isascii()
+            and value.isdigit()
+            and 17 <= len(value) <= 20
+            and value[0] != "0"
+            and int(value) < (1 << 64)
+            and self.token not in value
+        ):
+            return value
+        return None
+
     def send(self, payload):
         validate_payload(payload)
         boundary = "needradar-" + uuid.uuid4().hex
@@ -478,9 +491,10 @@ class DiscordRestTransport:
             body, 15, 8 * 1024 * 1024,
         )
         result = _json_body(raw)
-        if status not in {200, 201} or not isinstance(result, dict) or not isinstance(result.get("id"), str):
+        message_id = self._message_id(result.get("id")) if isinstance(result, dict) else None
+        if status not in {200, 201} or message_id is None:
             raise TimeoutError("discord_send_outcome_ambiguous")
-        return {"message_id": result["id"]}
+        return {"message_id": message_id}
 
     def find_by_payload_identity(self, payload_identity):
         query = urllib.parse.urlencode({"limit": 100})
@@ -496,7 +510,7 @@ class DiscordRestTransport:
         message = next((item for item in messages if isinstance(item, dict) and item.get("nonce") == nonce), None)
         if message is None:
             return None
-        return {"message_id": message.get("id"), "payload_identity": payload_identity}
+        return {"message_id": self._message_id(message.get("id")), "payload_identity": payload_identity}
 
 
 def _json_body(raw):
@@ -788,7 +802,7 @@ def _reddit_rows(body, window_start, window_end, origin, token):
             if isinstance(metadata, dict):
                 node = {**node, "url": metadata.get("detailsLink", node.get("url"))}
         url = collect_reddit.post_url(node, [token], "AI_Agents")
-        if not url or not isinstance(title, str) or not title.strip() or (text is not None and not isinstance(text, str)):
+        if not isinstance(title, str) or not title.strip() or (text is not None and not isinstance(text, str)):
             errors.append("response_invalid")
             continue
         selected.append({

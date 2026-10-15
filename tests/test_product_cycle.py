@@ -123,13 +123,16 @@ class InjectedHTTP:
                     }, b'{"error":"synthetic unavailable"}'
                 reddit_id = base64.b64encode(b"t3_synthetic001").decode().rstrip("=")
                 post_time = (NOW - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+                metadata = {"__typename": "MetadataCell", "createdAt": post_time}
+                if self.mode != "reddit_missing_link":
+                    metadata["detailsLink"] = "https://www.reddit.com/r/AI_Agents/comments/synthetic001/setup"
                 body_value = {"data": {"subredditV3": {"elements": {
                     "edges": [{"node": {
                         "id": reddit_id,
                         "cells": [
                             {"__typename": "TitleCell", "title": "Agent setup repeats"},
                             {"__typename": "PreviewTextCell", "text": "I repeat tool setup after each session reset."},
-                            {"__typename": "MetadataCell", "createdAt": post_time, "detailsLink": "https://www.reddit.com/r/AI_Agents/comments/synthetic001/setup"},
+                            metadata,
                         ],
                     }}],
                     "pageInfo": {"hasNextPage": True, "endCursor": "synthetic-next"},
@@ -203,10 +206,14 @@ class InjectedHTTP:
                 payload = json.loads(match.group(1))
             else:
                 payload = json.loads(body)
-            self.discord_messages.append({"id": "synthetic-message-1", "nonce": payload["nonce"]})
-            if self.ambiguous_discord or self.mode == "readback_failure":
+            message_id = DISCORD_KEY if self.mode == "discord_readback_credential" else "145000000000000001"
+            self.discord_messages.append({"id": message_id, "nonce": payload["nonce"]})
+            if self.ambiguous_discord or self.mode in {"readback_failure", "discord_readback_credential"}:
                 return 500, {}, b'{"error":"synthetic lost response"}'
-            return 200, {}, json.dumps(self.discord_messages[-1]).encode()
+            response = {**self.discord_messages[-1]}
+            if self.mode == "discord_send_credential":
+                response["id"] = DISCORD_KEY
+            return 200, {}, json.dumps(response).encode()
         assert method == "GET" and parsed.path == f"/api/v10/channels/{product.CHANNEL_ID}/messages"
         self.events.append("discord_readback")
         assert headers["Authorization"] == f"Bot {DISCORD_KEY}"
@@ -550,6 +557,21 @@ class ProductCycleTests(unittest.TestCase):
         self.assertEqual(acquisition["source_results"]["reddit"]["posts"], [])
         self.assertEqual(len(acquisition["source_results"]["x"]["posts"]), 1)
 
+    def test_reddit_post_without_permalink_reaches_shared_adapter_as_incomplete_evidence(self):
+        _code, result, _service, _calls, output = _run(self.directory, mode="reddit_missing_link")
+        self.assertEqual(result["status"], "success")
+        acquisition = json.loads((output / "acquisition.json").read_text())
+        post = acquisition["source_results"]["reddit"]["posts"][0]
+        self.assertEqual(post["id"], "t3_synthetic001")
+        self.assertIsNone(post["permalink"])
+
+        snapshot = json.loads((output / "serve" / "snapshot.json").read_text())
+        item = next(item for item in snapshot["items"] if item["id"] == "reddit:t3_synthetic001")
+        self.assertEqual(item["references"], [])
+        self.assertTrue(item["flags"]["incomplete"])
+        coverage = snapshot["source_normalization"]["coverage"]["sources"]["reddit"]
+        self.assertIn("reddit:t3_synthetic001 has no source reference", coverage["failure_reasons"])
+
     def test_source_injection_remains_untrusted_data_in_the_real_model_request(self):
         _code, result, service, _calls, _output = _run(self.directory, mode="source_injection")
         self.assertEqual(result["status"], "success")
@@ -669,6 +691,28 @@ class ProductCycleTests(unittest.TestCase):
         self.assertEqual(health["delivery_status"], "ambiguous")
         self.assertEqual(delivery["attempts"][0]["reconciliation"]["status"], "unavailable")
         self.assertEqual(sum(method == "POST" and "discord.com" in url for method, url in service.calls), 1)
+
+    def test_discord_credentials_in_send_or_readback_ids_are_not_persisted(self):
+        for index, mode in enumerate(("discord_send_credential", "discord_readback_credential")):
+            with self.subTest(mode=mode):
+                case = self.directory / f"credential-{index}"
+                case.mkdir(mode=0o700)
+                _code, result, service, _calls, output = _run(case, mode=mode)
+                self.assertEqual(result["status"], "success")
+                delivery = json.loads((output / "serve" / "discord-delivery.json").read_text())
+                if mode == "discord_send_credential":
+                    self.assertEqual(delivery["status"], "delivered_reconciled")
+                    self.assertEqual(delivery["message_id"], "145000000000000001")
+                    self.assertEqual(delivery["attempts"][0]["reconciliation"]["status"], "found")
+                else:
+                    self.assertEqual(delivery["status"], "ambiguous")
+                    self.assertIsNone(delivery["message_id"])
+                    self.assertEqual(delivery["attempts"][0]["reconciliation"]["status"], "invalid_match")
+                self.assertEqual(sum(method == "POST" and "discord.com" in url for method, url in service.calls), 1)
+                self.assertEqual(sum(method == "GET" and "discord.com" in url for method, url in service.calls), 1)
+                for artifact in output.rglob("*"):
+                    if artifact.is_file():
+                        self.assertNotIn(DISCORD_KEY.encode(), artifact.read_bytes(), artifact.name)
 
     def test_zero_findings_remains_a_successful_serve_and_delivery(self):
         _code, result, service, _calls, output = _run(self.directory, mode="no_findings")
