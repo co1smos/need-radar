@@ -1132,8 +1132,10 @@ class ProductRunner:
             })
             stage = "credentials"
             credentials = self._credentials()
-            cycle_end = self.now().astimezone(UTC).replace(microsecond=0)
-            cycle_start = cycle_end - timedelta(days=7)
+            cycle_time = self.now().astimezone(UTC).replace(microsecond=0)
+            cycle_start = cycle_time - timedelta(days=7)
+            # Keep five seconds beyond X's ten-second end_time dispatch minimum.
+            cycle_end = cycle_time - timedelta(seconds=15)
             window = {"start": cycle_start.isoformat().replace("+00:00", "Z"), "end": cycle_end.isoformat().replace("+00:00", "Z")}
             evidence_kind = "synthetic_injected_boundary" if self.injected else "authentic_live"
             stage = "source_acquisition"
@@ -1580,7 +1582,7 @@ class ProductRunner:
             "responses": all_bodies,
             "coverage": {
                 "partial": True, "source_errors": errors, "max_posts_per_source": 10, "pagination": "disabled",
-                "x_window_limitation": "Provider start is implicit; local admission remains [window.start, window.end), so early-window coverage may be missing after dispatch delay.",
+                "x_window_limitation": "The fixed interval ends 15 seconds before cycle time to meet end_time dispatch eligibility, excluding the newest posts; provider start is implicit and may advance during Reddit delay, so early-window posts may be missing. Local admission remains [window.start, window.end).",
             },
             "source_results": source_results,
         })
