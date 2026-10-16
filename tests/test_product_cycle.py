@@ -127,7 +127,7 @@ class InjectedHTTP:
                 assert max_bytes == 8 * 1024 * 1024
                 assert params == {"subreddit_name": ["AI_Agents"], "sort": ["NEW"], "need_format": ["false"]}
                 if self.mode == "advance_clock":
-                    self.clock[0] += timedelta(seconds=1)
+                    self.clock[0] += timedelta(seconds=45)
                 if self.mode == "timeout":
                     time.sleep(0.55)
                 if self.mode == "request_unknown":
@@ -156,8 +156,21 @@ class InjectedHTTP:
                         metadata,
                     ],
                 }
+                edges = [{"node": node}]
+                if self.mode in {"immediate_window", "advance_clock"}:
+                    future_time = (self.clock[0] + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+                    future_id = base64.b64encode(b"t3_synthetic002").decode().rstrip("=")
+                    edges.append({"node": {
+                        "id": future_id,
+                        "cells": [
+                            {"__typename": "TitleCell", "title": "Future synthetic post"},
+                            {"__typename": "PreviewTextCell", "text": "This post is outside the frozen interval."},
+                            {"__typename": "MetadataCell", "createdAt": future_time,
+                             "detailsLink": "https://www.reddit.com/r/AI_Agents/comments/synthetic002/setup"},
+                        ],
+                    }})
                 body_value = {"data": {"subredditV3": {"elements": {
-                    "edges": [{"node": node}],
+                    "edges": edges,
                     "pageInfo": {"hasNextPage": True, "endCursor": "synthetic-next"},
                 }}}}
                 return 200, {
@@ -193,16 +206,18 @@ class InjectedHTTP:
             }
             row.update({name: value for name, value in optional_fields.items() if name in requested_fields})
             rows = [row]
-            if self.mode == "advance_clock":
+            if self.mode in {"immediate_window", "advance_clock"}:
+                cycle_time = datetime.fromisoformat(end.replace("Z", "+00:00")) + timedelta(seconds=15)
+                window_start = cycle_time - timedelta(days=7)
                 rows.append({
                     "id": "123456790", "text": "At the fixed local window start.",
-                    "created_at": (datetime.fromisoformat(end.replace("Z", "+00:00")) - timedelta(days=7)).isoformat().replace("+00:00", "Z"),
+                    "created_at": window_start.isoformat().replace("+00:00", "Z"),
                     "conversation_id": "123456790", "edit_history_tweet_ids": ["123456790"],
                     "referenced_tweets": [],
                 })
                 rows.append({
                     "id": "123456792", "text": "Before the fixed local window start.",
-                    "created_at": (datetime.fromisoformat(end.replace("Z", "+00:00")) - timedelta(days=7, seconds=1)).isoformat().replace("+00:00", "Z"),
+                    "created_at": (window_start - timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
                     "conversation_id": "123456792", "edit_history_tweet_ids": ["123456792"],
                     "referenced_tweets": [],
                 })
@@ -216,6 +231,18 @@ class InjectedHTTP:
                     "id": "123456791", "text": "At the exclusive local window end.",
                     "created_at": end, "conversation_id": "123456791",
                     "edit_history_tweet_ids": ["123456791"], "referenced_tweets": [],
+                })
+                rows.append({
+                    "id": "123456794", "text": "After the exclusive interval end.",
+                    "created_at": (datetime.fromisoformat(end.replace("Z", "+00:00")) + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+                    "conversation_id": "123456794", "edit_history_tweet_ids": ["123456794"],
+                    "referenced_tweets": [],
+                })
+                rows.append({
+                    "id": "123456795", "text": "Future synthetic post.",
+                    "created_at": (self.clock[0] + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+                    "conversation_id": "123456795", "edit_history_tweet_ids": ["123456795"],
+                    "referenced_tweets": [],
                 })
             body_value = {"data": rows}
             return 200, {
@@ -720,54 +747,80 @@ class ProductCycleTests(unittest.TestCase):
             for item in product.ProductBudget(self.directory / "private-budget.sqlite3").attempts()
         ))
 
-    def test_x_request_omits_stale_start_after_reddit_delay_and_keeps_fixed_local_window(self):
-        clock = [NOW]
-        code, result, service, _calls, output = _run(self.directory, mode="advance_clock", clock=clock)
-        self.assertEqual(code, 0, result)
-        self.assertEqual(result["status"], "success")
+    def test_x_end_time_is_eligible_for_immediate_and_delayed_dispatch(self):
+        for mode, delay in (("immediate_window", timedelta()), ("advance_clock", timedelta(seconds=45))):
+            with self.subTest(mode=mode):
+                case = self.directory / mode
+                case.mkdir(mode=0o700)
+                clock = [NOW]
+                code, result, service, _calls, output = _run(case, mode=mode, clock=clock)
+                self.assertEqual(code, 0, result)
+                self.assertEqual(result["status"], "success")
 
-        acquisition = json.loads((output / "acquisition.json").read_text())
-        x_dispatch = dict(service.treg_dispatch_times)[product.X_ROUTE]
-        expected_start = (NOW - timedelta(days=7)).isoformat().replace("+00:00", "Z")
-        expected_end = NOW.isoformat().replace("+00:00", "Z")
-        self.assertEqual(x_dispatch, NOW + timedelta(seconds=1))
-        self.assertGreater(x_dispatch - (NOW - timedelta(days=7)), timedelta(days=7))
-        self.assertEqual(acquisition["window"], {"start": expected_start, "end": expected_end})
+                acquisition = json.loads((output / "acquisition.json").read_text())
+                x_dispatch = dict(service.treg_dispatch_times)[product.X_ROUTE]
+                expected_start = (NOW - timedelta(days=7)).isoformat().replace("+00:00", "Z")
+                expected_end = (NOW - timedelta(seconds=15)).isoformat().replace("+00:00", "Z")
+                self.assertEqual(x_dispatch, NOW + delay)
+                self.assertEqual(acquisition["window"], {"start": expected_start, "end": expected_end})
+                self.assertGreaterEqual(x_dispatch - datetime.fromisoformat(expected_end.replace("Z", "+00:00")), timedelta(seconds=10))
 
-        x_params = acquisition["requested"]["x"]
-        self.assertEqual(x_params["query"], product.X_QUERY)
-        self.assertEqual(x_params["end_time"], expected_end)
-        self.assertEqual(x_params["sort_order"], "recency")
-        self.assertEqual(x_params["max_results"], 10)
-        self.assertNotIn("start_time", x_params)
-        self.assertEqual(acquisition["responses"]["x"]["request"]["parameters"], x_params)
-        self.assertIn("local admission remains [window.start, window.end)", acquisition["coverage"]["x_window_limitation"])
-        x_posts = acquisition["source_results"]["x"]["posts"]
-        self.assertEqual([post["id"] for post in x_posts], ["123456789", "123456790", "123456793"])
-        self.assertTrue(all(expected_start <= post["created_at"] < expected_end for post in x_posts))
+                x_params = acquisition["requested"]["x"]
+                self.assertEqual(x_params, {
+                    "query": product.X_QUERY,
+                    "end_time": expected_end,
+                    "sort_order": "recency",
+                    "max_results": 10,
+                    "tweet.fields": "created_at,conversation_id,edit_history_tweet_ids,referenced_tweets",
+                })
+                sent_params = next(params for route, _headers, params in service.treg_requests if route == product.X_ROUTE)
+                self.assertEqual(sent_params, {
+                    "query": [product.X_QUERY],
+                    "end_time": [expected_end],
+                    "sort_order": ["recency"],
+                    "max_results": ["10"],
+                    "tweet.fields": ["created_at,conversation_id,edit_history_tweet_ids,referenced_tweets"],
+                })
+                self.assertEqual(acquisition["responses"]["x"]["request"]["parameters"], x_params)
+                self.assertEqual(acquisition["source_results"]["x"]["origin"]["request_parameters"], x_params)
+                self.assertNotIn("start_time", x_params)
+                self.assertIn("end_time dispatch eligibility", acquisition["coverage"]["x_window_limitation"])
 
-        self.assertEqual(len(service.treg_requests), 2)
-        self.assertTrue(all(headers["Cache-Control"] == "no-cache" for _route, headers, _params in service.treg_requests))
-        self.assertEqual(
-            {route: headers["X-Treg-Route-Max-Cost"] for route, headers, _params in service.treg_requests},
-            {
-                product.REDDIT_ROUTE: "0.001000",
-                product.X_ROUTE: "0.050000",
-            },
-        )
+                x_posts = acquisition["source_results"]["x"]["posts"]
+                self.assertEqual([post["id"] for post in x_posts], ["123456789", "123456790", "123456793"])
+                self.assertTrue(all(expected_start <= post["created_at"] < expected_end for post in x_posts))
+                self.assertEqual(
+                    [post["id"] for post in acquisition["source_results"]["reddit"]["posts"]],
+                    ["t3_synthetic001"],
+                )
 
-        snapshot = json.loads((output / "serve" / "snapshot.json").read_text())["items"]
-        comparison = json.loads((output / "shadow" / "comparison.json").read_text())
-        from need_radar import __main__ as serve
-        self.assertEqual(
-            comparison["parity"]["ordered_snapshot_sha256"],
-            serve.digest(serve.json_bytes(snapshot)),
-        )
-        self.assertTrue(comparison["parity"]["same_context"])
-        self.assertEqual(
-            comparison["arms"]["v0"]["artifacts"]["snapshot"]["sha256"],
-            serve.digest((output / "serve" / "snapshot.json").read_bytes()),
-        )
+                self.assertEqual(len(service.treg_requests), 2)
+                self.assertTrue(all(headers["Cache-Control"] == "no-cache" for _route, headers, _params in service.treg_requests))
+                self.assertEqual(
+                    {route: headers["X-Treg-Route-Max-Cost"] for route, headers, _params in service.treg_requests},
+                    {product.REDDIT_ROUTE: "0.001000", product.X_ROUTE: "0.050000"},
+                )
+                x_response = acquisition["responses"]["x"]
+                self.assertEqual(x_response["reserved_micro_usd"], product.X_RESERVATION_MICRO_USD)
+                self.assertEqual(x_response["charged_micro_usd"], 1000)
+                self.assertEqual(x_response["headers"]["x-treg-served-by"], "x")
+                self.assertEqual(x_response["headers"]["x-treg-served-via"], "x")
+                self.assertEqual(x_response["headers"]["x-treg-cache"], "miss")
+
+                snapshot_value = json.loads((output / "serve" / "snapshot.json").read_text())
+                snapshot = snapshot_value["items"]
+                self.assertEqual({item["id"] for item in snapshot}, {
+                    "reddit:t3_synthetic001", "x:123456789", "x:123456790", "x:123456793",
+                })
+                self.assertTrue(all(expected_start <= item["timestamp"] < expected_end for item in snapshot))
+                comparison = json.loads((output / "shadow" / "comparison.json").read_text())
+                from need_radar import __main__ as serve
+                self.assertEqual(
+                    comparison["parity"]["ordered_snapshot_sha256"],
+                    serve.digest(serve.json_bytes(snapshot)),
+                )
+                self.assertTrue(comparison["parity"]["same_context"])
+                self.assertEqual(comparison["assessment_comparison"]["status"], "descriptive")
 
     def test_unverified_gate_blocks_before_credentials_and_requests(self):
         code, result, service, calls, _output = _run(
