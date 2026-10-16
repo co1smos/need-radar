@@ -132,6 +132,11 @@ class InjectedHTTP:
                     time.sleep(0.55)
                 if self.mode == "request_unknown":
                     raise TimeoutError("synthetic no-response timeout")
+                if self.mode == "source_failure":
+                    return 402, {
+                        "x-treg-cost-micro": "500", "x-treg-call-id": "call-reddit-failed",
+                        "x-treg-served-by": "tikhub", "x-treg-served-via": "tikhub",
+                    }, b'{"error":"synthetic payment required"}'
                 if self.partial_reddit:
                     return 503, {
                         "x-treg-cost-micro": "500", "x-treg-call-id": "call-reddit-partial",
@@ -156,7 +161,7 @@ class InjectedHTTP:
                         metadata,
                     ],
                 }
-                edges = [{"node": node}]
+                edges = [] if self.mode == "empty_sources" else [{"node": node}]
                 if self.mode in {"immediate_window", "advance_clock"}:
                     future_time = (self.clock[0] + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
                     future_id = base64.b64encode(b"t3_synthetic002").decode().rstrip("=")
@@ -188,6 +193,11 @@ class InjectedHTTP:
             end = params["end_time"][0]
             if self.mode == "source_unknown_charge":
                 return 200, {"x-treg-call-id": "call-x-unknown", "x-treg-served-by": "x"}, b'{"data":[]}'
+            if self.mode == "source_failure":
+                return 400, {
+                    "x-treg-cost-micro": "1000", "x-treg-call-id": "call-x-failed",
+                    "x-treg-served-by": "x", "x-treg-served-via": "x",
+                }, b'{"error":"synthetic bad request"}'
             post_time = (NOW - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
             requested_fields = set(params.get("tweet.fields", [""])[0].split(","))
             row = {
@@ -205,7 +215,7 @@ class InjectedHTTP:
                 "referenced_tweets": [],
             }
             row.update({name: value for name, value in optional_fields.items() if name in requested_fields})
-            rows = [row]
+            rows = [] if self.mode == "empty_sources" else [row]
             if self.mode in {"immediate_window", "advance_clock"}:
                 cycle_time = datetime.fromisoformat(end.replace("Z", "+00:00")) + timedelta(seconds=15)
                 window_start = cycle_time - timedelta(days=7)
@@ -629,6 +639,7 @@ class ProductCycleTests(unittest.TestCase):
         )
         self.assertEqual(code, 0, result)
         self.assertEqual(result["status"], "success")
+        self.assertEqual(result["product_health_status"], "complete")
         self.assertEqual(result["evidence_kind"], "synthetic_injected_boundary")
         run_record = json.loads((output / "run-record.json").read_text())
         self.assertIs(run_record["configuration"]["provider_invoked"], False)
@@ -639,6 +650,7 @@ class ProductCycleTests(unittest.TestCase):
         })
         health = json.loads((output / "product-health.json").read_text())
         self.assertEqual(health["serve_status"], "success")
+        self.assertEqual(health["health_status"], "complete")
         self.assertEqual(health["delivery_status"], "delivered_reconciled")
         self.assertEqual(health["shadow_status"], "complete")
         self.assertEqual(service.model_calls, 5)
@@ -648,7 +660,7 @@ class ProductCycleTests(unittest.TestCase):
         self.assertEqual((output / "serve" / "report.md").is_file(), True)
         self.assertIn("Injected synthetic boundary responses", (output / "serve" / "report.md").read_text())
         self.assertEqual(health["retention"]["retention_days"], 3)
-        self.assertEqual(health["source_status"], "partial")
+        self.assertEqual(health["source_status"], "bounded")
         self.assertEqual(len(health["reservations"]), 7)
         self.assertEqual(health["budget"]["account_billed_usd"], None)
         self.assertEqual(health["lineage"]["acquisition"]["stage"], "source_acquisition")
@@ -713,6 +725,13 @@ class ProductCycleTests(unittest.TestCase):
             ])
         self.assertEqual(watchdog_code, 0)
         self.assertEqual(json.loads(watchdog_output.getvalue())["status"], "observed")
+        self.assertEqual(json.loads(watchdog_output.getvalue())["product_health_status"], "complete")
+        (output / "product-health.json").write_text("{}", encoding="utf-8")
+        tampered_health = scheduled.check_missed(
+            scheduled._read_config(self.directory / "product.json"),
+            SCHEDULED_FOR, observed_at=NOW + timedelta(days=2),
+        )
+        self.assertEqual(tampered_health["status"], "bad_data")
         ledger = sqlite3.connect(self.directory / "private-budget.sqlite3")
         self.assertEqual(ledger.execute("SELECT COUNT(*) FROM cycles").fetchone()[0], 1)
         ledger.close()
@@ -827,7 +846,7 @@ class ProductCycleTests(unittest.TestCase):
             self.directory, activation=_activation(missing_gate="provider_access"),
         )
         self.assertEqual(code, 1)
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["status"], "failed")
         self.assertIn("provider_access", result["warnings"][0])
         self.assertEqual(service.calls, [])
         self.assertEqual(calls["credentials"], 0)
@@ -881,20 +900,74 @@ class ProductCycleTests(unittest.TestCase):
     def test_judge_deadline_cannot_consume_frozen_report_delivery_time(self):
         _code, result, service, _calls, output = _run(self.directory, mode="judge_deadline", timeout_seconds=2)
         health = json.loads((output / "product-health.json").read_text())
-        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["status"], "degraded")
+        self.assertEqual(result["product_health_status"], "degraded")
         self.assertIn(health["delivery_status"], {"delivered", "delivered_reconciled"})
         self.assertEqual(sum(method == "POST" and "discord.com" in url for method, url in service.calls), 1)
         self.assertLess(service.events.index("discord_send"), service.events.index("judge"))
         self.assertTrue((output / "serve" / "report.md").is_file())
 
     def test_known_partial_source_failure_keeps_other_source_evidence(self):
-        _code, result, _service, _calls, output = _run(self.directory, partial_reddit=True)
-        self.assertEqual(result["status"], "success")
+        _code, result, service, _calls, output = _run(self.directory, partial_reddit=True)
+        self.assertEqual(result["status"], "degraded")
+        self.assertEqual(result["product_health_status"], "degraded")
         health = json.loads((output / "product-health.json").read_text())
         self.assertEqual(health["source_status"], "partial")
+        self.assertEqual(health["health_status"], "degraded")
+        self.assertEqual(health["source_errors"], {"reddit": "request_failed"})
         acquisition = json.loads((output / "acquisition.json").read_text())
         self.assertEqual(acquisition["source_results"]["reddit"]["posts"], [])
         self.assertEqual(len(acquisition["source_results"]["x"]["posts"]), 1)
+        self.assertGreater(service.model_calls, 0)
+        self.assertEqual(sum(method == "POST" and "discord.com" in url for method, url in service.calls), 1)
+        self.assertTrue((output / "serve" / "report.md").is_file())
+        watchdog = scheduled.check_missed(
+            scheduled._read_config(self.directory / "product.json"),
+            SCHEDULED_FOR, observed_at=NOW + timedelta(days=2),
+        )
+        self.assertEqual(watchdog["status"], "degraded")
+        self.assertEqual(watchdog["product_health_status"], "degraded")
+
+    def test_both_source_failures_stop_before_models_or_delivery_and_watchdog_reports_failed(self):
+        _code, result, service, _calls, output = _run(self.directory, mode="source_failure")
+        health = json.loads((output / "product-health.json").read_text())
+        acquisition = json.loads((output / "acquisition.json").read_text())
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["product_health_status"], "failed")
+        self.assertEqual(health["health_status"], "failed")
+        self.assertEqual(health["reason"], "all_sources_failed")
+        self.assertEqual(health["source_status"], "failed")
+        self.assertEqual(health["source_errors"], {"reddit": "request_failed", "x": "request_failed"})
+        self.assertEqual(service.model_calls, 0)
+        self.assertFalse(any("api.deepseek.com" in url or "discord.com" in url for _method, url in service.calls))
+        self.assertEqual(result["stages"]["acquisition"], "failed")
+        self.assertEqual(len(acquisition["responses"]), 2)
+        self.assertEqual(acquisition["responses"]["reddit"]["http_status"], 402)
+        self.assertEqual(acquisition["responses"]["reddit"]["charged_micro_usd"], 500)
+        self.assertEqual(acquisition["responses"]["x"]["http_status"], 400)
+        self.assertEqual(acquisition["responses"]["x"]["charged_micro_usd"], 1000)
+        self.assertTrue(health["lineage"]["acquisition"]["sha256"])
+        self.assertFalse((output / "serve" / "report.md").exists())
+        watchdog = scheduled.check_missed(
+            scheduled._read_config(self.directory / "product.json"),
+            SCHEDULED_FOR, observed_at=NOW + timedelta(days=2),
+        )
+        self.assertEqual(watchdog["status"], "failed")
+        self.assertEqual(watchdog["product_health_status"], "failed")
+
+    def test_healthy_empty_source_responses_are_not_total_acquisition_failure(self):
+        _code, result, service, _calls, output = _run(self.directory, mode="empty_sources")
+        health = json.loads((output / "product-health.json").read_text())
+        acquisition = json.loads((output / "acquisition.json").read_text())
+        self.assertEqual(result["source_status"], "bounded")
+        self.assertEqual(health["source_status"], "bounded")
+        self.assertEqual(health["source_errors"], {})
+        self.assertEqual([len(acquisition["source_results"][source]["posts"]) for source in ("reddit", "x")], [0, 0])
+        self.assertEqual(health["serve_status"], "no_findings")
+        self.assertGreater(service.model_calls, 0)
+        self.assertEqual(health["health_status"], "degraded")
+        self.assertNotEqual(health["shadow_comparison_status"], "complete")
+        self.assertEqual(sum(method == "POST" and "discord.com" in url for method, url in service.calls), 1)
 
     def test_reddit_post_without_permalink_reaches_shared_adapter_as_incomplete_evidence(self):
         _code, result, _service, _calls, output = _run(self.directory, mode="reddit_missing_link")
@@ -1053,21 +1126,50 @@ class ProductCycleTests(unittest.TestCase):
                 with context:
                     _code, result, _service, _calls, output = _run(case, mode=mode)
                 health = json.loads((output / "product-health.json").read_text())
-                self.assertEqual(result["status"], "success")
+                self.assertEqual(result["status"], "degraded")
+                self.assertEqual(result["product_health_status"], "degraded")
+                self.assertEqual(health["health_status"], "degraded")
                 self.assertEqual(health["serve_status"], "success")
                 self.assertIn(health["delivery_status"], {"delivered", "delivered_reconciled"})
+                self.assertEqual(sum(method == "POST" and "discord.com" in url for method, url in _service.calls), 1)
                 self.assertTrue((output / "serve" / "report.md").is_file())
                 if mode == "shadow_failure":
                     self.assertNotEqual(health["shadow_status"], "complete")
+                    self.assertNotIn(health["shadow_comparison_status"], {"complete", "success"})
+                    watchdog = scheduled.check_missed(
+                        scheduled._read_config(case / "product.json"),
+                        SCHEDULED_FOR, observed_at=NOW + timedelta(days=2),
+                    )
+                    self.assertEqual(watchdog["status"], "degraded")
+                    comparison_path = output / health["lineage"]["shadow"]["path"]
+                    comparison_path.write_text("{}", encoding="utf-8")
+                    watchdog = scheduled.check_missed(
+                        scheduled._read_config(case / "product.json"),
+                        SCHEDULED_FOR, observed_at=NOW + timedelta(days=2),
+                    )
+                    self.assertEqual(watchdog["status"], "bad_data")
                 if mode == "judge_failure":
-                    assessment = json.loads((output / "serve" / "assessment.json").read_text())
+                    assessment_path = output / "serve" / "assessment.json"
+                    assessment = json.loads(assessment_path.read_text())
                     self.assertEqual(assessment["status"], "invalid_output")
+                    watchdog = scheduled.check_missed(
+                        scheduled._read_config(case / "product.json"),
+                        SCHEDULED_FOR, observed_at=NOW + timedelta(days=2),
+                    )
+                    self.assertEqual(watchdog["status"], "degraded")
+                    assessment_path.write_text("{}", encoding="utf-8")
+                    watchdog = scheduled.check_missed(
+                        scheduled._read_config(case / "product.json"),
+                        SCHEDULED_FOR, observed_at=NOW + timedelta(days=2),
+                    )
+                    self.assertEqual(watchdog["status"], "bad_data")
 
     def test_ambiguous_discord_send_stays_unresolved_when_readback_fails(self):
         _code, result, service, _calls, output = _run(self.directory, mode="readback_failure")
         health = json.loads((output / "product-health.json").read_text())
         delivery = json.loads((output / "serve" / "discord-delivery.json").read_text())
-        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["status"], "degraded")
+        self.assertEqual(result["product_health_status"], "degraded")
         self.assertEqual(health["delivery_status"], "ambiguous")
         self.assertEqual(delivery["attempts"][0]["reconciliation"]["status"], "unavailable")
         self.assertEqual(sum(method == "POST" and "discord.com" in url for method, url in service.calls), 1)
@@ -1077,7 +1179,8 @@ class ProductCycleTests(unittest.TestCase):
             self.directory, mode="discord_readback_without_nonce", ambiguous_discord=True,
         )
         delivery = json.loads((output / "serve" / "discord-delivery.json").read_text())
-        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["status"], "degraded")
+        self.assertEqual(result["product_health_status"], "degraded")
         self.assertEqual(delivery["status"], "ambiguous")
         self.assertEqual(delivery["attempts"][0]["reconciliation"]["status"], "inconclusive")
         self.assertEqual(sum(method == "POST" and "discord.com" in url for method, url in service.calls), 1)
@@ -1111,7 +1214,7 @@ class ProductCycleTests(unittest.TestCase):
                 case = self.directory / f"credential-{index}"
                 case.mkdir(mode=0o700)
                 _code, result, service, _calls, output = _run(case, mode=mode)
-                self.assertEqual(result["status"], "success")
+                self.assertEqual(result["status"], "success" if mode == "discord_send_credential" else "degraded")
                 delivery = json.loads((output / "serve" / "discord-delivery.json").read_text())
                 if mode == "discord_send_credential":
                     self.assertEqual(delivery["status"], "delivered_reconciled")
@@ -1130,9 +1233,11 @@ class ProductCycleTests(unittest.TestCase):
     def test_zero_findings_remains_a_successful_serve_and_delivery(self):
         _code, result, service, _calls, output = _run(self.directory, mode="no_findings")
         health = json.loads((output / "product-health.json").read_text())
-        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["status"], "degraded")
+        self.assertEqual(result["product_health_status"], "degraded")
         self.assertEqual(health["serve_status"], "no_findings")
         self.assertIn(health["delivery_status"], {"delivered", "delivered_reconciled"})
+        self.assertNotEqual(health["shadow_comparison_status"], "complete")
         self.assertEqual(service.judge_calls, 0)
 
     def test_durable_unknown_reservation_and_cap_survive_restart(self):

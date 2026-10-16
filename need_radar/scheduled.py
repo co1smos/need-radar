@@ -412,6 +412,151 @@ def _optional_statuses(serve_directory, shadow_status, delivery_status):
     }
 
 
+def _product_health_status(health):
+    serve_ok = health.get("serve_status") in {"success", "no_findings"}
+    if not serve_ok or health.get("source_status") not in {"bounded", "partial"}:
+        return "failed"
+    complete = (
+        health.get("source_status") == "bounded"
+        and not health.get("source_errors")
+        and health.get("serve_judge_status") in {"success", "not_required_no_candidates"}
+        and health.get("visual_render_status") == "success"
+        and health.get("delivery_status") in {"delivered", "delivered_reconciled"}
+        and health.get("shadow_status") == "complete"
+        and health.get("shadow_comparison_status") in {"complete", "success"}
+    )
+    return "complete" if complete else "degraded"
+
+
+def _verify_product_health(receipt_path, recorded):
+    child = recorded.get("children", {}).get("product")
+    if not isinstance(child, dict):
+        return None
+    output_path = Path(child.get("output_path", ""))
+    reference = child.get("health_artifact")
+    if (
+        output_path.is_symlink()
+        or output_path.resolve() != receipt_path.parent.resolve()
+        or not isinstance(reference, dict)
+        or reference.get("path") != "product-health.json"
+    ):
+        raise ValueError("product health artifact reference is invalid")
+    health_path = output_path / "product-health.json"
+    if health_path.is_symlink() or not health_path.is_file() or digest(health_path.read_bytes()) != reference.get("sha256"):
+        raise ValueError("product health artifact is missing or corrupt")
+    health = json.loads(health_path.read_text(encoding="utf-8"))
+    health_status = health.get("health_status")
+    health_state = health.get("status")
+    if (
+        health.get("run_id") != recorded.get("record_id")
+        or health_status not in {"complete", "degraded", "failed"}
+        or health_status != recorded.get("product_health_status")
+        or health_status != child.get("health_status")
+        or _product_health_status(health) != health_status
+        or (health_status == "complete" and health_state != "success")
+        or (health_status == "degraded" and health_state != "degraded")
+        or (health_status == "failed" and health_state not in {"failed", "blocked", "serve_failed"})
+    ):
+        raise ValueError("product health status does not match its required stage evidence")
+    expected_run_status = {"complete": "success", "degraded": "degraded", "failed": "failed"}[health_status]
+    if recorded.get("status") != expected_run_status:
+        raise ValueError("scheduled result status does not match product health")
+    if health.get("serve_status") in {"success", "no_findings"}:
+        serve_output = recorded.get("children", {}).get("serve", {}).get("output_path")
+        if not serve_output:
+            raise ValueError("successful serve output is missing from the product receipt")
+        verified = _verify_artifacts(Path(serve_output))
+        if verified != {
+            key: recorded["children"]["serve"][key]
+            for key in ("run_id", "report", "validation")
+        }:
+            raise ValueError("serve artifact evidence does not match the product receipt")
+        candidates_path = Path(serve_output) / "candidates.json"
+        candidates = json.loads(candidates_path.read_text(encoding="utf-8"))
+        candidates_present = bool(candidates.get("candidates"))
+        if candidates_present == (health.get("serve_judge_status") == "not_required_no_candidates"):
+            raise ValueError("assessment requirement does not match validated candidates")
+    lineage = health.get("lineage")
+    if not isinstance(lineage, dict):
+        raise ValueError("product health lineage is missing")
+    acquisition_ref = lineage.get("acquisition")
+    if isinstance(acquisition_ref, dict):
+        if acquisition_ref.get("path") != "acquisition.json":
+            raise ValueError("acquisition artifact path is invalid")
+        acquisition_path = output_path / acquisition_ref["path"]
+        if (
+            acquisition_path.is_symlink()
+            or not acquisition_path.is_file()
+            or digest(acquisition_path.read_bytes()) != acquisition_ref.get("sha256")
+        ):
+            raise ValueError("acquisition artifact is missing or corrupt")
+        acquisition = json.loads(acquisition_path.read_text(encoding="utf-8"))
+        if acquisition.get("coverage", {}).get("source_errors") != health.get("source_errors"):
+            raise ValueError("source errors do not match acquisition evidence")
+        if health.get("source_status") == "failed" and (
+            set(health.get("source_errors", {})) != {"reddit", "x"}
+            or any(acquisition.get("source_results", {}).get(source, {}).get("posts") for source in ("reddit", "x"))
+            or health.get("artifacts", {}).get("model_calls")
+            or health.get("delivery_status") != "not_run"
+        ):
+            raise ValueError("total acquisition failure continued into product execution")
+    elif health.get("source_status") not in {"not_run"}:
+        raise ValueError("product receipt is missing acquisition lineage")
+    shadow_ref = lineage.get("shadow")
+    if isinstance(shadow_ref, dict):
+        if shadow_ref.get("path") != "shadow/comparison.json":
+            raise ValueError("shadow comparison artifact path is invalid")
+        comparison_path = output_path / shadow_ref["path"]
+        if (
+            comparison_path.is_symlink()
+            or not comparison_path.is_file()
+            or digest(comparison_path.read_bytes()) != shadow_ref.get("sha256")
+        ):
+            raise ValueError("shadow comparison artifact is corrupt")
+        comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
+        if comparison.get("status") != health.get("shadow_comparison_status"):
+            raise ValueError("shadow status does not match comparison evidence")
+    elif health.get("shadow_status") == "complete" or health.get("shadow_comparison_status") in {"complete", "success"}:
+        raise ValueError("complete shadow is missing comparison lineage")
+    delivery_ref = lineage.get("delivery")
+    if isinstance(delivery_ref, dict):
+        if delivery_ref.get("path") != "serve/discord-delivery.json":
+            raise ValueError("delivery artifact path is invalid")
+        delivery_path = output_path / delivery_ref["path"]
+        if (
+            delivery_path.is_symlink()
+            or not delivery_path.is_file()
+            or digest(delivery_path.read_bytes()) != delivery_ref.get("sha256")
+        ):
+            raise ValueError("delivery artifact is corrupt")
+        delivery = json.loads(delivery_path.read_text(encoding="utf-8"))
+        if delivery.get("status") != health["delivery_status"]:
+            raise ValueError("delivery status does not match delivery artifact")
+    elif health.get("delivery_status") in {"delivered", "delivered_reconciled"}:
+        raise ValueError("successful delivery is missing artifact lineage")
+    assessment_ref = lineage.get("assessment")
+    if isinstance(assessment_ref, dict):
+        if assessment_ref.get("path") != "serve/assessment.json":
+            raise ValueError("assessment artifact path is invalid")
+        assessment_path = output_path / assessment_ref["path"]
+        if (
+            assessment_path.is_symlink()
+            or not assessment_path.is_file()
+            or digest(assessment_path.read_bytes()) != assessment_ref.get("sha256")
+        ):
+            raise ValueError("assessment artifact is corrupt")
+        assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+        if assessment.get("status") != health.get("serve_judge_status"):
+            raise ValueError("assessment status does not match assessment artifact")
+    elif health.get("serve_judge_status") not in {"not_required_no_candidates", "not_run"}:
+        raise ValueError("assessment outcome is missing artifact evidence")
+    if health.get("visual_render_status") == "success":
+        render_path = output_path / "serve" / "report.html"
+        if render_path.is_symlink() or not render_path.is_file():
+            raise ValueError("successful render artifact is missing")
+    return health_status
+
+
 def run_cycle(config, scheduled_for=None, boundaries=None):
     if config.get("enabled") is not True:
         return {"record_id": None, "status": "disabled", "evidence_kind": "synthetic_offline"}
@@ -493,17 +638,38 @@ def run_cycle(config, scheduled_for=None, boundaries=None):
             operation = run_product_cycle(
                 config, output_directory, record_id, slot, boundaries=boundaries,
             )
+            health_path = output_directory / "product-health.json"
+            health_artifact = _file_reference(health_path)
+            health_status = operation.get("health_status", "failed")
+            try:
+                health = json.loads(health_path.read_text(encoding="utf-8"))
+                if health.get("health_status") != health_status:
+                    health_status = "failed"
+            except (OSError, ValueError, json.JSONDecodeError):
+                health_status = "failed"
+            scheduled_status = {"complete": "success", "degraded": "degraded", "failed": "failed"}.get(health_status, "failed")
             result.update({
-                "status": operation["status"],
+                "status": scheduled_status,
+                "product_health_status": health_status,
                 "evidence_kind": operation.get("evidence_kind", "synthetic_injected_boundary"),
                 "stages": {
-                    "serve": operation.get("serve_status", operation.get("error", "not_run")),
+                    "acquisition": operation.get("source_status", "not_run"),
+                    "serve": operation.get("serve_status", "not_run"),
+                    "assessment": operation.get("serve_judge_status", "not_run"),
+                    "render": operation.get("visual_render_status", "not_run"),
                     "discord_delivery": operation.get("delivery_status", "not_run"),
                     "shadow": operation.get("shadow_status", "not_run"),
+                    "comparison": operation.get("shadow_comparison_status", "not_run"),
                 },
                 "budget": operation.get("budget"),
-                "coverage": {"source_coverage": operation.get("source_status", "not_run")},
-                "children": {"product": {"output_path": str(output_directory), "stage": operation.get("stage")}},
+                "coverage": {
+                    "source_coverage": operation.get("source_status", "not_run"),
+                    "source_errors": operation.get("source_errors", {}),
+                },
+                "children": {"product": {
+                    "output_path": str(output_directory), "stage": operation.get("stage"),
+                    "health_status": health_status, "health_artifact": health_artifact,
+                }},
                 "warnings": ([operation["error"]] if operation.get("error") else []) + operation.get("warnings", []),
             })
             dispatches = operation.get("dispatches", {})
@@ -697,6 +863,11 @@ def _finish(database, lock, record_path, result):
     return {
         "record_id": result["record_id"],
         "status": result["status"],
+        "product_health_status": result.get("product_health_status"),
+        "source_status": result.get("coverage", {}).get("source_coverage"),
+        "source_errors": result.get("coverage", {}).get("source_errors", {}),
+        "stages": result.get("stages"),
+        "product_health_artifact": result.get("children", {}).get("product", {}).get("health_artifact"),
         "evidence_kind": result["evidence_kind"],
         "warnings": result.get("warnings", []),
         "record_sha256": record_hash,
@@ -714,6 +885,7 @@ def check_missed(config, scheduled_for=None, observed_at=None):
         slot = _scheduled_for(config, latest_due if latest_due >= anchor else observed)
     due_at = _utc(slot) + timedelta(seconds=config["schedule"]["grace_seconds"])
     database = _database(Path(config["state_db"]))
+    product_health_status = None
     if observed < due_at:
         status = "not_due"
         main_record = None
@@ -736,18 +908,27 @@ def check_missed(config, scheduled_for=None, observed_at=None):
                 status = "bad_data"
         elif main_record[1] == "overlap":
             status = "overlap"
-        elif main_record[1] == "success":
-            status = "observed"
+        elif main_record[1] in {"success", "degraded", "failed"}:
+            status = "observed" if main_record[1] == "success" else main_record[1]
             try:
                 receipt = Path(main_record[2]) / "run-record.json"
                 if not receipt.is_file() or digest(receipt.read_bytes()) != main_record[3]:
                     raise ValueError("run receipt is missing or corrupt")
                 recorded = json.loads(receipt.read_text(encoding="utf-8"))
-                serve_output = recorded.get("children", {}).get("serve", {}).get("output_path")
-                if recorded.get("status") != "success" or not serve_output:
-                    raise ValueError("run receipt has no successful serve output")
-                _verify_artifacts(Path(serve_output))
-            except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, json.JSONDecodeError):
+                if recorded.get("status") != main_record[1]:
+                    raise ValueError("run receipt status does not match scheduled health")
+                product_health_status = _verify_product_health(receipt, recorded)
+                if product_health_status is None:
+                    if recorded.get("status") == "success":
+                        serve_output = recorded.get("children", {}).get("serve", {}).get("output_path")
+                        if not serve_output:
+                            raise ValueError("run receipt has no successful serve output")
+                        _verify_artifacts(Path(serve_output))
+                    elif main_record[1] != "failed":
+                        raise ValueError("run receipt has no product health evidence")
+                elif product_health_status == "complete":
+                    status = "observed"
+            except (OSError, ValueError, TypeError, KeyError, AttributeError, sqlite3.Error, json.JSONDecodeError):
                 status = "bad_data"
         else:
             status = "failed"
@@ -758,6 +939,7 @@ def check_missed(config, scheduled_for=None, observed_at=None):
         "independent_entrypoint": True,
         "main_record_id": main_record[0] if main_record else None,
         "main_status": main_record[1] if main_record else None,
+        "product_health_status": product_health_status if main_record else None,
         "evidence_kind": "local_state_check",
     }
     _insert_record(
@@ -776,7 +958,11 @@ def check_missed(config, scheduled_for=None, observed_at=None):
         )
         database.commit()
     database.close()
-    return {"record_id": record_id, "status": status, "scheduled_for": slot, "linked_record_id": details["main_record_id"]}
+    return {
+        "record_id": record_id, "status": status, "scheduled_for": slot,
+        "linked_record_id": details["main_record_id"],
+        "product_health_status": product_health_status if main_record else None,
+    }
 
 
 def main(argv=None, boundaries=None):

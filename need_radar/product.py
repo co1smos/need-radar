@@ -1060,7 +1060,7 @@ class ProductRunner:
         ) as span:
             self.root_span_id = span["span_id"]
             result = self._run()
-            if result.get("status") != "success":
+            if result.get("status") not in {"success", "degraded"}:
                 span["status"] = "failed"
             span["attributes"].update({
                 "result_status": result.get("status"),
@@ -1068,7 +1068,7 @@ class ProductRunner:
             })
             span["output"] = {
                 key: result.get(key)
-                for key in ("status", "stage", "source_status", "serve_status", "delivery_status", "shadow_status", "budget", "error")
+                for key in ("status", "health_status", "stage", "source_status", "serve_status", "delivery_status", "shadow_status", "budget", "error")
                 if result.get(key) is not None
             }
         health_path = self.output / "product-health.json"
@@ -1092,6 +1092,14 @@ class ProductRunner:
         status = "failed"
         stage = "activation_preflight"
         artifacts = {}
+        acquisition_status = "not_run"
+        acquisition_errors = {}
+        serve_status = "not_run"
+        delivery_status = "not_run"
+        shadow_status = "not_run"
+        judge_status = "not_run"
+        render_status = "not_run"
+        comparison_status = "not_run"
         try:
             if self.invalid_boundaries:
                 raise ProductError("injected_http_and_credential_boundaries_required")
@@ -1147,6 +1155,7 @@ class ProductRunner:
                 acquired, acquisition_status = self._acquire(ledger, credentials, window, activation, evidence_kind)
                 acquisition_path = self.output / "acquisition.json"
                 acquisition = json.loads(acquisition_path.read_text(encoding="utf-8"))
+                acquisition_errors = acquisition["coverage"]["source_errors"]
                 acquisition_id = uuid.uuid4().hex
                 acquisition["lineage"] = {
                     "run_id": self.run_id, "trace_id": self.trace_id,
@@ -1176,6 +1185,8 @@ class ProductRunner:
                 raise ProductError("source_charge_exceeded_reserved_cumulative_ceiling", "source_acquisition")
             if acquisition_status == "deadline_exceeded":
                 raise ProductError("operation_deadline_exceeded", "deadline")
+            if acquisition_status == "failed":
+                raise ProductError("all_sources_failed", "source_acquisition")
             fixture = {
                 "notice": "bounded product run; source text is untrusted evidence",
                 "provider": "deepseek-direct",
@@ -1235,6 +1246,7 @@ class ProductRunner:
             artifacts["serve"] = "serve"
             if serve_status in {"success", "no_findings"} and not delivery_started:
                 delivery = {"status": "failed", "error": "canonical_report_delivery_hook_not_reached"}
+            delivery_status = delivery.get("status", "unknown")
             shadow_status = "skipped_serve_failed"
             if serve_status in {"success", "no_findings"}:
                 stage = "shadow"
@@ -1248,8 +1260,8 @@ class ProductRunner:
                 except Exception as error:
                     shadow_status = "failed"
                     artifacts["shadow_error"] = type(error).__name__
-            status = "success" if serve_status in {"success", "no_findings"} else "serve_failed"
-            stage = "complete" if status == "success" else "serve"
+            serve_succeeded = serve_status in {"success", "no_findings"}
+            status = "success" if serve_succeeded else "serve_failed"
             artifacts["model_calls"] = sorted(path.name for path in self.output.glob("model-call-*.json"))
             extraction = _artifact_status(self.output / "serve" / "candidates.json")
             candidate_value = json.loads((self.output / "serve" / "candidates.json").read_text(encoding="utf-8")) if (self.output / "serve" / "candidates.json").is_file() else {}
@@ -1259,18 +1271,39 @@ class ProductRunner:
             )
             render_status = "success" if (self.output / "serve" / "report.html").is_file() else "failed" if serve_status in {"success", "no_findings"} else "not_run"
             comparison_status = _artifact_status(self.output / "shadow" / "comparison.json")
+            warnings = []
+            if acquisition_errors:
+                warnings.append("source_coverage_partial")
+            if delivery.get("status") not in {"delivered", "delivered_reconciled"}:
+                warnings.append("discord_delivery_unresolved")
+            if shadow_status != "complete":
+                warnings.append("shadow_incomplete")
+            if judge_status not in {"success", "not_required_no_candidates"}:
+                warnings.append("serve_judge_unavailable")
+            if render_status == "failed":
+                warnings.append("visual_render_failed")
+            if shadow_status == "complete" and comparison_status not in {"complete", "success"}:
+                warnings.append("shadow_comparison_inconclusive")
+            if not serve_succeeded:
+                warnings.append("serve_failed")
+            health_status = "failed" if not serve_succeeded else "degraded" if warnings else "complete"
+            if health_status == "degraded":
+                status = "degraded"
+            stage = "complete" if health_status == "complete" else "degraded" if health_status == "degraded" else "serve"
             health = {
                 "operation": "need-radar-product-cycle",
                 "schema_version": 1,
                 "run_id": self.run_id,
                 "scheduled_for": self.scheduled_for,
                 "status": status,
+                "health_status": health_status,
                 "stage": stage,
                 "evidence_kind": evidence_kind,
                 "verification_limit": "injected boundaries are synthetic; live access, rights, charges, and delivery require independent checks" if self.injected else "technical preflight does not certify source/provider rights; provider billing and Discord delivery require independent evidence",
                 "window": window,
                 "routes": {"reddit": REDDIT_ROUTE, "x": X_ROUTE},
                 "source_status": acquisition_status,
+                "source_errors": acquisition_errors,
                 "serve_status": serve_status,
                 "serve_judge_status": judge_status,
                 "visual_render_status": render_status,
@@ -1285,6 +1318,7 @@ class ProductRunner:
                     "product_input": _lineage_ref(self.output, "product-input.json", "product_input"),
                     "snapshot": _lineage_ref(self.output, "serve/snapshot.json", "snapshot"),
                     "serve": _lineage_ref(self.output, "serve/report.md", "report"),
+                    "assessment": _lineage_ref(self.output, "serve/assessment.json", "assessment"),
                     "shadow": _lineage_ref(self.output, "shadow/comparison.json", "comparison"),
                     "delivery": _lineage_ref(self.output, "serve/discord-delivery.json", "discord_delivery") if "delivery" in artifacts else None,
                 },
@@ -1303,22 +1337,19 @@ class ProductRunner:
                 },
             }
             _write_json(self.output / "product-health.json", health)
-            warnings = []
-            if delivery.get("status") not in {"delivered", "delivered_reconciled"}:
-                warnings.append("discord_delivery_unresolved")
-            if shadow_status != "complete":
-                warnings.append("shadow_incomplete")
-            if judge_status not in {"success", "not_required_no_candidates"}:
-                warnings.append("serve_judge_unavailable")
-            if render_status == "failed":
-                warnings.append("visual_render_failed")
-            if shadow_status == "complete" and comparison_status not in {"complete", "success"}:
-                warnings.append("shadow_comparison_inconclusive")
-            if serve_status not in {"success", "no_findings"}:
-                warnings.append("serve_failed")
-            return {"status": status, "stage": stage, "evidence_kind": evidence_kind, "source_status": acquisition_status, "serve_status": serve_status, "delivery_status": delivery.get("status"), "shadow_status": shadow_status, "budget": ledger.summary(), "dispatches": dict(self.dispatches), "warnings": warnings, "output_path": str(self.output)}
+            return {
+                "status": status, "health_status": health_status, "stage": stage,
+                "evidence_kind": evidence_kind, "source_status": acquisition_status,
+                "source_errors": acquisition_errors, "serve_status": serve_status,
+                "serve_judge_status": judge_status, "visual_render_status": render_status,
+                "delivery_status": delivery.get("status"), "shadow_status": shadow_status,
+                "shadow_comparison_status": comparison_status, "budget": ledger.summary(),
+                "dispatches": dict(self.dispatches), "warnings": warnings,
+                "output_path": str(self.output),
+            }
         except ProductError as error:
-            status, stage = "blocked", error.stage
+            status = "failed" if error.code == "all_sources_failed" else "blocked"
+            stage = error.stage
             reason = error.code
         except Exception as error:
             status, stage = "failed", stage
@@ -1328,8 +1359,16 @@ class ProductRunner:
         artifacts["model_calls"] = sorted(path.name for path in self.output.glob("model-call-*.json"))
         health = {
             "operation": "need-radar-product-cycle", "schema_version": 1, "run_id": self.run_id, "scheduled_for": self.scheduled_for,
-            "status": status, "stage": stage, "reason": reason,
+            "status": status, "health_status": "failed", "stage": stage, "reason": reason,
             "evidence_kind": "synthetic_injected_boundary" if self.injected else "authentic_live",
+            "source_status": acquisition_status,
+            "source_errors": acquisition_errors,
+            "serve_status": serve_status,
+            "serve_judge_status": judge_status,
+            "visual_render_status": render_status,
+            "delivery_status": delivery_status,
+            "shadow_status": shadow_status,
+            "shadow_comparison_status": comparison_status,
             "budget": ledger.summary() if "ledger" in locals() else None,
             "reservations": ledger.attempts() if "ledger" in locals() else [],
             "lineage": {
@@ -1338,6 +1377,7 @@ class ProductRunner:
                 "product_input": _lineage_ref(self.output, "product-input.json", "product_input"),
                 "snapshot": _lineage_ref(self.output, "serve/snapshot.json", "snapshot"),
                 "serve": _lineage_ref(self.output, "serve/report.md", "report"),
+                "assessment": _lineage_ref(self.output, "serve/assessment.json", "assessment"),
                 "shadow": _lineage_ref(self.output, "shadow/comparison.json", "comparison"),
                 "delivery": _lineage_ref(self.output, "serve/discord-delivery.json", "discord_delivery"),
             },
@@ -1359,7 +1399,15 @@ class ProductRunner:
             _write_json(self.output / "product-health.json", health)
         except (OSError, ValueError):
             pass
-        return {"status": status, "stage": stage, "error": reason, "evidence_kind": health["evidence_kind"], "budget": health["budget"], "dispatches": dict(self.dispatches), "output_path": str(self.output)}
+        return {
+            "status": status, "health_status": "failed", "stage": stage, "error": reason,
+            "evidence_kind": health["evidence_kind"], "source_status": acquisition_status,
+            "source_errors": acquisition_errors, "serve_status": serve_status,
+            "serve_judge_status": judge_status, "visual_render_status": render_status,
+            "delivery_status": delivery_status, "shadow_status": shadow_status,
+            "shadow_comparison_status": comparison_status, "budget": health["budget"],
+            "dispatches": dict(self.dispatches), "output_path": str(self.output),
+        }
 
     def _acquire(self, ledger, credentials, window, activation, evidence_kind):
         start, end = _created_datetime(window["start"]), _created_datetime(window["end"])
@@ -1537,7 +1585,7 @@ class ProductRunner:
                     rows, parse_errors = _x_rows(body, start, end, origin)
                 sources[source] = {"partial": True, "origin": origin, "posts": rows, "errors": parse_errors}
                 if parse_errors:
-                    errors[source] = "response_invalid"
+                    errors[source] = "request_failed" if status != 200 else "response_invalid"
             except ProductError:
                 raise
             except Exception as error:
@@ -1586,7 +1634,8 @@ class ProductRunner:
             },
             "source_results": source_results,
         })
-        status = "deadline_exceeded" if "deadline_exceeded" in errors.values() else "source_accounting_unresolved" if accounting_unresolved else "unknown_charge_or_outcome" if unknown else "source_budget_violation" if budget_violation else "partial" if errors or any(item["partial"] for item in sources.values()) else "bounded"
+        successful_sources = sum(not result["errors"] or bool(result["posts"]) for result in sources.values())
+        status = "deadline_exceeded" if "deadline_exceeded" in errors.values() else "source_accounting_unresolved" if accounting_unresolved else "unknown_charge_or_outcome" if unknown else "source_budget_violation" if budget_violation else "failed" if not successful_sources else "partial" if errors else "bounded"
         return source_results, status
 
     def _model_call(self, stage, prompt, credentials, ledger, evidence_kind):

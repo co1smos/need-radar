@@ -52,6 +52,12 @@ No Hermes job is created by this ticket. Expiry-only cleanup does not call Disco
 
 Before enabling a real one-shot run, verify and retain evidence for: (1) current Reddit and X Treg request/response schemas, provider identity, first-page behavior, cache/overflow behavior, and cost headers; (2) account eligibility and current credentials without placing them in config; (3) private retention and cleanup readiness; (4) source billing caps and the existing Reddit/X unresolved-hold state; (5) current DeepSeek model availability, input/output pricing, and the account-level billing view; (6) Discord channel send permission, bot token scope, message attachment limits, and read-back visibility; and (7) operation-lock and watchdog readiness. Record applicable source/provider and model data-use terms, known restrictions, and unresolved interpretations in informational `data_use_notes`; amended #16 does not require a separate legal certification. Owner authorization is not provider permission, and informational status does not override a known applicable restriction. The local injected proof verifies only request construction and response handling. It does not verify provider access, charges, third-party rights, schedule execution, or Discord delivery.
 
+## Product health outcomes
+
+`product-health.json.health_status` and the scheduled receipt distinguish `complete`, `degraded`, and `failed`. A fully successful serve is `degraded` when acquisition has known source errors, required assessment or delivery is unresolved, HTML rendering fails, or the shadow/comparison is incomplete. The canonical Markdown report and any already-authorized delivery remain available when later stages degrade. Both source requests failing records `source_status: failed`, source errors, costs, and acquisition lineage, then stops before model calls, report generation, or delivery. Successful empty responses have `source_status: bounded` with no source errors and continue through the normal no-findings path.
+
+The independent watchdog verifies the product-health file hash recorded by the scheduled run, its run ID and health classification, acquisition lineage and source errors, and the required stage artifacts. It reports degraded or failed product health instead of treating a valid serve report alone as proof of a complete pilot. The synthetic regressions cover both-source failure, one-source partial coverage, healthy empty responses, complete success, and incomplete optional stages; all provider/model/Discord boundaries are injected. Network, credential-file, and canonical live-state access remain denied in process and subprocess checks under Hermes `TMPDIR`. No live acceptance or provider permission is established. Revert this correction with `git revert <issue-28-candidate-commit>`; no external or canonical live state is changed by the correction.
+
 ## Offline verification
 
 Focused product-cycle checks use Hermes `TMPDIR` and subprocesses with network, credential-file, and canonical-live-state access denied. Synthetic profile fixtures verify selected- and default-profile reuse, comments/export syntax, no inherited-token fallback, duplicate/malformed rejection, and no credential persistence. The injected product cycle and cleanup wrapper are also exercised in subprocesses. These checks use synthetic HTTP/service responses and do not establish live access, billing, source rights, or Discord delivery.
@@ -62,9 +68,15 @@ Run the focused regression and full suite from the repository root:
 
 ```sh
 TMPDIR=/home/ubuntu/.hermes/cache/scratch PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tests \
-  python3 -m unittest test_product_cycle.ProductCycleTests.test_x_end_time_is_eligible_for_immediate_and_delayed_dispatch -v
+  python3 -m unittest -v \
+  test_product_cycle.ProductCycleTests.test_runnable_product_cycle_uses_concrete_adapters_and_retains_lineage \
+  test_product_cycle.ProductCycleTests.test_both_source_failures_stop_before_models_or_delivery_and_watchdog_reports_failed \
+  test_product_cycle.ProductCycleTests.test_known_partial_source_failure_keeps_other_source_evidence \
+  test_product_cycle.ProductCycleTests.test_healthy_empty_source_responses_are_not_total_acquisition_failure \
+  test_product_cycle.ProductCycleTests.test_judge_shadow_and_renderer_failures_preserve_serve_and_delivery \
+  test_product_cycle.ProductCycleTests.test_zero_findings_remains_a_successful_serve_and_delivery
 TMPDIR=/home/ubuntu/.hermes/cache/scratch npm test
 npm run typecheck:sandcastle-workflow
 ```
 
-Observed on October 16, 2026: the focused immediate/delayed regression passed; all 47 product-cycle tests passed; `npm test` passed (34 Ralph tests and 328 offline Python tests); and the workflow typecheck passed. Python tests load `tests/sitecustomize.py`, which denies network, credential-file, and canonical live-state access in-process; product-cycle checks also verify those denials in subprocesses. All service responses in these checks are synthetic. No live provider call, private recording replay, credential access, or live-state access was performed.
+Observed on October 16, 2026: the six focused issue #28 health scenarios passed; `npm test` passed (34 Ralph tests and 330 offline Python tests); and the workflow typecheck passed. Python tests load `tests/sitecustomize.py`, which denies network, credential-file, and canonical live-state access in-process; product-cycle checks also verify those denials in subprocesses. All service responses in these checks are synthetic. No live provider call, private recording replay, credential access, or live-state access was performed.
