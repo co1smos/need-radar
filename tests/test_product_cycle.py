@@ -94,11 +94,14 @@ def _model_result(prompt, mode, judge_count):
 class InjectedHTTP:
     """The real product adapters run against synthetic HTTP/service responses."""
 
-    def __init__(self, *, mode="success", partial_reddit=False, ambiguous_discord=False):
+    def __init__(self, *, mode="success", partial_reddit=False, ambiguous_discord=False, clock=None):
         self.mode = mode
         self.partial_reddit = partial_reddit
         self.ambiguous_discord = ambiguous_discord
+        self.clock = clock
         self.calls = []
+        self.treg_requests = []
+        self.treg_dispatch_times = []
         self.discord_messages = []
         self.discord_payloads = []
         self.model_calls = 0
@@ -112,11 +115,19 @@ class InjectedHTTP:
         if parsed.hostname == "treg.to":
             route = parsed.path.rsplit("/", 1)[-1]
             params = parse_qs(parsed.query)
+            self.treg_requests.append((route, dict(headers), params))
+            if self.clock is not None:
+                self.treg_dispatch_times.append((route, self.clock[0]))
             assert method == "GET" and headers["X-Treg-Token"] == TOKEN
+            assert headers["Cache-Control"] == "no-cache"
+            reservation = product.REDDIT_RESERVATION_MICRO_USD if route == product.REDDIT_ROUTE else product.X_RESERVATION_MICRO_USD
+            assert headers["X-Treg-Route-Max-Cost"] == f"{reservation / 1_000_000:.6f}"
             assert body is None and timeout <= 15
             if route == product.REDDIT_ROUTE:
                 assert max_bytes == 8 * 1024 * 1024
                 assert params == {"subreddit_name": ["AI_Agents"], "sort": ["NEW"], "need_format": ["false"]}
+                if self.mode == "advance_clock":
+                    self.clock[0] += timedelta(seconds=1)
                 if self.mode == "timeout":
                     time.sleep(0.55)
                 if self.mode == "request_unknown":
@@ -160,8 +171,8 @@ class InjectedHTTP:
             assert params["sort_order"] == ["recency"]
             assert params["max_results"] == ["10"]
             assert params["tweet.fields"] == ["created_at,conversation_id,edit_history_tweet_ids,referenced_tweets"]
-            start, end = params["start_time"][0], params["end_time"][0]
-            assert datetime.fromisoformat(end.replace("Z", "+00:00")) - datetime.fromisoformat(start.replace("Z", "+00:00")) == timedelta(days=7)
+            assert "start_time" not in params
+            end = params["end_time"][0]
             if self.mode == "source_unknown_charge":
                 return 200, {"x-treg-call-id": "call-x-unknown", "x-treg-served-by": "x"}, b'{"data":[]}'
             post_time = (NOW - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
@@ -181,7 +192,32 @@ class InjectedHTTP:
                 "referenced_tweets": [],
             }
             row.update({name: value for name, value in optional_fields.items() if name in requested_fields})
-            body_value = {"data": [row]}
+            rows = [row]
+            if self.mode == "advance_clock":
+                rows.append({
+                    "id": "123456790", "text": "At the fixed local window start.",
+                    "created_at": (datetime.fromisoformat(end.replace("Z", "+00:00")) - timedelta(days=7)).isoformat().replace("+00:00", "Z"),
+                    "conversation_id": "123456790", "edit_history_tweet_ids": ["123456790"],
+                    "referenced_tweets": [],
+                })
+                rows.append({
+                    "id": "123456792", "text": "Before the fixed local window start.",
+                    "created_at": (datetime.fromisoformat(end.replace("Z", "+00:00")) - timedelta(days=7, seconds=1)).isoformat().replace("+00:00", "Z"),
+                    "conversation_id": "123456792", "edit_history_tweet_ids": ["123456792"],
+                    "referenced_tweets": [],
+                })
+                rows.append({
+                    "id": "123456793", "text": "Before the exclusive local window end.",
+                    "created_at": (datetime.fromisoformat(end.replace("Z", "+00:00")) - timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+                    "conversation_id": "123456793", "edit_history_tweet_ids": ["123456793"],
+                    "referenced_tweets": [],
+                })
+                rows.append({
+                    "id": "123456791", "text": "At the exclusive local window end.",
+                    "created_at": end, "conversation_id": "123456791",
+                    "edit_history_tweet_ids": ["123456791"], "referenced_tweets": [],
+                })
+            body_value = {"data": rows}
             return 200, {
                 "x-treg-cost-micro": "1000", "x-treg-call-id": "call-x-success",
                 "x-treg-served-by": "x", "x-treg-served-via": "x", "x-treg-cache": "miss",
@@ -422,7 +458,7 @@ def _run_authentic_preflight_with_mocked_ledgers(directory, *, runtime_credentia
         return product.run_product_cycle(config, output, "synthetic-preflight", SCHEDULED_FOR)
 
 
-def _run(directory, *, http=None, activation=None, mode="success", partial_reddit=False, ambiguous_discord=False, timeout_seconds=60, budget_exhausted=False):
+def _run(directory, *, http=None, activation=None, mode="success", partial_reddit=False, ambiguous_discord=False, timeout_seconds=60, budget_exhausted=False, clock=None):
     directory = Path(directory)
     activation_path = directory / "activation.json"
     activation_path.write_text(json.dumps(activation or _activation()), encoding="utf-8")
@@ -434,7 +470,8 @@ def _run(directory, *, http=None, activation=None, mode="success", partial_reddi
     config_path.chmod(0o600)
     source_state_dirs = _source_state_dirs(directory)
     _seed_source_ledgers(source_state_dirs)
-    service = http or InjectedHTTP(mode=mode, partial_reddit=partial_reddit, ambiguous_discord=ambiguous_discord)
+    clock = clock if clock is not None else [NOW]
+    service = http or InjectedHTTP(mode=mode, partial_reddit=partial_reddit, ambiguous_discord=ambiguous_discord, clock=clock)
     calls = {"credentials": 0}
 
     def credentials():
@@ -446,7 +483,7 @@ def _run(directory, *, http=None, activation=None, mode="success", partial_reddi
         "credential_loader": credentials,
         "product_budget_db": directory / "private-budget.sqlite3",
         "source_state_dirs": source_state_dirs,
-        "now": lambda: NOW,
+        "now": lambda: clock[0],
     }
     if budget_exhausted:
         ledger = product.ProductBudget(boundaries["product_budget_db"])
@@ -682,6 +719,55 @@ class ProductCycleTests(unittest.TestCase):
             item["provider_call_id"] == "call-reddit-success"
             for item in product.ProductBudget(self.directory / "private-budget.sqlite3").attempts()
         ))
+
+    def test_x_request_omits_stale_start_after_reddit_delay_and_keeps_fixed_local_window(self):
+        clock = [NOW]
+        code, result, service, _calls, output = _run(self.directory, mode="advance_clock", clock=clock)
+        self.assertEqual(code, 0, result)
+        self.assertEqual(result["status"], "success")
+
+        acquisition = json.loads((output / "acquisition.json").read_text())
+        x_dispatch = dict(service.treg_dispatch_times)[product.X_ROUTE]
+        expected_start = (NOW - timedelta(days=7)).isoformat().replace("+00:00", "Z")
+        expected_end = NOW.isoformat().replace("+00:00", "Z")
+        self.assertEqual(x_dispatch, NOW + timedelta(seconds=1))
+        self.assertGreater(x_dispatch - (NOW - timedelta(days=7)), timedelta(days=7))
+        self.assertEqual(acquisition["window"], {"start": expected_start, "end": expected_end})
+
+        x_params = acquisition["requested"]["x"]
+        self.assertEqual(x_params["query"], product.X_QUERY)
+        self.assertEqual(x_params["end_time"], expected_end)
+        self.assertEqual(x_params["sort_order"], "recency")
+        self.assertEqual(x_params["max_results"], 10)
+        self.assertNotIn("start_time", x_params)
+        self.assertEqual(acquisition["responses"]["x"]["request"]["parameters"], x_params)
+        self.assertIn("local admission remains [window.start, window.end)", acquisition["coverage"]["x_window_limitation"])
+        x_posts = acquisition["source_results"]["x"]["posts"]
+        self.assertEqual([post["id"] for post in x_posts], ["123456789", "123456790", "123456793"])
+        self.assertTrue(all(expected_start <= post["created_at"] < expected_end for post in x_posts))
+
+        self.assertEqual(len(service.treg_requests), 2)
+        self.assertTrue(all(headers["Cache-Control"] == "no-cache" for _route, headers, _params in service.treg_requests))
+        self.assertEqual(
+            {route: headers["X-Treg-Route-Max-Cost"] for route, headers, _params in service.treg_requests},
+            {
+                product.REDDIT_ROUTE: "0.001000",
+                product.X_ROUTE: "0.050000",
+            },
+        )
+
+        snapshot = json.loads((output / "serve" / "snapshot.json").read_text())["items"]
+        comparison = json.loads((output / "shadow" / "comparison.json").read_text())
+        from need_radar import __main__ as serve
+        self.assertEqual(
+            comparison["parity"]["ordered_snapshot_sha256"],
+            serve.digest(serve.json_bytes(snapshot)),
+        )
+        self.assertTrue(comparison["parity"]["same_context"])
+        self.assertEqual(
+            comparison["arms"]["v0"]["artifacts"]["snapshot"]["sha256"],
+            serve.digest((output / "serve" / "snapshot.json").read_bytes()),
+        )
 
     def test_unverified_gate_blocks_before_credentials_and_requests(self):
         code, result, service, calls, _output = _run(

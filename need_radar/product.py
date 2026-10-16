@@ -626,6 +626,7 @@ def _route_request(request, token, org, route, params, reservation, timeout, max
     url = f"https://treg.to/call/{route}?{query}"
     headers = {
         "Accept": "application/json",
+        "Cache-Control": "no-cache",
         "X-Treg-Token": token,
         "X-Treg-Route-Max-Cost": f"{reservation / 1_000_000:.6f}",
     }
@@ -1362,7 +1363,7 @@ class ProductRunner:
         start, end = _created_datetime(window["start"]), _created_datetime(window["end"])
         now_text = window["end"]
         x_params = {
-            "query": X_QUERY, "start_time": window["start"], "end_time": window["end"],
+            "query": X_QUERY, "end_time": window["end"],
             "sort_order": "recency",
             "max_results": 10,
             "tweet.fields": "created_at,conversation_id,edit_history_tweet_ids,referenced_tweets",
@@ -1378,8 +1379,6 @@ class ProductRunner:
             if unknown:
                 sources[source] = {"partial": True, "origin": _source_origin(source, route, params, self.run_id, now_text), "posts": [], "errors": ["charge_unknown"]}
                 continue
-            if source == "x":
-                params = {**params, "start_time": window["start"], "end_time": window["end"]}
             try:
                 request_timeout = self._remaining(15)
             except ProductError:
@@ -1579,7 +1578,10 @@ class ProductRunner:
             "schema_version": 1, "run_id": self.run_id, "window": window,
             "requested": {"reddit": reddit_params, "x": x_params},
             "responses": all_bodies,
-            "coverage": {"partial": True, "source_errors": errors, "max_posts_per_source": 10, "pagination": "disabled"},
+            "coverage": {
+                "partial": True, "source_errors": errors, "max_posts_per_source": 10, "pagination": "disabled",
+                "x_window_limitation": "Provider start is implicit; local admission remains [window.start, window.end), so early-window coverage may be missing after dispatch delay.",
+            },
             "source_results": source_results,
         })
         status = "deadline_exceeded" if "deadline_exceeded" in errors.values() else "source_accounting_unresolved" if accounting_unresolved else "unknown_charge_or_outcome" if unknown else "source_budget_violation" if budget_violation else "partial" if errors or any(item["partial"] for item in sources.values()) else "bounded"

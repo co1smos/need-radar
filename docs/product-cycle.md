@@ -55,3 +55,16 @@ Before enabling a real one-shot run, verify and retain evidence for: (1) current
 ## Offline verification
 
 Focused product-cycle checks use Hermes `TMPDIR` and subprocesses with network, credential-file, and canonical-live-state access denied. Synthetic profile fixtures verify selected- and default-profile reuse, comments/export syntax, no inherited-token fallback, duplicate/malformed rejection, and no credential persistence. The injected product cycle and cleanup wrapper are also exercised in subprocesses. These checks use synthetic HTTP/service responses and do not establish live access, billing, source rights, or Discord delivery.
+
+For X recent search, `start_time` is optional but, when supplied, must be within the preceding seven days at dispatch ([X endpoint schema](https://docs.x.com/x-api/posts/search-recent-posts.md)). The product request omits it, keeps the explicit cycle `end_time`, query, recency sort, and ten-result limit, then admits only timestamps in the original local `[window.start, window.end)` interval. Because the provider's implicit rolling start is not returned, Reddit-to-X dispatch delay can leave some early-window posts uncovered; `acquisition.json` records this limitation and the actual sent parameters. Both product source requests send `Cache-Control: no-cache`, as documented for Treg direct calls ([Treg API docs](https://treg.to/llms.txt)).
+
+Run the focused regression and full suite from the repository root:
+
+```sh
+TMPDIR=/home/ubuntu/.hermes/cache/scratch PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tests \
+  python3 -m unittest test_product_cycle.ProductCycleTests.test_x_request_omits_stale_start_after_reddit_delay_and_keeps_fixed_local_window -v
+TMPDIR=/home/ubuntu/.hermes/cache/scratch npm test
+npm run typecheck:sandcastle-workflow
+```
+
+Observed on October 16, 2026: the focused regression passed; all 47 product-cycle tests passed; `npm test` passed (34 Ralph tests and 328 offline Python tests); and the workflow typecheck passed. Python tests load `tests/sitecustomize.py`, which denies network, credential-file, and canonical live-state access in-process; product-cycle checks also verify those denials in subprocesses. All service responses in these checks are synthetic. No live provider call, private recording replay, credential access, or live-state access was performed.
