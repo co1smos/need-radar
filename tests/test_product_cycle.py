@@ -1488,6 +1488,18 @@ class ProductCycleTests(unittest.TestCase):
         self.assertEqual(receipt["discord_status"], "not_applicable")
         self.assertIsNone(receipt["message_id"])
 
+    def test_data_use_notes_are_informational_but_technical_gates_remain_required(self):
+        activation = _activation()
+        self.assertNotIn("source_use_rights", product.REQUIRED_GATES)
+        self.assertNotIn("model_access_and_data_use", product.REQUIRED_GATES)
+        self.assertIn("model_access", product.REQUIRED_GATES)
+        activation["data_use_notes"] = {"status": "unverified"}
+        product.validate_activation(activation)
+        for gate in product.REQUIRED_GATES:
+            with self.subTest(gate=gate):
+                with self.assertRaises(product.ProductError):
+                    product.validate_activation(_activation(missing_gate=gate))
+
     def test_discord_removal_command_keeps_local_result_when_credentials_are_denied(self):
         import network_guard
 

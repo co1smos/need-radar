@@ -15,15 +15,18 @@
     "reddit": 1000,
     "x": 50000
   },
+  "data_use_notes": {
+    "status": "unverified",
+    "note": "Informational only; owner authorization is not provider permission. Record known restrictions and unresolved interpretations without certifying them."
+  },
   "gates": {
     "one_shot_execution": {"verified": false, "evidence": ""},
     "reddit_route_schema": {"verified": false, "evidence": ""},
     "x_route_schema": {"verified": false, "evidence": ""},
     "provider_access": {"verified": false, "evidence": ""},
-    "source_use_rights": {"verified": false, "evidence": ""},
     "source_billing_caps": {"verified": false, "evidence": ""},
     "existing_source_holds": {"verified": false, "evidence": ""},
-    "model_access_and_data_use": {"verified": false, "evidence": ""},
+    "model_access": {"verified": false, "evidence": ""},
     "discord_permission_and_readback": {"verified": false, "evidence": ""},
     "retention_and_cleanup": {"verified": false, "evidence": ""}
   }
